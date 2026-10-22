@@ -115,12 +115,6 @@
 - 릴리스 만들기: `sh tools/release.sh` (아래 "릴리스 올리는 법").
 - 개발 문서: [docs/HANDOFF.md](docs/HANDOFF.md), 분석 기록 [docs/ANALYSIS_LOG.md](docs/ANALYSIS_LOG.md).
 
-### 릴리스 올리는 법 (관리자용)
-
-1. `src/common.h`의 `EU4BOOST_VERSION`을 새 버전(예: `0.4.1`, `-dev` 없이)으로 바꾸고 커밋합니다.
-2. `sh tools/release.sh`를 실행하면 `build/release/eu4boost_v버전.zip`이 생깁니다(빌드와 테스트를 함께 합니다).
-3. GitHub 저장소 → Releases → "Draft a new release"를 엽니다. 태그 `v버전`(예: `v0.4.1`)을 만들고, zip 파일을 올린 뒤 Publish를 누릅니다.
-
 ## 라이선스
 
 - 이 프로젝트: [MIT 라이선스](LICENSE)
