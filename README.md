@@ -7,7 +7,7 @@
 - 기본 기능은 게임 결과를 바꾸지 않습니다. 원래 코드와 결과를 직접 비교해서 확인했습니다.
 
 > 필요한 것: Windows 64비트, EU4 **1.37.5.0** (Steam), **[EU4dll](https://github.com/matanki-saito/EU4dll)**.
-> EU4dll은 한글·일본어 패치를 설치하면 함께 들어오는 DLL입니다. 이 플러그인은 EU4dll이 게임 폴더의 `plugins` 폴더에서 읽어 들입니다.
+> EU4dll은 한글·일본어 패치를 설치하기 위해 설치하는 DLL입니다. 이 플러그인은 EU4dll이 게임 폴더의 `plugins` 폴더에서 읽어 들입니다.
 
 ---
 
