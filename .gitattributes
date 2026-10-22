@@ -1,0 +1,3 @@
+# Keep every file byte-for-byte: sources are LF, ini files are UTF-16LE + CRLF.
+* -text
+*.ini binary

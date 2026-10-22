@@ -1,0 +1,5 @@
+build/
+__pycache__/
+*.pyc
+# this PC's paths for tools/re (see tools/re/re_paths.py)
+tools/local_paths.json

@@ -1,0 +1,44 @@
+[11:59:19.267] eu4boost 0.3.0-dev3 loaded into <게임 폴더>\eu4.exe (base 00007ff7dcd50000), loader thread 5484
+[11:59:19.267] config: allocator=1 guard=1 large_pages=0 reserve_mb=0 purge_delay_ms=250 | profiler=1 autostart=0 interval_us=1000 max_seconds=300 | main_thread=0 background_full_speed=0 | speed5_midtick_frame_ms=200 | online_poll_ms=100 zero_fill=-1/65536
+[11:59:19.267] A/B test: launch #5 -> variant A (experiments OFF)
+[11:59:19.267] logical processors: 12
+[11:59:19.267] allocator: eu4 CRT heap not yet initialized (early load, ideal) at patch time
+[11:59:19.267] allocator: zero-filled malloc ON for allocations >= 65536 bytes (EU4dll font buffer)
+[11:59:19.292] allocator: 6 CRT entry points redirected, heap guard on
+[11:59:19.292] allocator: mimalloc active
+[11:59:19.292] render: speed-5 mid-tick frame interval 50 ms -> 200 ms
+[11:59:19.292] threads: main thread affinity hook installed (mode: free)
+[11:59:19.292] online: POPS_RunCallbacks limited to every 100 ms
+[11:59:19.313] online: Nakama tick limited to every 100 ms
+[11:59:19.333] speed: logging real time per game day (eu4boost_speed_*.csv)
+[11:59:19.391] parallel: stats=1 chunked=0 small_loop_caps=0 min_items_per_task=0 worker_spin_us=0 spin_workers=4 -> installed
+[11:59:19.391] profiler: ready (Ctrl+Alt+P to start/stop)
+[11:59:42.526] threads: game pins thread 5484 to logical CPU 6 (mask 40) -> ignored, thread stays free on 12 CPUs
+[12:02:13.882] speed: 100d 1596.09.11 - 1596.12.19: 100 days in 5.0 s = 20.14 days/s (49.7 ms per day, of which daily tick 38.7 ms)
+[12:02:18.092] speed: 100d 1596.12.20 - 1597.03.29: 100 days in 4.2 s = 23.76 days/s (42.1 ms per day, of which daily tick 33.8 ms)
+[12:02:22.229] speed: 100d 1597.03.30 - 1597.07.07: 100 days in 4.1 s = 24.18 days/s (41.4 ms per day, of which daily tick 33.9 ms)
+[12:02:26.186] speed: 100d 1597.07.08 - 1597.10.15: 100 days in 4.0 s = 25.26 days/s (39.6 ms per day, of which daily tick 31.9 ms)
+[12:02:30.399] speed: 100d 1597.10.16 - 1598.01.23: 100 days in 4.2 s = 23.75 days/s (42.1 ms per day, of which daily tick 33.8 ms)
+[12:02:54.557] allocator: foreign frees 4441, foreign reallocs 0, guard hits 136, zero-filled mallocs 4840
+[12:02:54.557] process: peak working set 3165 MB, peak commit 4400 MB, cpu user 186 s, sys 23 s
+[12:02:54.557] online: POPS callbacks run 1622 / skipped 51602, Nakama ticks run 1619 / skipped 24994
+[12:02:54.557] speed: run 1596.09.11 - 1598.02.28: 536 days in 23.0 s = 23.31 days/s (42.9 ms per day, of which daily tick 34.4 ms)
+[12:02:54.557] speed: total 536 days in 1 run(s), 23.0 s = 23.31 days/s (42.9 ms per day, of which daily tick 34.4 ms)
+[12:02:54.557] parallel: 16 loop sites, 10403 ms total main-thread time in parallel loops
+[12:02:54.557] parallel: site eu4+10a762e calls 26611 items/call 4941 | per call: wall 179 us, dispatch 26 us, main wait 153 us | tasks/call 11.0 late 11% | worker start latency avg 39 us max 320 us | capped 0
+[12:02:54.557] parallel: site eu4+77d9b5 calls 537 items/call 254 | per call: wall 4678 us, dispatch 27 us, main wait 4651 us | tasks/call 11.0 late 7% | worker start latency avg 342 us max 9225 us | capped 0
+[12:02:54.557] parallel: site eu4+e0ff78 calls 13901 items/call 516 | per call: wall 77 us, dispatch 27 us, main wait 50 us | tasks/call 11.0 late 13% | worker start latency avg 27 us max 212 us | capped 0
+[12:02:54.557] parallel: site eu4+424462 calls 10843 items/call 1380 | per call: wall 57 us, dispatch 21 us, main wait 36 us | tasks/call 11.0 late 11% | worker start latency avg 20 us max 214 us | capped 0
+[12:02:54.557] parallel: site eu4+169be36 calls 17358 items/call 65 | per call: wall 22 us, dispatch 21 us, main wait 0 us | tasks/call 11.0 late 67% | worker start latency avg 15 us max 157 us | capped 0
+[12:02:54.557] parallel: site eu4+77f411 calls 537 items/call 257 | per call: wall 584 us, dispatch 30 us, main wait 553 us | tasks/call 11.0 late 11% | worker start latency avg 68 us max 606 us | capped 0
+[12:02:54.557] parallel: site eu4+77fee1 calls 537 items/call 3925 | per call: wall 343 us, dispatch 26 us, main wait 317 us | tasks/call 11.0 late 10% | worker start latency avg 52 us max 485 us | capped 0
+[12:02:54.557] parallel: site eu4+780391 calls 537 items/call 3925 | per call: wall 243 us, dispatch 24 us, main wait 219 us | tasks/call 11.0 late 10% | worker start latency avg 42 us max 340 us | capped 0
+[12:02:54.557] parallel: site eu4+192012 calls 523 items/call 4942 | per call: wall 245 us, dispatch 21 us, main wait 224 us | tasks/call 11.0 late 10% | worker start latency avg 39 us max 428 us | capped 0
+[12:02:54.557] parallel: site eu4+77eab1 calls 18 items/call 257 | per call: wall 5380 us, dispatch 51 us, main wait 5329 us | tasks/call 11.0 late 10% | worker start latency avg 547 us max 5633 us | capped 0
+[12:02:54.557] parallel: site eu4+780951 calls 18 items/call 3925 | per call: wall 5079 us, dispatch 42 us, main wait 5037 us | tasks/call 11.0 late 7% | worker start latency avg 434 us max 5310 us | capped 0
+[12:02:54.557] parallel: site eu4+77f8c1 calls 537 items/call 257 | per call: wall 95 us, dispatch 25 us, main wait 70 us | tasks/call 11.0 late 11% | worker start latency avg 27 us max 131 us | capped 0
+[12:02:54.557] parallel: site eu4+191b42 calls 523 items/call 516 | per call: wall 88 us, dispatch 24 us, main wait 64 us | tasks/call 11.0 late 11% | worker start latency avg 25 us max 207 us | capped 0
+[12:02:54.557] parallel: site eu4+db2525 calls 537 items/call 257 | per call: wall 24 us, dispatch 22 us, main wait 3 us | tasks/call 11.0 late 30% | worker start latency avg 18 us max 69 us | capped 0
+[12:02:54.557] parallel: site eu4+780e01 calls 19 items/call 257 | per call: wall 488 us, dispatch 25 us, main wait 463 us | tasks/call 11.0 late 11% | worker start latency avg 75 us max 583 us | capped 0
+[12:02:54.557] parallel: site eu4+77ef61 calls 18 items/call 257 | per call: wall 126 us, dispatch 30 us, main wait 95 us | tasks/call 11.0 late 11% | worker start latency avg 35 us max 153 us | capped 0
+[12:02:54.557] process exit
