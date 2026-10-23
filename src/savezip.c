@@ -15,9 +15,15 @@
 // blocks share no dictionary, which costs ~0.6% in size at 2 MB. The CRC-32 is computed per block
 // (slice-by-8) and combined. The uncompressed data - and so the game loaded from the save - is
 // unchanged; only the compressed bytes differ.
-// Entries smaller than two blocks and any failure (out of memory, zlib error) go to the original
-// function. Nothing is written before every block is done, so a fallback never leaves half an
-// entry behind.
+// Entries smaller than two blocks and any failure (out of memory, zlib error, a read the stream
+// refuses) go to the original function, which positions the stream itself. Nothing is written before
+// every block is done, so a fallback never leaves half an entry behind. The game checks each entry's
+// CRC when it loads a save, so compressed bytes that did not match the data could not load silently.
+//
+// Save journal (crash reports): after every save one line - time, game date, entry sizes, what the
+// parallel compression and the country writer (savepar.c) did, and the time it took - goes to a list of
+// the session's last saves in crash_reports\saves.txt. A report made in this session or at the next
+// launch carries it, so a save that later fails to load can be traced to how it was written.
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
@@ -185,7 +191,7 @@ static int par_deflate(void** zip, void* in, int size, uint32_t* crc, int level,
     ST_SEEK(in, 0);
     for (int off = 0; off < size; ) {
         int k = size - off; if (k > (16 << 20)) k = 16 << 20;
-        ST_READ(in, data + off, k);
+        if (!ST_READ(in, data + off, k)) goto done;        // the game's memory stream copies all of k or nothing
         off += k;
     }
     for (int i = 0; i < nb; i++) {
@@ -224,6 +230,8 @@ done:
 
 static volatile LONG g_entries, g_par_entries;
 static double g_zip_ms, g_save_ms; static long g_saves;
+static int64_t g_cur_in, g_cur_out;            // this save's entries: bytes in and compressed
+static int g_cur_par, g_cur_n;
 
 static int hk_zip_deflate(void** zip, void* in, uint8_t* buf, uint64_t buf_size, uint32_t* crc, int level) {
     LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
@@ -235,7 +243,8 @@ static int hk_zip_deflate(void** zip, void* in, uint8_t* buf, uint64_t buf_size,
         how = r >= 0 ? "parallel" : "parallel failed -> original";
     }
     if (r < 0) r = o_zip_deflate(zip, in, buf, buf_size, crc, level);
-    else InterlockedIncrement(&g_par_entries);
+    else { InterlockedIncrement(&g_par_entries); g_cur_par++; }
+    g_cur_n++; g_cur_in += size; if (r > 0) g_cur_out += r;
     QueryPerformanceCounter(&t1);
     double ms = (double)(t1.QuadPart - t0.QuadPart) * g_qpf_ms;
     InterlockedIncrement(&g_entries);
@@ -245,14 +254,48 @@ static int hk_zip_deflate(void** zip, void* in, uint8_t* buf, uint64_t buf_size,
     return r;
 }
 
+// ---- save journal ----
+#define NJOURNAL 20
+static char g_jl[NJOURNAL][240];
+static int g_jn;                               // lines so far (the ring holds the last NJOURNAL)
+static char g_journal[NJOURNAL * 240 + 128];
+static void game_date(char* out, size_t n) {   // the gamestate's date (speed.c)
+    uint8_t* gs = *(uint8_t* volatile*)((uint8_t*)g_exe + 0x233fe78u);
+    if (!gs) { snprintf(out, n, "-"); return; }
+    int hours = *(volatile int*)(gs + 0x1dd0) - 43800000, days = hours / 24, y = days / 365, d = days - y * 365, m = 0;
+    static const int ml[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    while (m < 11 && d >= ml[m]) d -= ml[m++];
+    snprintf(out, n, "%d.%d.%d", y, m + 1, d + 1);
+}
+static void journal_add(double ms) {
+    SYSTEMTIME st; GetLocalTime(&st);
+    char date[24]; game_date(date, sizeof date);
+    snprintf(g_jl[g_jn % NJOURNAL], sizeof g_jl[0], "  %02d:%02d:%02d %s | %d entries %lld KB -> %lld KB (%d parallel) | %s | %.0f ms\r\n",
+             st.wHour, st.wMinute, st.wSecond, date, g_cur_n, (long long)(g_cur_in >> 10), (long long)(g_cur_out >> 10), g_cur_par,
+             eb_savepar_status(), ms);
+    g_jn++;
+    int k = snprintf(g_journal, sizeof g_journal, "saves of the session (newest last):\r\n");
+    for (int i = g_jn > NJOURNAL ? g_jn - NJOURNAL : 0; i < g_jn && k < (int)sizeof g_journal - 1; i++)
+        k += snprintf(g_journal + k, sizeof g_journal - (size_t)k, "%s", g_jl[i % NJOURNAL]);
+    if (g_cfg.report_capture && eb_rep_dir[0]) {
+        wchar_t p[MAX_PATH]; _snwprintf(p, MAX_PATH, L"%lssaves.txt", eb_rep_dir);
+        HANDLE h = CreateFileW(p, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, g_journal, (DWORD)strlen(g_journal), &w, NULL); CloseHandle(h); }
+    }
+}
+const char* eb_save_journal(void) { return g_journal; }    // crash.c
+
 static void hk_save(void* helper) {
     LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
     double zip0 = g_zip_ms;
+    g_cur_in = g_cur_out = 0; g_cur_par = g_cur_n = 0;
+    eb_savepar_mark();
     o_save(helper);
     QueryPerformanceCounter(&t1);
     double ms = (double)(t1.QuadPart - t0.QuadPart) * g_qpf_ms;
     g_save_ms += ms; g_saves++;
-    eb_log("save: written in %.0f ms (zip compression %.0f ms)", ms, g_zip_ms - zip0);
+    if (g_cfg.save_stats) eb_log("save: written in %.0f ms (zip compression %.0f ms)", ms, g_zip_ms - zip0);
+    journal_add(ms);
 }
 
 // ---- number formatting while saving ----
@@ -396,7 +439,7 @@ int eb_savezip_install(void) {
         else eb_log("save: unknown eu4.exe - fast_format off");
     }
 #endif
-    if (!g_cfg.save_par && !g_cfg.save_stats) return 0;
+    if (!g_cfg.save_par && !g_cfg.save_stats && !g_cfg.report_capture) return 0;   // the journal needs the save hook
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpf_ms = 1000.0 / (double)f.QuadPart;
     crc_init();
     int kb = g_cfg.save_block_kb;
@@ -437,11 +480,11 @@ int eb_savezip_install(void) {
         eb_log("save: hook failed - save compression unchanged");
         return 0;
     }
-    if (g_cfg.save_stats && ts && MH_CreateHook(ts, (void*)hk_save, (void**)&o_save) == MH_OK) MH_EnableHook(ts);
+    if (ts && MH_CreateHook(ts, (void*)hk_save, (void**)&o_save) == MH_OK) MH_EnableHook(ts);
     if (g_cfg.save_par)
         eb_log("save: parallel zip compression on (%d KB blocks, up to %d threads)", g_block >> 10, g_nthreads);
     else
-        eb_log("save: zip compression timing only (parallel_compress=0)");
+        eb_log("save: zip compression unchanged (parallel_compress=0); timing%s", g_cfg.report_capture ? " and the save journal" : "");
     return 1;
 }
 

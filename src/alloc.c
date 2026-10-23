@@ -57,23 +57,35 @@ static size_t g_zero_min = 65536, g_zero_os;
 static volatile LONG64 g_zeroed, g_zeroed_bytes, g_zeroed_os;
 
 static void* __cdecl hk_malloc(size_t n) {
+    void* p;
     if (g_zero_malloc && (g_zero_malloc == 1 || n >= g_zero_min)) {
-        if (g_zero_os && n >= g_zero_os) { g_zeroed_os++; return HeapAlloc(g_heap, HEAP_ZERO_MEMORY, n ? n : 1); }
-        g_zeroed++; g_zeroed_bytes += n;
-        return mi_zalloc(n);
-    }
-    return mi_malloc(n);
+        if (g_zero_os && n >= g_zero_os) { g_zeroed_os++; p = HeapAlloc(g_heap, HEAP_ZERO_MEMORY, n ? n : 1); }
+        else { g_zeroed++; g_zeroed_bytes += n; p = mi_zalloc(n); }
+    } else p = mi_malloc(n);
+    if (eb_md_on) eb_md_alloc(p, n);
+    return p;
 }
 static void* __cdecl hk_calloc(size_t count, size_t size) {
-    return mi_calloc(count, size);
+    void* p = mi_calloc(count, size);
+    if (eb_md_on && p) eb_md_alloc(p, count * size);
+    return p;
 }
 static void __cdecl hk_free(void* p) {
     if (p == NULL) return;
+    if (eb_md_on) eb_md_free(p);
     if (ours(p)) { mi_free(p); return; }
     InterlockedIncrement64(&g_foreign_free);
     HeapFree(g_heap, 0, p);
 }
+static void* realloc_in(void* p, size_t n);
 static void* __cdecl hk_realloc(void* p, size_t n) {
+    if (!eb_md_on) return realloc_in(p, n);
+    if (p && n == 0) { hk_free(p); return NULL; }
+    void* q = realloc_in(p, n);
+    if (q) { if (p) eb_md_free(p); eb_md_alloc(q, n); }
+    return q;
+}
+static void* realloc_in(void* p, size_t n) {
     if (p == NULL) return mi_malloc(n);
     if (n == 0) { hk_free(p); return NULL; }
     if (ours(p)) return mi_realloc(p, n);
@@ -93,7 +105,11 @@ static size_t __cdecl hk_msize(void* p) {
     return HeapSize(g_heap, 0, p);
 }
 static void* __cdecl hk_recalloc(void* p, size_t count, size_t size) {
-    if (p == NULL || ours(p)) return mi_recalloc(p, count, size);
+    if (p == NULL || ours(p)) {
+        void* q = mi_recalloc(p, count, size);
+        if (eb_md_on && q) { if (p) eb_md_free(p); eb_md_alloc(q, count * size); }
+        return q;
+    }
     // foreign block: emulate _recalloc semantics
     if (size && count > ((size_t)-1) / size) return NULL;
     size_t n = count * size;
@@ -122,7 +138,7 @@ static RtlSizeHeap_t o_RtlSizeHeap;
 static RtlReAllocateHeap_t o_RtlReAllocateHeap;
 
 static BOOLEAN NTAPI g_RtlFreeHeap(PVOID heap, ULONG flags, PVOID p) {
-    if (p != NULL && ours(p)) { InterlockedIncrement64(&g_guard_hits); mi_free(p); return TRUE; }
+    if (p != NULL && ours(p)) { InterlockedIncrement64(&g_guard_hits); if (eb_md_on) eb_md_free(p); mi_free(p); return TRUE; }
     return o_RtlFreeHeap(heap, flags, p);
 }
 static SIZE_T NTAPI g_RtlSizeHeap(PVOID heap, ULONG flags, PVOID p) {
@@ -137,6 +153,7 @@ static PVOID NTAPI g_RtlReAllocateHeap(PVOID heap, ULONG flags, PVOID p, SIZE_T 
         if (flags & HEAP_REALLOC_IN_PLACE_ONLY) q = mi_expand(p, n);
         else q = mi_realloc(p, n ? n : 1);
         if (q && (flags & HEAP_ZERO_MEMORY) && n > old) memset((char*)q + old, 0, n - old);
+        if (q && eb_md_on) { eb_md_free(p); eb_md_alloc(q, n); }
         return q;
     }
     return o_RtlReAllocateHeap(heap, flags, p, n);
@@ -237,6 +254,7 @@ int eb_alloc_install(void) {
         }
     }
 
+    eb_md_init();                                // memory growth diagnostics, before the first hooked allocation
     if (MH_Initialize() != MH_OK) { eb_log("allocator: MinHook init failed"); return 0; }
 
     // guard first, so nothing can slip through between the two steps
@@ -266,6 +284,7 @@ int eb_alloc_install(void) {
     MH_STATUS s = MH_EnableHook(MH_ALL_HOOKS);   // MinHook suspends other threads while patching
     if (s != MH_OK) { eb_log("allocator: enable failed (%s)", MH_StatusToString(s)); return 0; }
     eb_log("allocator: %u CRT entry points redirected%s", (unsigned)NTARGETS, g_cfg.alloc_guard_foreign ? ", heap guard on" : "");
+    eb_md_start();
     return 1;
 }
 

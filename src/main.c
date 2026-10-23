@@ -101,6 +101,8 @@ static void load_config(void) {
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
     c->ui_timing            = ini_int(ini, L"general",   L"ui_timing", 0);       // diagnostics
+    c->mem_sites            = ini_int(ini, L"diag",      L"mem_sites", 0);
+    c->mem_sites_s          = ini_int(ini, L"diag",      L"mem_sites_s", 60);
     c->report_capture       = ini_int(ini, L"report",    L"capture", 1);
     c->report_upload        = ini_int(ini, L"report",    L"upload", -1);
     c->report_hang_s        = ini_int(ini, L"report",    L"hang_seconds", 45);
@@ -113,6 +115,8 @@ static void load_config(void) {
     if (c->slow_stall_ms < 1000) c->slow_stall_ms = 1000;
     if (c->slow_load_s < 1) c->slow_load_s = 1;
     GetPrivateProfileStringW(L"report", L"url", L"", c->report_url, 256, ini);
+    c->update_auto          = ini_int(ini, L"update",    L"auto", 1);
+    GetPrivateProfileStringW(L"update", L"url", L"", c->update_url, 256, ini);
     {
         wchar_t v[32];
         GetPrivateProfileStringW(L"threads", L"main_thread", L"free", v, 32, ini);
@@ -198,6 +202,7 @@ static void init(void) {
     eb_uitime_install();
     eb_crash_install();          // last: its frame counter chains to the other POPS hooks
     eb_report_start();
+    eb_update_start();
     if (g_cfg.prof_enabled) {
         if (eb_prof_start_thread()) eb_log("profiler: ready (Ctrl+Alt+P to start/stop)");
     }

@@ -25,7 +25,10 @@
 // are compared with the parallel ones), 3 = serial precompute on the main thread + verify.
 // Anything unexpected (another call order, a country missing, a lazy object missing) falls back
 // to the original call for the rest of the loop; nothing parallel is written before the batch is
-// complete.
+// complete. Every country's bytes are also checked before any of them is used (balanced(): the binary
+// tokens walk through and every '{' is closed); if one fails, the whole save is written the original
+// way. A save that loads with its blocks out of step - a player's save on 2026-10-23 broke that way,
+// though before the countries - can then never come from this code.
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
@@ -115,7 +118,7 @@ static void hk_static_l(void* list, void* writer) {           // FUN_140451740 w
 
 // ---- the batch ---------------------------------------------------------------------------------
 #define MAXW 15
-typedef struct { uint8_t* c; int thr; int64_t beg, end; } sjob_t;
+typedef struct { uint8_t* c; int thr, ok; int64_t beg, end; } sjob_t;
 static sjob_t* g_jobs;
 static int g_jobcap;
 static volatile LONG g_njobs, g_next, g_done, g_pending;
@@ -125,7 +128,8 @@ static void* g_stream[MAXW + 1];                    // per thread, [0] = main
 static uint8_t g_wtmpl[0x20];                       // the game's writer as the loop uses it
 static int g_mode_ms, g_mode2_ms;                   // the real stream's mode fields
 static int g_active, g_k, g_n;                      // batch state: next index, countries
-static LONG64 g_saves, g_batches, g_fallback, g_emitted, g_ver, g_ver_bad, g_bytes;
+static LONG64 g_saves, g_batches, g_fallback, g_emitted, g_ver, g_ver_bad, g_bytes, g_checked, g_check_bad;
+static char g_status[160];                          // what the latest save's country loop did (savezip.c's save journal)
 static double g_pre_ms, g_pre_max, g_qpf_ms;
 static int g_logged;
 
@@ -145,6 +149,32 @@ static int64_t scmp(void* s, int64_t pos, const uint8_t* p, int64_t len) {
         if (b != p[i]) return i;
     }
     return -1;
+}
+
+// One country in the binary save format: u16 tokens; '{' 0x0003, '}' 0x0004, '=' 0x0001; tokens with a
+// payload: 0x000c i32, 0x000d f32, 0x0014 u32 (4 bytes), 0x000e bool (1), 0x0167 fixed-point and 0x029c
+// u64 (8), 0x000f and 0x0017 strings (u16 length, then the bytes); every other token is a name. The bytes
+// must end exactly at a token's end, with every block that was opened closed again.
+static int balanced(const uint8_t* p, int64_t n) {
+    int64_t i = 0; int depth = 0, opened = 0;
+    if (!p || n <= 0) return 0;
+    while (i + 2 <= n) {
+        unsigned t = (unsigned)p[i] | (unsigned)p[i + 1] << 8;
+        i += 2;
+        switch (t) {
+        case 0x0003: depth++; opened = 1; break;
+        case 0x0004: if (--depth < 0) return 0; break;
+        case 0x000c: case 0x000d: case 0x0014: i += 4; break;
+        case 0x000e: i += 1; break;
+        case 0x0167: case 0x029c: i += 8; break;
+        case 0x000f: case 0x0017:
+            if (i + 2 > n) return 0;
+            i += 2 + ((int64_t)p[i] | (int64_t)p[i + 1] << 8);
+            break;
+        default: break;
+        }
+    }
+    return i == n && depth == 0 && opened;
 }
 
 static void* new_stream(void) {
@@ -178,6 +208,7 @@ static void run_jobs(int thr) {
         o_keyobj(w, key, j->c);
         game_strfree(key);
         j->end = vsize(g_stream[thr]);
+        j->ok = balanced(vdata(g_stream[thr]) + j->beg, j->end - j->beg);   // right after writing, while the bytes are in cache
         j->thr = thr;
         InterlockedIncrement(&g_done);
     }
@@ -229,7 +260,7 @@ static const char* start_batch(uint8_t* writer, uint8_t** list, int n) {
     int threads = g_cfg.save_countries == 3 ? 1 : 1 + g_nw;
     if (threads > n) threads = n;
     for (int i = 0; i < threads; i++) if (!(g_stream[i] = new_stream())) { free_streams(); return "out of memory"; }
-    for (int i = 0; i < n; i++) { g_jobs[i].c = list[i]; g_jobs[i].thr = -1; g_jobs[i].beg = g_jobs[i].end = 0; }
+    for (int i = 0; i < n; i++) { g_jobs[i].c = list[i]; g_jobs[i].thr = -1; g_jobs[i].ok = 0; g_jobs[i].beg = g_jobs[i].end = 0; }
     LONGLONG t0 = qpc();
     while (g_pending) YieldProcessor();
     g_next = 0; g_done = 0;
@@ -245,6 +276,18 @@ static const char* start_batch(uint8_t* writer, uint8_t** list, int n) {
     g_pre_ms += ms; if (ms > g_pre_max) g_pre_max = ms;
     int64_t bytes = 0;
     for (int i = 0; i < n; i++) { if (g_jobs[i].thr < 0) { free_streams(); return "a country was not written"; } bytes += g_jobs[i].end - g_jobs[i].beg; }
+    int bad = 0, first = -1;
+    for (int i = 0; i < n; i++) if (!g_jobs[i].ok) { if (first < 0) first = i; bad++; }
+    g_checked += n;
+    if (bad) {
+        g_check_bad += bad;
+        static int logged;
+        if (logged++ < 5)
+            eb_log("save: CHECK FAILED - %d of %d countries' bytes do not close (first: %d, %.3s, %lld bytes) - this save is written the original way",
+                   bad, n, first, (const char*)(g_jobs[first].c + 0x20), (long long)(g_jobs[first].end - g_jobs[first].beg));
+        free_streams();
+        return "the check of a country's bytes failed";
+    }
     g_bytes += bytes;
     if (g_cfg.save_stats) eb_log("save: %d countries serialized in %.1f ms on %d threads (%.1f MB)", n, ms, threads, (double)bytes / 1048576.0);
     return NULL;
@@ -268,11 +311,16 @@ static void hk_keyobj(void* writer, void* key, void* obj) {
         const char* why = start_batch((uint8_t*)writer, list, n);
         if (why) {
             g_fallback++;
+            snprintf(g_status, sizeof g_status, "countries original (%s)", why);
             if (g_logged++ < 10) eb_log("save: countries written the original way (%s)", why);
-        } else { g_active = 1; g_k = 0; g_n = n; g_batches++; }
+        } else { g_active = 1; g_k = 0; g_n = n; g_batches++; snprintf(g_status, sizeof g_status, "countries parallel (%d, checked)", n); }
     }
     if (!g_active || g_k >= g_n || obj != g_jobs[g_k].c) {
-        if (g_active) { end_batch(); g_fallback++; if (g_logged++ < 10) eb_log("save: country loop order differs at %d - rest written the original way", g_k); }
+        if (g_active) {
+            end_batch(); g_fallback++;
+            size_t l = strlen(g_status); snprintf(g_status + l, sizeof g_status - l, "; original from %d on", g_k);
+            if (g_logged++ < 10) eb_log("save: country loop order differs at %d - rest written the original way", g_k);
+        }
         o_keyobj(writer, key, obj);
         return;
     }
@@ -353,10 +401,39 @@ int eb_savepar_install(void) {
 #endif
 }
 
+#ifdef EB_TEST
+// self-test of balanced() on hand-made token streams; returns the number of wrong answers
+__declspec(dllexport) int eb_test_balanced(void) {
+    static const uint8_t ok1[] = { 0x17,0x00, 3,0, 'S','W','E', 0x01,0x00, 0x03,0x00,            // SWE = {
+                                   0x34,0x12, 0x01,0x00, 0x0c,0x00, 1,2,3,4,                     //   name = i32
+                                   0x35,0x12, 0x01,0x00, 0x0f,0x00, 4,0, 0x03,0x00,0x04,0x04,    //   name = "\3\0\4\4" (tokens inside a string)
+                                   0x36,0x12, 0x01,0x00, 0x03,0x00, 0x0e,0x00, 1, 0x67,0x01, 1,2,3,4,5,6,7,8, 0x04,0x00,   //   name = { bool f64 }
+                                   0x04,0x00 };                                                  // }
+    static const uint8_t open1[] = { 0x17,0x00, 1,0, 'X', 0x01,0x00, 0x03,0x00, 0x03,0x00, 0x04,0x00 };   // one block left open
+    static const uint8_t close1[] = { 0x03,0x00, 0x04,0x00, 0x04,0x00 };                       // one '}' too many
+    static const uint8_t cut1[] = { 0x03,0x00, 0x0c,0x00, 1,2, 0x04,0x00 };                    // i32 cut short: ends inside a value
+    static const uint8_t str1[] = { 0x03,0x00, 0x0f,0x00, 9,0, 'a', 0x04,0x00 };               // string longer than the bytes
+    int bad = 0;
+    bad += balanced(ok1, sizeof ok1) != 1;
+    bad += balanced(open1, sizeof open1) != 0;
+    bad += balanced(close1, sizeof close1) != 0;
+    bad += balanced(cut1, sizeof cut1) != 0;
+    bad += balanced(str1, sizeof str1) != 0;
+    bad += balanced(ok1, sizeof ok1 - 2) != 0;                  // the last '}' missing
+    bad += balanced(NULL, 0) != 0;
+    eb_log("TEST balanced: %d wrong answers", bad);
+    return bad;
+}
+#endif
+
+// savezip.c: before a save (clear) and after it (what the country loop did)
+void eb_savepar_mark(void) { g_status[0] = 0; }
+const char* eb_savepar_status(void) { return g_status[0] ? g_status : o_keyobj ? "countries not reached" : "parallel countries off"; }
+
 void eb_savepar_report(void) {
     if (!o_keyobj) return;
-    eb_log("save: parallel countries: %lld saves, %lld batches (%.1f ms avg, %.1f max, %.1f MB avg), %lld fallbacks, %lld countries appended | verify %lld, mismatches %lld",
+    eb_log("save: parallel countries: %lld saves, %lld batches (%.1f ms avg, %.1f max, %.1f MB avg), %lld fallbacks, %lld countries appended | checked %lld, failed %lld | verify %lld, mismatches %lld",
            (long long)g_saves, (long long)g_batches, g_batches ? g_pre_ms / (double)g_batches : 0.0, g_pre_max,
            g_batches ? (double)g_bytes / 1048576.0 / (double)g_batches : 0.0, (long long)g_fallback, (long long)g_emitted,
-           (long long)g_ver, (long long)g_ver_bad);
+           (long long)g_checked, (long long)g_check_bad, (long long)g_ver, (long long)g_ver_bad);
 }

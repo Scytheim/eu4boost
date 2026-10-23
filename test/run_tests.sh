@@ -12,8 +12,8 @@ CC="clang --target=x86_64-w64-windows-gnu"
 CFLAGS="-O2 -DNDEBUG -DEB_TEST -D__USE_MINGW_ANSI_STDIO=1 -D_WIN32_WINNT=0x0A00 -Wall -Wno-unused-function -fno-strict-aliasing"
 # the EB_TEST build skips the eu4.exe signature checks, so those tables are unused there
 CFLAGS="$CFLAGS -Wno-unused-const-variable"
-for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $T/$f.o; done
-$CC -shared -static -fuse-ld=lld -o $T/eu4boost_test.dll $T/main.o $T/alloc.o $T/profiler.o $T/threads.o $T/online.o $T/speed.o $T/parallel.o $T/savezip.o $T/savepar.o $T/modifier.o $T/country.o $T/console.o $T/guard.o $T/aiprof.o $T/uitime.o $T/crash.o $T/report.o build/mimalloc.o build/mh_*.o \
+for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report memdiag update; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $T/$f.o; done
+$CC -shared -static -fuse-ld=lld -o $T/eu4boost_test.dll $T/main.o $T/alloc.o $T/profiler.o $T/threads.o $T/online.o $T/speed.o $T/parallel.o $T/savezip.o $T/savepar.o $T/modifier.o $T/country.o $T/console.o $T/guard.o $T/aiprof.o $T/uitime.o $T/crash.o $T/report.o $T/memdiag.o $T/update.o build/mimalloc.o build/mh_*.o \
     -Wl,--exclude-all-symbols -lpsapi -lwinmm -ladvapi32 -lwinhttp -lbcrypt -luser32 -lkernel32
 $CC -shared -fuse-ld=lld -o $T/pops_api.dll test/fake_pops.c -Wl,--out-implib,$T/libpops_api.a
 $CC -O1 -fuse-ld=lld -o $T/harness.exe test/harness.c -L$T -lpops_api
@@ -50,5 +50,9 @@ run modadd     '[general]\r\nlog=1\r\n[modifiers]\r\nfast_add=1\r\n' 300 modadd
 run modadd_sse2 '[general]\r\nlog=1\r\n[modifiers]\r\nfast_add=1\r\nfast_search=2\r\n' 300 modadd
 run pacing     '[general]\r\nlog=1\r\n[render]\r\nspeed5_days_per_frame=3\r\n' 300 pacing
 run guard      '[general]\r\nlog=1\r\n' 300 guard
+run stackwalk  '[general]\r\nlog=1\r\n' 300 stackwalk
+rm -f $T/eu4boost_memsites.tsv
+run memsites   '[general]\r\nlog=1\r\n[diag]\r\nmem_sites=4\r\nmem_sites_s=5\r\n' 6500 none
+grep -q '^#snap' $T/eu4boost_memsites.tsv 2>/dev/null || { echo "memsites: no snapshot"; failed="$failed memsites"; }
 if [ -n "$failed" ]; then echo "FAILED:$failed"; exit 1; fi
-echo "all 14 cases passed"
+echo "all 16 cases passed"

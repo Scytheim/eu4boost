@@ -555,6 +555,12 @@ int main(int argc, char** argv) {
         int (*tf)(void) = (int (*)(void))GetProcAddress(h, "eb_test_fmt");
         CHECK(tf != NULL);
         if (tf) { int d = tf(); printf("number formatting: %d differences\n", d); CHECK(d == 0); }
+        int (*tb)(void) = (int (*)(void))GetProcAddress(h, "eb_test_balanced");     // savepar.c's check of a country's bytes
+        CHECK(tb != NULL);
+        if (tb) { int d = tb(); printf("country byte check: %d wrong answers\n", d); CHECK(d == 0); }
+        int (*tu)(void) = (int (*)(void))GetProcAddress(h, "eb_test_update");          // update.c: versions, release list, signature
+        CHECK(tu != NULL);
+        if (tu) { int d = tu(); printf("auto-update checks: %d wrong answers\n", d); CHECK(d == 0); }
     }
 
     // 3h. modifier-container add (fast path vs the game's algorithm)
@@ -562,6 +568,22 @@ int main(int argc, char** argv) {
 
     // 3i. crash guards (freed tooltip sources, missing relation)
     if (argc > 3 && strcmp(argv[3], "guard") == 0) guard_test();
+
+    // 3j. stack samples of a running thread (crash.c): it stays suspended for the walk, so 20,000 samples
+    //     of a thread whose stack keeps changing walk cleanly; walking after the resume (0.4.1) is shown too
+    if (argc > 3 && strcmp(argv[3], "stackwalk") == 0) {
+        typedef int (*sw_t)(int, int, double*, int*, int*);
+        sw_t sw = (sw_t)GetProcAddress(h, "eb_test_stackwalk");
+        CHECK(sw != NULL);
+        if (sw) {
+            double us = 0; int deep = 0, faults = 0;
+            int ok = sw(20000, 0, &us, &deep, &faults);
+            printf("stackwalk: %d of 20000 samples walked, %d with 3+ frames of the test function, %d faults, suspended %.1f us on average\n", ok, deep, faults, us);
+            CHECK(ok == 20000 && deep > 10000 && faults == 0);
+            ok = sw(20000, 1, &us, &deep, &faults);
+            printf("stackwalk after the resume (0.4.1): %d walked, %d with 3+ frames, %d faults caught by the guard\n", ok, deep, faults);
+        }
+    }
 
     // 4. multi-threaded churn (also gives the profiler something to sample)
     HANDLE th[8]; for (int i = 0; i < 8; i++) th[i] = CreateThread(NULL, 0, churn, (LPVOID)(uintptr_t)(i + 1), 0, NULL);

@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.1"
+#define EU4BOOST_VERSION "0.4.2"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -80,6 +80,8 @@ typedef struct {
     int guard_relation;           // 1 = a missing relation on annexation is skipped instead of crashing
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
+    int mem_sites;                // memdiag.c: keep the call sites of 1 in N allocations (0 = off; needs the allocator)
+    int mem_sites_s;              // ... and write a snapshot every this many seconds
     // crash reports (crash.c writes them, report.c sends them)
     int report_capture;           // 1 = write a local report when the game crashes, hangs or ends abnormally
     int report_upload;            // -1 = ask once, 0 = never send, 1 = send pending reports at launch
@@ -90,6 +92,9 @@ typedef struct {
     int slow_stall_ms;            // ... no frame for this many ms outside a load
     int slow_load_s;              // ... a load (start -> first game frame) over this many seconds
     wchar_t report_url[256];      // report endpoint ("" = the one built in)
+    // auto-update (update.c)
+    int update_auto;              // 1 = a newer signed release is downloaded and used from the next launch
+    wchar_t update_url[256];      // release list ("" = GitHub's latest release of Scytheim/eu4boost; tests only)
 } eb_config_t;
 
 extern eb_config_t g_cfg;
@@ -135,6 +140,9 @@ void eb_savezip_report(void);
 // savepar.c
 int  eb_savepar_install(void);
 void eb_savepar_report(void);
+void eb_savepar_mark(void);              // savezip.c, around every save: what the country loop did
+const char* eb_savepar_status(void);
+const char* eb_save_journal(void);       // savezip.c: the session's last saves (crash.c puts it in reports)
 
 // console.c
 int  eb_console_install(void);
@@ -157,11 +165,19 @@ extern volatile int eb_in_day;         // crash.c: inside the daily tick (set by
 // uitime.c
 int  eb_uitime_install(void);
 
+// memdiag.c (called by alloc.c's hooks while eb_md_on)
+extern int eb_md_on;
+int  eb_md_init(void);
+void eb_md_start(void);
+void eb_md_alloc(void* p, size_t n);
+void eb_md_free(void* p);
+
 // crash.c, report.c
 extern wchar_t eb_rep_dir[MAX_PATH];   // <plugins>\crash_reports\ .
 int  eb_crash_install(void);
 void eb_crash_exit(void);
 void eb_report_start(void);
+void eb_update_start(void);            // update.c
 void eb_rm_dir(const wchar_t* dir);    // a folder with files only
 extern volatile int eb_loading;        // uitime.c: a save is being loaded or a new game set up
 void eb_slow_event(const char* what, double ms, double limit_ms, const char* detail);

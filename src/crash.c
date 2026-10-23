@@ -20,11 +20,22 @@
 //   slow_stall_ms (2 s) outside a load - and samples the main thread's stack at 1, 2, 4 and 8 s of the
 //   stall; during a load it samples every 5 s. Events go to pending\<session>_slow\, which is sent
 //   once the session is over (at most one slow report a day, report.c).
+// call stacks: another thread stays suspended for the whole walk (see "call stacks" below).
+// saves: savezip.c keeps a journal of the session's saves (crash_reports\saves.txt). Crash and hang
+//   reports carry this session's and the previous one's (a save that fails to load was usually written
+//   in an earlier session); an abnormal-exit report carries the ended session's.
+// heartbeat: every minute the watchdog writes the session's state (memory and commit left, game date,
+//   frames) to crash_reports\heartbeat.txt; an abnormal-exit report carries the last one, so a game that
+//   ran out of memory (its abort cannot be caught) can be told from a killed one.
+// mods: at load the enabled mods of this session (dlc_load.json, in load order) are listed with the
+//   name, version and Workshop id from their .mod files into crash_reports\mods.txt; every report of
+//   the session gets that list (a report made at the next launch gets the old session's file).
 // test_keys=1 (testing only): Ctrl+Alt+Shift+F9 crashes the main thread, +F10 hangs it for 70 s,
-//   +F11 stalls it for 3 s.
+//   +F11 stalls it for 3 s, +F8 samples the main thread's stack 2,000 times.
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <wchar.h>
 #include <psapi.h>
 #include "MinHook.h"
@@ -46,6 +57,12 @@ static int g_slow_n;
 static double g_slow_ratio;               // the worst event so far: its time / its limit
 static char g_lsamp[4096];                // main thread samples of the current load
 static int g_lsamp_n;
+static char g_mods[16 * 1024];            // this session's mods for the reports (built at load)
+static char g_prev_mods[16 * 1024];       // the previous session's (mods.txt), for reports made at this launch
+static char g_prev_saves[8 * 1024];       // the save journal of the latest session that saved (saves.txt, savezip.c)
+static char g_prev_beat[2048];            // the previous session's last heartbeat (heartbeat.txt)
+static const char g_nolog[] = "The plugin log of that session is not here (log=0 in eu4boost.ini, or a later launch replaced it).\r\n";
+static volatile LONG g_test_burst;        // test_keys: F8 asked for a burst of stack samples
 
 // ---- text building without the heap (it also runs in a crashed process) ----
 typedef struct { char* p; int n, cap; } sb_t;
@@ -115,20 +132,189 @@ static int interesting(uint64_t a) {
     return !_stricmp(name, "eu4.exe") || !_stricmp(name, "eu4boost.dll") || !_stricmp(name, "plugin64.dll");
 }
 
-// call stack by unwinding (x64 unwind data of every module)
-static int walk(const CONTEXT* c0, uint64_t* pcs, int max) {
-    CONTEXT c = *c0; int n = 0;
-    while (n < max) {
-        uint64_t pc = c.Rip, sp = c.Rsp;
-        if (!pc || !readable(pc, 1)) break;
-        pcs[n++] = pc;
-        if (!readable(sp, 512)) break;
-        DWORD64 base = 0; PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(pc, &base, NULL);
-        if (f) { PVOID hd; DWORD64 ef; RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, pc, f, &c, &hd, &ef, NULL); }
-        else { c.Rip = *(DWORD64*)sp; c.Rsp = sp + 8; }       // leaf function: return address on top
-        if (!c.Rip || (c.Rip == pc && c.Rsp == sp)) break;
+// ---- call stacks ----
+// A stack is walked with the modules' own unwind data (.pdata, RtlVirtualUnwind) from a table of the
+// loaded modules built just before, reading only inside that thread's stack. Another thread stays
+// suspended for the whole walk, and the walk takes no lock (no loader or heap call), so it cannot wait
+// on a lock the suspended thread holds - as in profiler.c. 0.4.1 resumed the thread first and then
+// walked a stack that kept changing: a frame register restored from it sent RtlVirtualUnwind to
+// address 0x40 and crashed a player's game (crash report of 2026-10-23). The walk also runs behind a
+// fault guard, so a broken frame ends the walk (and the thread is resumed) instead of the game.
+typedef struct { uint64_t base, end; const RUNTIME_FUNCTION* pd; DWORD npd; } mod_t;
+typedef struct { mod_t m[512]; int n; } mods_t;
+static mods_t g_wd_mods, g_cr_mods;       // the watchdog's and the crash writer's (both may walk at once)
+
+static int mods_build(void* p) {
+    mods_t* t = (mods_t*)p;
+    HMODULE h[512]; DWORD need = 0; t->n = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), h, sizeof h, &need)) return 0;
+    int n = (int)(need / sizeof(HMODULE)); if (n > 512) n = 512;
+    for (int i = 0; i < n; i++) {
+        const uint8_t* b = (const uint8_t*)h[i];
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)b;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(b + dos->e_lfanew);
+        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) continue;
+        mod_t m = { (uint64_t)(uintptr_t)b, (uint64_t)(uintptr_t)b + nt->OptionalHeader.SizeOfImage, NULL, 0 };
+        const IMAGE_DATA_DIRECTORY* d = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (d->VirtualAddress && d->Size && (uint64_t)d->VirtualAddress + d->Size <= nt->OptionalHeader.SizeOfImage) {
+            m.pd = (const RUNTIME_FUNCTION*)(b + d->VirtualAddress); m.npd = d->Size / sizeof(RUNTIME_FUNCTION);
+        }
+        int j = t->n++;                                       // sorted by base
+        while (j > 0 && t->m[j - 1].base > m.base) { t->m[j] = t->m[j - 1]; j--; }
+        t->m[j] = m;
     }
-    return n;
+    return t->n;
+}
+static const mod_t* mods_find(const mods_t* t, uint64_t pc) {
+    int lo = 0, hi = t->n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (pc < t->m[mid].base) hi = mid - 1; else if (pc >= t->m[mid].end) lo = mid + 1; else return &t->m[mid];
+    }
+    return NULL;
+}
+static const RUNTIME_FUNCTION* fn_find(const mod_t* m, uint64_t pc) {
+    DWORD rva = (DWORD)(pc - m->base); int lo = 0, hi = (int)m->npd - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1; const RUNTIME_FUNCTION* f = &m->pd[mid];
+        if (rva < f->BeginAddress) hi = mid - 1; else if (rva >= f->EndAddress) lo = mid + 1; else return f;
+    }
+    return NULL;
+}
+// once its prologue has set it, the frame register (rbp...) that f's unwind data starts from lies in the stack
+static int frame_ok(const mod_t* m, const RUNTIME_FUNCTION* f, uint64_t pc, const CONTEXT* c, uint64_t lo, uint64_t hi) {
+    if (f->UnwindData & 1) return 1;                          // an indirect entry: RtlVirtualUnwind follows it
+    if ((uint64_t)f->UnwindData + 4 > m->end - m->base) return 0;
+    const uint8_t* u = (const uint8_t*)(uintptr_t)(m->base + f->UnwindData);   // UNWIND_INFO: [1] prologue size, [3] frame register
+    int reg = u[3] & 15;
+    if (!reg || pc - m->base - f->BeginAddress < u[1]) return 1;
+    uint64_t v = (&c->Rax)[reg];                              // CONTEXT keeps rax..r15 in the unwind codes' order
+    return v >= lo && v <= hi;
+}
+typedef struct { CONTEXT c; uint64_t lo, hi; const mods_t* mods; uint64_t* pcs; int max, n; } walk_t;
+static int walk_body(void* p) {
+    walk_t* w = (walk_t*)p; CONTEXT* c = &w->c;
+    while (w->n < w->max) {
+        uint64_t pc = c->Rip, sp = c->Rsp;
+        if (!pc) break;
+        w->pcs[w->n++] = pc;
+        if (sp < w->lo || sp + 8 > w->hi || (sp & 7)) break;
+        const mod_t* m = mods_find(w->mods, pc);
+        if (!m && w->n > 1) break;                            // only the first frame may be outside a module (a bad call target)
+        const RUNTIME_FUNCTION* f = m && m->pd ? fn_find(m, pc) : NULL;
+        if (!f) { c->Rip = *(const DWORD64*)(uintptr_t)sp; c->Rsp = sp + 8; }    // leaf function: return address on top
+        else {
+            if (!frame_ok(m, f, pc, c, w->lo, w->hi)) break;
+            PVOID hd; DWORD64 ef;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, m->base, pc, (PRUNTIME_FUNCTION)f, c, &hd, &ef, NULL);
+        }
+        if (c->Rsp <= sp || c->Rsp > w->hi) break;            // unwinding only moves towards the stack base
+    }
+    return w->n;
+}
+
+// fault guard: eb_guard_call(fn, arg, &rsp) returns fn(arg), or -1 when fn faults - the vectored
+// handler moves the thread to eb_guard_fail with the stack pointer saved here
+int eb_guard_call(int (*fn)(void*), void* arg, volatile uint64_t* rsp);
+extern char eb_guard_fail[];
+__asm__(".text\n"
+        ".globl eb_guard_call\n"
+        "eb_guard_call:\n"
+        "    pushq %rbx\n    pushq %rbp\n    pushq %rdi\n    pushq %rsi\n"
+        "    pushq %r12\n    pushq %r13\n    pushq %r14\n    pushq %r15\n"
+        "    subq $0xa8, %rsp\n"
+        "    movdqu %xmm6, 0x00(%rsp)\n    movdqu %xmm7, 0x10(%rsp)\n    movdqu %xmm8, 0x20(%rsp)\n    movdqu %xmm9, 0x30(%rsp)\n"
+        "    movdqu %xmm10, 0x40(%rsp)\n    movdqu %xmm11, 0x50(%rsp)\n    movdqu %xmm12, 0x60(%rsp)\n    movdqu %xmm13, 0x70(%rsp)\n"
+        "    movdqu %xmm14, 0x80(%rsp)\n    movdqu %xmm15, 0x90(%rsp)\n"
+        "    movq %rsp, (%r8)\n"
+        "    movq %rcx, %rax\n    movq %rdx, %rcx\n"
+        "    subq $0x20, %rsp\n"
+        "    callq *%rax\n"
+        "    addq $0x20, %rsp\n"
+        ".Leb_guard_out:\n"
+        "    movdqu 0x00(%rsp), %xmm6\n    movdqu 0x10(%rsp), %xmm7\n    movdqu 0x20(%rsp), %xmm8\n    movdqu 0x30(%rsp), %xmm9\n"
+        "    movdqu 0x40(%rsp), %xmm10\n    movdqu 0x50(%rsp), %xmm11\n    movdqu 0x60(%rsp), %xmm12\n    movdqu 0x70(%rsp), %xmm13\n"
+        "    movdqu 0x80(%rsp), %xmm14\n    movdqu 0x90(%rsp), %xmm15\n"
+        "    addq $0xa8, %rsp\n"
+        "    popq %r15\n    popq %r14\n    popq %r13\n    popq %r12\n"
+        "    popq %rsi\n    popq %rdi\n    popq %rbp\n    popq %rbx\n"
+        "    ret\n"
+        ".globl eb_guard_fail\n"
+        "eb_guard_fail:\n"
+        "    movl $-1, %eax\n"
+        "    jmp .Leb_guard_out\n");
+typedef struct { volatile LONG tid; volatile uint64_t rsp; } gslot_t;
+static gslot_t g_gslot[4];
+static PVOID g_guard_veh;
+static volatile LONG g_guard_faults;
+static LONG CALLBACK guard_veh(EXCEPTION_POINTERS* e) {
+    if ((e->ExceptionRecord->ExceptionCode & 0xF0000000u) != 0xC0000000u) return EXCEPTION_CONTINUE_SEARCH;   // errors only
+    LONG me = (LONG)GetCurrentThreadId();
+    for (int i = 0; i < 4; i++)
+        if (g_gslot[i].tid == me && g_gslot[i].rsp) {
+            e->ContextRecord->Rsp = g_gslot[i].rsp; e->ContextRecord->Rip = (DWORD64)(uintptr_t)eb_guard_fail;
+            InterlockedIncrement(&g_guard_faults);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void guard_init(void) { if (!g_guard_veh) g_guard_veh = AddVectoredExceptionHandler(1, guard_veh); }
+static int guarded(int (*fn)(void*), void* arg) {
+    LONG me = (LONG)GetCurrentThreadId(); int s = -1;
+    for (int i = 0; i < 4 && s < 0; i++) if (InterlockedCompareExchange(&g_gslot[i].tid, me, 0) == 0) s = i;
+    if (s < 0) return -1;
+    g_gslot[s].rsp = 0;
+    int r = eb_guard_call(fn, arg, &g_gslot[s].rsp);
+    g_gslot[s].rsp = 0; g_gslot[s].tid = 0;
+    return r;
+}
+
+// the stack of a thread: [allocation base of the stack, stack base)
+typedef LONG (NTAPI *ntqit_t)(HANDLE, int, PVOID, ULONG, PULONG);
+static int stack_of(const NT_TIB* tib, uint64_t* lo, uint64_t* hi) {
+    MEMORY_BASIC_INFORMATION mi;
+    *hi = (uint64_t)(uintptr_t)tib->StackBase;
+    *lo = VirtualQuery((const uint8_t*)tib->StackBase - 1, &mi, sizeof mi) ? (uint64_t)(uintptr_t)mi.AllocationBase : (uint64_t)(uintptr_t)tib->StackLimit;
+    return *hi > *lo;
+}
+static int thread_stack(HANDLE th, uint64_t* lo, uint64_t* hi) {
+    ntqit_t q = (ntqit_t)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+    struct { LONG ExitStatus; PVOID Teb; PVOID UniqueProcess; PVOID UniqueThread; ULONG_PTR AffinityMask; LONG Priority; LONG BasePriority; } tbi;
+    *lo = *hi = 0;
+    return q && q(th, 0 /* ThreadBasicInformation */, &tbi, sizeof tbi, NULL) == 0 && tbi.Teb && stack_of((const NT_TIB*)tbi.Teb, lo, hi);
+}
+// the call stack from a context whose stack does not change meanwhile (the crashing thread waits for us)
+static int walk_ctx(const CONTEXT* c, uint64_t lo, uint64_t hi, mods_t* mods, uint64_t* pcs, int max) {
+    if (!g_guard_veh || max < 1) return 0;
+    walk_t w; memset(&w, 0, sizeof w);
+    w.c = *c; w.lo = lo; w.hi = hi; w.mods = mods; w.pcs = pcs; w.max = max;
+    if (guarded(mods_build, mods) < 0) mods->n = 0;
+    guarded(walk_body, &w);
+    if (!w.n) pcs[w.n++] = c->Rip;
+    return w.n;
+}
+// registers and call stack of another thread, which stays suspended for the walk (tens of us)
+static LONG64 g_samples, g_sample_t, g_sample_max;   // samples: count, QPC ticks the thread was suspended (sum, longest)
+static uint64_t g_main_lo, g_main_hi;
+static int sample_thread(HANDLE th, uint64_t lo, uint64_t hi, mods_t* mods, CONTEXT* out, uint64_t* pcs, int max) {
+    memset(out, 0, sizeof *out);
+    if (!g_guard_veh || !hi || max < 1 || guarded(mods_build, mods) <= 0) return 0;
+    walk_t w; memset(&w, 0, sizeof w);
+    w.c.ContextFlags = CONTEXT_FULL; w.lo = lo; w.hi = hi; w.mods = mods; w.pcs = pcs; w.max = max;
+    HANDLE self = GetCurrentThread(); int prio = GetThreadPriority(self);
+    SetThreadPriority(self, THREAD_PRIORITY_TIME_CRITICAL);    // not put aside by the scheduler while the other thread waits
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    if (SuspendThread(th) == (DWORD)-1) { SetThreadPriority(self, prio); return 0; }
+    int ok = GetThreadContext(th, &w.c);
+    if (ok) { *out = w.c; guarded(walk_body, &w); }
+    ResumeThread(th);
+    QueryPerformanceCounter(&t1);
+    SetThreadPriority(self, prio);
+    LONG64 d = t1.QuadPart - t0.QuadPart;
+    InterlockedIncrement64(&g_samples); InterlockedAdd64(&g_sample_t, d);
+    if (d > g_sample_max) g_sample_max = d;
+    return ok ? w.n : 0;
 }
 // values on the stack that point just behind a call instruction in a module (return addresses)
 static int after_call(uint64_t v) {
@@ -152,12 +338,14 @@ static void s_scan(sb_t* b, uint64_t rsp, int max) {
         s_put(b, "  rsp+"); s_hex(b, p - rsp, 1); s_put(b, "  "); s_addr(b, v); s_put(b, "\r\n"); n++;
     }
 }
-static void s_stack(sb_t* b, const CONTEXT* c) {
-    uint64_t pcs[64]; int n = walk(c, pcs, 64);
+typedef struct { sb_t* b; uint64_t rsp; } scan_t;
+static int scan_body(void* p) { scan_t* s = (scan_t*)p; s_scan(s->b, s->rsp, 48); return 0; }
+static void s_frames(sb_t* b, const uint64_t* pcs, int n, uint64_t rsp) {
     s_put(b, "stack (unwound):\r\n");
     for (int i = 0; i < n; i++) { s_put(b, "  "); s_dec(b, i); s_put(b, "  "); s_addr(b, pcs[i]); s_put(b, "\r\n"); }
     s_put(b, "return addresses on the stack:\r\n");
-    s_scan(b, c->Rsp, 48);
+    scan_t s = { b, rsp };
+    if (g_guard_veh) guarded(scan_body, &s);                  // another thread's stack may change while it is read
 }
 static void s_regs(sb_t* b, const CONTEXT* c) {
     const char* nm[] = { "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","r8","r9","r10","r11","r12","r13","r14","r15" };
@@ -248,18 +436,13 @@ static void copy_log(const wchar_t* dir, const wchar_t* src) {
 static char g_cbuf[96 * 1024];            // the report text (static: no heap, little stack)
 static EXCEPTION_POINTERS* g_cep;
 static DWORD g_ctid;
-static void get_ctx(HANDLE th, CONTEXT* c) {                // another thread's registers (stopped only meanwhile)
-    memset(c, 0, sizeof *c); c->ContextFlags = CONTEXT_FULL;
-    if (SuspendThread(th) == (DWORD)-1) { c->Rip = 0; return; }
-    if (!GetThreadContext(th, c)) c->Rip = 0;
-    ResumeThread(th);
-}
+static uint64_t g_c_lo, g_c_hi;           // the crashing thread's stack
 static DWORD WINAPI crash_writer(LPVOID unused) {
     (void)unused;
     EXCEPTION_RECORD* er = g_cep->ExceptionRecord; CONTEXT* c = g_cep->ContextRecord;
     sb_t b = { g_cbuf, 0, sizeof g_cbuf };
     s_put(&b, "eu4boost crash report\r\nkind: crash\r\nsignature: "); s_put(&b, exc_name(er->ExceptionCode)); s_put(&b, " ");
-    uint64_t pcs[64]; int n = walk(c, pcs, 64), top = 0;
+    uint64_t pcs[64]; int n = walk_ctx(c, g_c_lo, g_c_hi, &g_cr_mods, pcs, 64), top = 0;
     while (top < n && !interesting(pcs[top])) top++;
     s_addr(&b, top < n ? pcs[top] : (uint64_t)(uintptr_t)er->ExceptionAddress);
     s_put(&b, "\r\nexception: "); s_hex(&b, er->ExceptionCode, 8); s_put(&b, " "); s_put(&b, exc_name(er->ExceptionCode));
@@ -271,11 +454,14 @@ static DWORD WINAPI crash_writer(LPVOID unused) {
     s_put(&b, "\r\nthread: "); s_put(&b, g_ctid == g_main_tid ? "main" : "other"); s_put(&b, "\r\n");
     s_state(&b);
     s_regs(&b, c);
-    s_stack(&b, c);
+    s_frames(&b, pcs, n, c->Rsp);
     if (g_ctid != g_main_tid && g_main_thread) {
-        CONTEXT mc; get_ctx(g_main_thread, &mc);
-        if (mc.Rip) { s_put(&b, "main thread:\r\n  rip="); s_addr(&b, mc.Rip); s_put(&b, "\r\n"); s_stack(&b, &mc); }
+        CONTEXT mc; int mn = sample_thread(g_main_thread, g_main_lo, g_main_hi, &g_cr_mods, &mc, pcs, 64);
+        if (mc.Rip) { s_put(&b, "main thread:\r\n  rip="); s_addr(&b, mc.Rip); s_put(&b, "\r\n"); s_frames(&b, pcs, mn, mc.Rsp); }
     }
+    s_put(&b, g_mods);
+    s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
+    s_put(&b, "before this session: "); s_put(&b, g_prev_saves[0] ? g_prev_saves : "no saves.txt\r\n");
     s_modules(&b);
     wchar_t stamp[20], dir[MAX_PATH]; s_stamp(stamp, 20); new_dir(dir, stamp, L"crash");
     write_file(dir, L"report.txt", g_cbuf, b.n);
@@ -287,6 +473,7 @@ static LPTOP_LEVEL_EXCEPTION_FILTER g_next_filter;          // the game's filter
 static LONG WINAPI eb_filter(EXCEPTION_POINTERS* ep) {
     if (InterlockedExchange(&g_crashed, 1) == 0) {
         g_cep = ep; g_ctid = GetCurrentThreadId();
+        if (!stack_of((const NT_TIB*)NtCurrentTeb(), &g_c_lo, &g_c_hi)) g_c_lo = g_c_hi = 0;
         HANDLE h = CreateThread(NULL, 1 << 20, crash_writer, NULL, 0, NULL);
         if (h) { WaitForSingleObject(h, 20000); CloseHandle(h); }
         else crash_writer(NULL);
@@ -305,14 +492,17 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hk_set_uef(LPTOP_LEVEL_EXCEPTION_FILT
 static void write_hang(int seconds) {
     static char t[64 * 1024];
     sb_t b = { t, 0, sizeof t };
-    CONTEXT mc; get_ctx(g_main_thread, &mc);
-    uint64_t pcs[64]; int n = mc.Rip ? walk(&mc, pcs, 64) : 0, top = 0;
+    CONTEXT mc; uint64_t pcs[64];
+    int n = sample_thread(g_main_thread, g_main_lo, g_main_hi, &g_wd_mods, &mc, pcs, 64), top = 0;
     while (top < n && !interesting(pcs[top])) top++;
     s_put(&b, "eu4boost crash report\r\nkind: hang\r\nsignature: HANG ");
     if (top < n) s_addr(&b, pcs[top]); else s_put(&b, "unknown");
     s_put(&b, "\r\nno frame for: "); s_dec(&b, seconds); s_put(&b, " s\r\n");
     s_state(&b);
-    if (mc.Rip) { s_put(&b, "main thread:\r\n"); s_regs(&b, &mc); s_stack(&b, &mc); }
+    if (mc.Rip) { s_put(&b, "main thread:\r\n"); s_regs(&b, &mc); s_frames(&b, pcs, n, mc.Rsp); }
+    s_put(&b, g_mods);
+    s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
+    s_put(&b, "before this session: "); s_put(&b, g_prev_saves[0] ? g_prev_saves : "no saves.txt\r\n");
     s_modules(&b);
     wchar_t stamp[20], dir[MAX_PATH]; s_stamp(stamp, 20); new_dir(dir, stamp, L"hang");
     write_file(dir, L"report.txt", t, b.n);
@@ -357,8 +547,8 @@ void eb_slow_event(const char* what, double ms, double limit, const char* detail
     }
     LeaveCriticalSection(&g_slow_cs);
 }
-// the session is over: events.txt becomes report.txt, which report.c sends
-static void finalize_slow(const wchar_t* dir, const wchar_t* log) {
+// the session is over: events.txt (and the session's mods) becomes report.txt, which report.c sends
+static void finalize_slow(const wchar_t* dir, const wchar_t* log, const char* mods) {
     wchar_t u[MAX_PATH]; _snwprintf(u, MAX_PATH, L"%lsunconfirmed", dir);
     if (GetFileAttributesW(u) == INVALID_FILE_ATTRIBUTES) return;
     char top[200] = "", head[400];
@@ -374,15 +564,17 @@ static void finalize_slow(const wchar_t* dir, const wchar_t* log) {
         ReadFile(h, buf, sizeof buf, &rd, NULL); CloseHandle(h);
         append_file(dir, L"report.txt", buf, (int)rd);
     }
-    copy_log(dir, log);
+    append_file(dir, L"report.txt", mods, (int)strlen(mods));
+    if (log) copy_log(dir, log);
+    else write_file(dir, L"eu4boost.log", g_nolog, (int)strlen(g_nolog));
     DeleteFileW(u);
 }
-// one sample of the main thread's stack (the thread is stopped only while its registers are read)
+// one sample of the main thread's stack (the thread is suspended while it is walked)
 static int sample_main(char* out, int cap, char* top, int tcap) {
-    CONTEXT mc; get_ctx(g_main_thread, &mc);
+    CONTEXT mc; uint64_t pcs[32];
+    int n = sample_thread(g_main_thread, g_main_lo, g_main_hi, &g_wd_mods, &mc, pcs, 32), first = -1;
     out[0] = 0; if (top) top[0] = 0;
-    if (!mc.Rip) return 0;
-    uint64_t pcs[32]; int n = walk(&mc, pcs, 32), first = -1;
+    if (!n) return 0;
     sb_t b = { out, 0, cap };
     for (int i = 0; i < n && i < 16; i++) { if (i) s_put(&b, " < "); s_addr(&b, pcs[i]); }
     for (int i = 0; i < n && first < 0; i++) if (interesting(pcs[i])) first = i;
@@ -398,13 +590,34 @@ int eb_load_samples_take(char* out, size_t n) {
     return k;
 }
 
+// every minute the session's state (memory, game date, frames) to crash_reports\heartbeat.txt: a session
+// that ends without a catchable crash - the game's out-of-memory abort, a killed process - leaves its
+// last state for the abnormal-exit report of the next launch
+static void heartbeat(void) {
+    static char t[2048];
+    sb_t b = { t, 0, sizeof t };
+    SYSTEMTIME st; GetLocalTime(&st);
+    char hm[16]; snprintf(hm, sizeof hm, "%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+    s_put(&b, "last state of that session (written every minute, the latest at "); s_put(&b, hm); s_put(&b, "):\r\n");
+    s_state(&b);
+    write_file(eb_rep_dir, L"heartbeat.txt", t, b.n);
+}
 static DWORD WINAPI watchdog(LPVOID unused) {
     (void)unused;
-    LONG64 seen = -1; ULONGLONG since = 0, load_t0 = 0, load_next = 0; int reported = 0, ns = 0, in_load = 0;
+    LONG64 seen = -1; ULONGLONG since = 0, load_t0 = 0, load_next = 0, beat = 0; int reported = 0, ns = 0, in_load = 0;
     static char samp[4][1024], tops[4][160], tmp[1024];
     int samp_s[4];
     for (;;) {
         Sleep(250);
+        if (unbiased_ms() - beat >= 60000) { beat = unbiased_ms(); heartbeat(); }
+        if (g_test_burst == 1) {                                // test_keys: 2,000 samples of the running main thread
+            LONG64 s0 = g_samples, t0 = g_sample_t; LONG f0 = g_guard_faults; int got = 0;
+            for (int i = 0; i < 2000; i++) { if (sample_main(tmp, sizeof tmp, NULL, 0)) got++; Sleep(1); }
+            LONG64 k = g_samples - s0;
+            eb_log("report: TEST %d of 2000 main thread samples walked, suspended %.1f us on average (longest so far %.1f us), fault guard %ld | last: %.300s",
+                   got, k ? (g_sample_t - t0) * g_ms * 1000.0 / k : 0.0, g_sample_max * g_ms * 1000.0, g_guard_faults - f0, tmp);
+            g_test_burst = 0;
+        }
         LONG64 f = g_frames; ULONGLONG now = unbiased_ms();
         // a load: the main thread every 5 s (uitime.c takes them when the load is over)
         if (eb_loading && g_cfg.report_slow) {
@@ -461,6 +674,7 @@ static uintptr_t hk_rcb(void* a, void* b) {
                 if (GetAsyncKeyState(VK_F9) & 0x8000) { eb_log("report: TEST crash (Ctrl+Alt+Shift+F9)"); *(volatile int*)(uintptr_t)8 = 1; }
                 if (GetAsyncKeyState(VK_F10) & 0x8000) { eb_log("report: TEST hang for 70 s (Ctrl+Alt+Shift+F10)"); Sleep(70000); }
                 if (GetAsyncKeyState(VK_F11) & 0x8000) { eb_log("report: TEST stall for 3 s (Ctrl+Alt+Shift+F11)"); Sleep(3000); }
+                if ((GetAsyncKeyState(VK_F8) & 0x8000) && !g_test_burst) { eb_log("report: TEST stack sample burst (Ctrl+Alt+Shift+F8)"); g_test_burst = 1; }
             }
         }
     }
@@ -489,6 +703,77 @@ int eb_docs_dir(wchar_t* out, size_t n) {                     // Documents\Parad
     _snwprintf(out, n, L"%ls\\Paradox Interactive\\Europa Universalis IV\\", docs);
     return 1;
 }
+static int read_small(const wchar_t* p, char* buf, int cap) {    // a whole small file, 0-terminated
+    DWORD rd = 0;
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) { if (!ReadFile(h, buf, (DWORD)cap - 1, &rd, NULL)) rd = 0; CloseHandle(h); }
+    buf[rd] = 0;
+    return (int)rd;
+}
+// the value of key="..." (or key=...) at the start of a line of a .mod descriptor
+static void mod_key(const char* t, const char* key, char* out, int n) {
+    size_t kl = strlen(key); out[0] = 0;
+    for (const char* p = t; (p = strstr(p, key)); p += kl) {
+        if (p != t && p[-1] != '\n' && p[-1] != '\r' && p[-1] != ' ' && p[-1] != '\t') continue;
+        const char* q = p + kl; while (*q == ' ' || *q == '\t') q++;
+        if (*q != '=') continue;
+        q++; while (*q == ' ' || *q == '\t') q++;
+        int quoted = *q == '"', k = 0; if (quoted) q++;
+        while (*q && *q != '\r' && *q != '\n' && (quoted ? *q != '"' : *q != ' ' && *q != '\t') && k < n - 1) out[k++] = *q++;
+        out[k] = 0;
+        return;
+    }
+}
+// this session's mods in load order (the launcher wrote dlc_load.json before starting the game), each
+// with the name, version, game version and Workshop id from its .mod file - the folder path is left out
+static void mods_list(void) {
+    sb_t b = { g_mods, 0, sizeof g_mods };
+    wchar_t d[MAX_PATH], p[MAX_PATH];
+    static char js[64 * 1024], t[16 * 1024];
+    s_put(&b, "mods (load order, dlc_load.json and the .mod files):\r\n");
+    if (!eb_docs_dir(d, MAX_PATH)) { s_put(&b, "  (no documents folder)\r\n"); return; }
+    _snwprintf(p, MAX_PATH, L"%lsdlc_load.json", d);
+    if (!read_small(p, js, sizeof js)) { s_put(&b, "  (no dlc_load.json)\r\n"); return; }
+    const char* e = strstr(js, "\"enabled_mods\""), *end = e ? strchr(e, ']') : NULL, *q = e ? strchr(e, '[') : NULL;
+    int i = 0;
+    while (q && end && (q = strchr(q + 1, '"')) && q < end && b.n < b.cap - 400) {
+        const char* z = strchr(q + 1, '"'); if (!z || z > end) break;
+        char file[MAX_PATH]; int fl = (int)(z - q - 1); if (fl >= MAX_PATH) fl = MAX_PATH - 1;
+        memcpy(file, q + 1, (size_t)fl); file[fl] = 0; q = z;
+        wchar_t wf[MAX_PATH]; if (MultiByteToWideChar(CP_UTF8, 0, file, -1, wf, MAX_PATH) <= 0) wf[0] = 0;
+        _snwprintf(p, MAX_PATH, L"%ls%ls", d, wf);
+        char name[160], ver[48], sup[48], rid[24];
+        if (read_small(p, t, sizeof t)) { mod_key(t, "name", name, sizeof name); mod_key(t, "version", ver, sizeof ver);
+                                          mod_key(t, "supported_version", sup, sizeof sup); mod_key(t, "remote_file_id", rid, sizeof rid); }
+        else { name[0] = ver[0] = sup[0] = rid[0] = 0; }
+        if (!rid[0] && !strncmp(file, "mod/ugc_", 8)) { int k = 0; for (const char* c = file + 8; *c >= '0' && *c <= '9' && k < 20; c++) rid[k++] = *c; rid[k] = 0; }
+        s_put(&b, "  "); s_dec(&b, ++i); s_put(&b, ". "); s_put(&b, name[0] ? name : "(no .mod file)");
+        if (ver[0]) { s_put(&b, " | version "); s_put(&b, ver); }
+        if (sup[0]) { s_put(&b, " | for "); s_put(&b, sup); }
+        s_put(&b, rid[0] ? " | Workshop " : " | local"); s_put(&b, rid);
+        s_put(&b, " | "); s_put(&b, file); s_put(&b, "\r\n");
+    }
+    if (!i) s_put(&b, "  (none)\r\n");
+    const char* x = strstr(js, "\"disabled_dlcs\""), *xe = x ? strchr(x, ']') : NULL;
+    if (x && xe) {
+        s_put(&b, "disabled DLCs: ");
+        char dl[2048]; int n = (int)(xe - x + 1); if (n >= (int)sizeof dl) n = sizeof dl - 1;
+        memcpy(dl, x, (size_t)n); dl[n] = 0; s_put(&b, dl); s_put(&b, "\r\n");
+    }
+}
+// eu4boost_prev.log belongs to the session that started at `start` (YYYYMMDD_HHMMSS): its first line's time
+// is within seconds of it. With log=0 no launch rotates the log, and an older session's would be attached.
+static int log_of_session(const wchar_t* name, const wchar_t* start) {
+    wchar_t p[MAX_PATH]; char head[32];
+    _snwprintf(p, MAX_PATH, L"%ls%ls", g_dir, name);
+    if (read_small(p, head, sizeof head) < 10 || head[0] != '[' || wcslen(start) < 15) return 0;
+    int a = atoi(head + 1) * 3600 + atoi(head + 4) * 60 + atoi(head + 7);
+    int b = ((start[9] - L'0') * 10 + start[10] - L'0') * 3600 + ((start[11] - L'0') * 10 + start[12] - L'0') * 60 +
+            (start[13] - L'0') * 10 + start[14] - L'0';
+    int d = a > b ? a - b : b - a;
+    if (d > 43200) d = 86400 - d;
+    return d <= 10;
+}
 static void attach_game_logs(const wchar_t* dir) {
     wchar_t d[MAX_PATH], s[MAX_PATH];
     if (!eb_docs_dir(d, MAX_PATH)) return;
@@ -515,7 +800,10 @@ static void check_previous(void) {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.' || wcsncmp(fd.cFileName, prev, 15) < 0) continue;
             wchar_t d[MAX_PATH], u[MAX_PATH]; _snwprintf(d, MAX_PATH, L"%lspending\\%ls\\", eb_rep_dir, fd.cFileName);
             size_t nl = wcslen(fd.cFileName);
-            if (nl > 5 && !wcscmp(fd.cFileName + nl - 5, L"_slow")) { finalize_slow(d, L"eu4boost_prev.log"); attach_game_logs(d); continue; }
+            if (nl > 5 && !wcscmp(fd.cFileName + nl - 5, L"_slow")) {
+                finalize_slow(d, log_of_session(L"eu4boost_prev.log", fd.cFileName) ? L"eu4boost_prev.log" : NULL, g_prev_mods);
+                attach_game_logs(d); continue;
+            }
             if (clean) continue;
             _snwprintf(u, MAX_PATH, L"%lsunconfirmed", d); DeleteFileW(u);
             attach_game_logs(d); found = 1;
@@ -530,7 +818,11 @@ static void check_previous(void) {
                   "could catch: a crash through __fastfail (heap corruption, abort), a killed process, a shutdown or a power loss.\r\n");
         wchar_t dir[MAX_PATH]; new_dir(dir, prev[0] ? prev : g_start, L"exit");
         write_file(dir, L"report.txt", r, b.n);
-        copy_log(dir, L"eu4boost_prev.log");
+        append_file(dir, L"report.txt", g_prev_mods, (int)strlen(g_prev_mods));
+        append_file(dir, L"report.txt", g_prev_saves, (int)strlen(g_prev_saves));
+        append_file(dir, L"report.txt", g_prev_beat, (int)strlen(g_prev_beat));
+        if (log_of_session(L"eu4boost_prev.log", prev)) copy_log(dir, L"eu4boost_prev.log");
+        else write_file(dir, L"eu4boost.log", g_nolog, (int)strlen(g_nolog));
         attach_game_logs(dir);
     }
     eb_log("report: the previous session did not exit normally (%s) - report kept for sending", t[6] == 'c' ? "crash" : found ? "hang" : "abnormal exit");
@@ -563,9 +855,15 @@ int eb_crash_install(void) {
     _snwprintf(p, MAX_PATH, L"%lssent", eb_rep_dir); CreateDirectoryW(p, NULL);
     _snwprintf(g_session, MAX_PATH, L"%lssession.txt", eb_rep_dir);
     s_stamp(g_start, 20);
+    _snwprintf(p, MAX_PATH, L"%lsmods.txt", eb_rep_dir); read_small(p, g_prev_mods, sizeof g_prev_mods);
+    _snwprintf(p, MAX_PATH, L"%lssaves.txt", eb_rep_dir); read_small(p, g_prev_saves, sizeof g_prev_saves);
+    _snwprintf(p, MAX_PATH, L"%lsheartbeat.txt", eb_rep_dir); read_small(p, g_prev_beat, sizeof g_prev_beat); DeleteFileW(p);
     check_previous();
+    mods_list(); write_file(eb_rep_dir, L"mods.txt", g_mods, (int)strlen(g_mods));
     set_session("running");
+    guard_init();
     g_main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, g_main_tid);
+    if (g_main_thread && !thread_stack(g_main_thread, &g_main_lo, &g_main_hi)) eb_log("report: the main thread's stack was not found - no stack samples");
     g_next_filter = SetUnhandledExceptionFilter(eb_filter);
     MH_STATUS st = MH_Initialize();
     void* target = NULL;
@@ -574,20 +872,76 @@ int eb_crash_install(void) {
                  MH_EnableHook(target) == MH_OK;
     if (!hooked) eb_log("report: SetUnhandledExceptionFilter hook failed - a filter installed later replaces ours");
     o_rcb = (pops_rcb_t)patch_iat(g_exe, "pops_api.dll", "POPS_RunCallbacks", (void*)hk_rcb);
-    if (o_rcb && g_main_thread && (g_cfg.report_hang_s > 0 || g_cfg.report_slow)) {
+    if (o_rcb && g_main_thread) {                              // hangs, stalls and the heartbeat
         HANDLE h = CreateThread(NULL, 256 * 1024, watchdog, NULL, 0, NULL);
         if (h) CloseHandle(h);
     }
     eb_log("report: crash, hang (%d s), abnormal-exit%s reports are written to crash_reports\\%s", g_cfg.report_hang_s,
            g_cfg.report_slow ? " and slow (stalls over 2 s, save lists, loads)" : "",
-           g_cfg.report_test_keys ? " - TEST KEYS ON (Ctrl+Alt+Shift+F9 crash, F10 hang, F11 stall)" : "");
+           g_cfg.report_test_keys ? " - TEST KEYS ON (Ctrl+Alt+Shift+F9 crash, F10 hang, F11 stall, F8 stack samples)" : "");
+    int nm = 0; for (const char* s = g_mods; (s = strstr(s, "\r\n  ")); s += 4) nm++;
+    eb_log("report: %d mods listed for the reports%s", nm, g_guard_veh ? "" : " - fault guard missing, no stack walks");
     return 1;
 #endif
 }
 
 void eb_crash_exit(void) {                                    // DLL_PROCESS_DETACH at process exit
     if (!g_cfg.report_capture || !g_session[0] || g_crashed) return;
+    if (g_samples) eb_log("report: %lld main thread stack samples, suspended %.1f us on average, %.1f us at most; fault guard %ld",
+                          (long long)g_samples, g_sample_t * g_ms * 1000.0 / g_samples, g_sample_max * g_ms * 1000.0, g_guard_faults);
     drop_unconfirmed(g_start);
-    if (g_slow_dir[0]) finalize_slow(g_slow_dir, L"eu4boost.log");
+    if (g_slow_dir[0]) finalize_slow(g_slow_dir, L"eu4boost.log", g_mods);
     set_session("exit");
 }
+
+#ifdef EB_TEST
+// self-test: a thread that keeps changing its stack (recursion through frames that use rbp, of varying
+// size) is sampled again and again. resume_first = 1 walks after resuming it, as 0.4.1 did.
+static volatile LONG t_stop;
+static volatile uint64_t t_sink;
+__attribute__((noinline)) static uint64_t t_churn(int d) {
+    volatile uint8_t* a = (volatile uint8_t*)__builtin_alloca(16 + (size_t)(d * 40 % 700));
+    a[0] = (uint8_t)d; uint64_t r = a[0];
+    if (d > 0 && !t_stop) r += t_churn(d - 1);
+    else for (volatile int k = 0; k < 200; k++) r += (uint64_t)k;
+    return r;
+}
+static DWORD WINAPI t_churner(LPVOID u) {
+    (void)u; unsigned s = 1;
+    while (!t_stop) { s = s * 1103515245u + 12345u; t_sink += t_churn((int)(s >> 16) % 48); }
+    return 0;
+}
+__declspec(dllexport) int eb_test_stackwalk(int samples, int resume_first, double* avg_us, int* deep, int* faults) {
+    guard_init();
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ms = 1000.0 / (double)f.QuadPart;
+    t_stop = 0;
+    HANDLE th = CreateThread(NULL, 1 << 20, t_churner, NULL, 0, NULL);
+    uint64_t lo, hi; int ok = 0; *deep = 0;
+    if (!th || !thread_stack(th, &lo, &hi)) return -1;
+    guarded(mods_build, &g_wd_mods);
+    const mod_t* me = mods_find(&g_wd_mods, (uint64_t)(uintptr_t)t_churn);
+    const RUNTIME_FUNCTION* fc = me ? fn_find(me, (uint64_t)(uintptr_t)t_churn) : NULL;
+    if (!fc) return -2;
+    uint64_t c0 = me->base + fc->BeginAddress, c1 = me->base + fc->EndAddress;
+    LONG f0 = g_guard_faults; LONG64 s0 = g_samples, t0 = g_sample_t;
+    for (int i = 0; i < samples; i++) {
+        CONTEXT c; uint64_t pcs[64]; int n = 0;
+        if (!resume_first) n = sample_thread(th, lo, hi, &g_wd_mods, &c, pcs, 64);
+        else {                                                // registers, resume, then walk the changing stack
+            walk_t w; memset(&w, 0, sizeof w); w.c.ContextFlags = CONTEXT_FULL;
+            w.lo = lo; w.hi = hi; w.mods = &g_wd_mods; w.pcs = pcs; w.max = 64;
+            if (SuspendThread(th) == (DWORD)-1) continue;
+            int got = GetThreadContext(th, &w.c);
+            ResumeThread(th);
+            if (got) { guarded(walk_body, &w); n = w.n; }
+        }
+        if (n > 0) ok++;
+        int in = 0; for (int k = 0; k < n; k++) in += pcs[k] >= c0 && pcs[k] < c1;
+        if (in >= 3) (*deep)++;
+    }
+    t_stop = 1; WaitForSingleObject(th, INFINITE); CloseHandle(th);
+    *faults = (int)(g_guard_faults - f0);
+    *avg_us = g_samples > s0 ? (g_sample_t - t0) * g_ms * 1000.0 / (g_samples - s0) : 0.0;
+    return ok;
+}
+#endif

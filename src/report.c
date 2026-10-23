@@ -37,9 +37,10 @@ static void b_str(buf_t* b, const char* s) { b_add(b, s, strlen(s)); }
 
 // ---- personal data out: profile folder, user name and computer name (UTF-8 and ANSI spellings) ----
 #define NSCRUB 12
-static struct { char from[MAX_PATH * 3]; const char* to; } g_scrub[NSCRUB];
+static struct { char from[MAX_PATH * 3]; const char* to; int word; } g_scrub[NSCRUB];
 static int g_nscrub;
-static void scrub_add(const wchar_t* w, const char* to) {
+// short names (under 5 bytes, e.g. "user") are replaced only as a whole word: "USER32.dll" stays
+static void scrub_add(const wchar_t* w, const char* to, int whole_short) {
     if (!w || wcslen(w) < 3) return;
     for (int cp = 0; cp < 2; cp++) {
         for (int slash = 0; slash < 2; slash++) {
@@ -49,16 +50,16 @@ static void scrub_add(const wchar_t* w, const char* to) {
             if (WideCharToMultiByte(cp ? CP_ACP : CP_UTF8, 0, t, -1, g_scrub[g_nscrub].from, sizeof g_scrub[0].from, NULL, NULL) > 1) {
                 int dup = 0;
                 for (int i = 0; i < g_nscrub; i++) if (!strcmp(g_scrub[i].from, g_scrub[g_nscrub].from)) dup = 1;
-                if (!dup) g_scrub[g_nscrub++].to = to;
+                if (!dup) { g_scrub[g_nscrub].word = whole_short && strlen(g_scrub[g_nscrub].from) < 5; g_scrub[g_nscrub++].to = to; }
             }
         }
     }
 }
 static void scrub_init(void) {
     wchar_t v[MAX_PATH];
-    if (GetEnvironmentVariableW(L"USERPROFILE", v, MAX_PATH)) scrub_add(v, "%USERPROFILE%");   // longest first
-    if (GetEnvironmentVariableW(L"USERNAME", v, MAX_PATH)) scrub_add(v, "<user>");
-    DWORD n = MAX_PATH; if (GetComputerNameW(v, &n)) scrub_add(v, "<pc>");
+    if (GetEnvironmentVariableW(L"USERPROFILE", v, MAX_PATH)) scrub_add(v, "%USERPROFILE%", 0);   // longest first
+    if (GetEnvironmentVariableW(L"USERNAME", v, MAX_PATH)) scrub_add(v, "<user>", 1);
+    DWORD n = MAX_PATH; if (GetComputerNameW(v, &n)) scrub_add(v, "<pc>", 1);
 }
 static int ieq(const char* a, const char* b, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -106,6 +107,7 @@ static void drop_lines(buf_t* b, const char* prefix) {       // whole lines that
     free(b->p); *b = o;
     if (!b->p) b_add(b, "", 0);
 }
+static int alnum(char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
 static void scrub(buf_t* b) {
     mask_secrets(b);
     for (int k = 0; k < g_nscrub; k++) {
@@ -113,7 +115,10 @@ static void scrub(buf_t* b) {
         buf_t o = {0};
         size_t i = 0;
         while (i < b->n) {
-            if (i + fl <= b->n && ieq(b->p + i, g_scrub[k].from, fl)) { b_add(&o, g_scrub[k].to, tl); i += fl; }
+            if (i + fl <= b->n && ieq(b->p + i, g_scrub[k].from, fl) &&
+                (!g_scrub[k].word || ((!i || !alnum(b->p[i - 1])) && (i + fl == b->n || !alnum(b->p[i + fl]))))) {
+                b_add(&o, g_scrub[k].to, tl); i += fl;
+            }
             else { b_add(&o, b->p + i, 1); i++; }
         }
         free(b->p); *b = o;
