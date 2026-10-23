@@ -12,9 +12,9 @@ CC="clang --target=x86_64-w64-windows-gnu"
 CFLAGS="-O2 -DNDEBUG -DEB_TEST -D__USE_MINGW_ANSI_STDIO=1 -D_WIN32_WINNT=0x0A00 -Wall -Wno-unused-function -fno-strict-aliasing"
 # the EB_TEST build skips the eu4.exe signature checks, so those tables are unused there
 CFLAGS="$CFLAGS -Wno-unused-const-variable"
-for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $T/$f.o; done
-$CC -shared -static -fuse-ld=lld -o $T/eu4boost_test.dll $T/main.o $T/alloc.o $T/profiler.o $T/threads.o $T/online.o $T/speed.o $T/parallel.o $T/savezip.o $T/savepar.o $T/modifier.o $T/country.o $T/console.o $T/guard.o $T/aiprof.o build/mimalloc.o build/mh_*.o \
-    -Wl,--exclude-all-symbols -lpsapi -lwinmm -ladvapi32 -lkernel32
+for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $T/$f.o; done
+$CC -shared -static -fuse-ld=lld -o $T/eu4boost_test.dll $T/main.o $T/alloc.o $T/profiler.o $T/threads.o $T/online.o $T/speed.o $T/parallel.o $T/savezip.o $T/savepar.o $T/modifier.o $T/country.o $T/console.o $T/guard.o $T/aiprof.o $T/uitime.o $T/crash.o $T/report.o build/mimalloc.o build/mh_*.o \
+    -Wl,--exclude-all-symbols -lpsapi -lwinmm -ladvapi32 -lwinhttp -lbcrypt -luser32 -lkernel32
 $CC -shared -fuse-ld=lld -o $T/pops_api.dll test/fake_pops.c -Wl,--out-implib,$T/libpops_api.a
 $CC -O1 -fuse-ld=lld -o $T/harness.exe test/harness.c -L$T -lpops_api
 if [ -n "$EB_NATIVE_WINDOWS" ]; then
@@ -39,6 +39,7 @@ run zero_auto  '[general]\r\nlog=1\r\n[allocator]\r\nzero_fill=-1\r\n' 1500 zero
 rm -f $T/plugin64.dll
 run plain      '[general]\r\nlog=1\r\n[profiler]\r\nenabled=1\r\n' 1500 none
 run online_off '[general]\r\nlog=1\r\n[online]\r\npoll_interval_ms=0\r\n' 1500 none nothrottle
+run online_always '[general]\r\nlog=1\r\n[online]\r\nonly_while_running=0\r\n' 1500 none always
 run no_alloc   '[general]\r\nlog=1\r\n[allocator]\r\nenabled=0\r\n' 1500 none
 rm -f $T/eu4boost_speed_*.csv
 run speed      '[general]\r\nlog=1\r\n' 1000 speed
@@ -50,4 +51,4 @@ run modadd_sse2 '[general]\r\nlog=1\r\n[modifiers]\r\nfast_add=1\r\nfast_search=
 run pacing     '[general]\r\nlog=1\r\n[render]\r\nspeed5_days_per_frame=3\r\n' 300 pacing
 run guard      '[general]\r\nlog=1\r\n' 300 guard
 if [ -n "$failed" ]; then echo "FAILED:$failed"; exit 1; fi
-echo "all 13 cases passed"
+echo "all 14 cases passed"

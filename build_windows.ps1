@@ -21,10 +21,10 @@ Run @("-O3", "-DNDEBUG", "-DMI_STAT=0", "-DMI_SECURE=0", "-I$MI/include", "-c", 
 foreach ($f in "hook", "buffer", "trampoline") { Run ($CFLAGS + @("-w", "-I$MH/include", "-c", "$MH/src/$f.c", "-o", "$OUT/mh_$f.o")) }
 Run ($CFLAGS + @("-w", "-c", "$MH/src/hde/hde64.c", "-o", "$OUT/mh_hde64.o"))
 $objs = @()
-foreach ($f in "main", "alloc", "profiler", "threads", "online", "speed", "parallel", "savezip", "savepar", "modifier", "country", "console", "guard", "aiprof") {
+foreach ($f in "main", "alloc", "profiler", "threads", "online", "speed", "parallel", "savezip", "savepar", "modifier", "country", "console", "guard", "aiprof", "uitime", "crash", "report") {
     Run ($CFLAGS + @("-I$MI/include", "-I$MH/include", "-c", "src/$f.c", "-o", "$OUT/$f.o")); $objs += "$OUT/$f.o"
 }
 # same link order as build.sh (its mh_*.o glob is alphabetical), so both scripts give the same code
 $objs += "$OUT/mimalloc.o", "$OUT/mh_buffer.o", "$OUT/mh_hde64.o", "$OUT/mh_hook.o", "$OUT/mh_trampoline.o"
-Run (@("-shared", "-static", "-fuse-ld=lld", "-s", "-o", "$OUT/eu4boost.dll") + $objs + @("-Wl,--exclude-all-symbols", "-lpsapi", "-lwinmm", "-ladvapi32", "-lkernel32"))
+Run (@("-shared", "-static", "-fuse-ld=lld", "-s", "-o", "$OUT/eu4boost.dll") + $objs + @("-Wl,--exclude-all-symbols", "-lpsapi", "-lwinmm", "-ladvapi32", "-lwinhttp", "-lbcrypt", "-luser32", "-lkernel32"))
 Get-Item "$OUT/eu4boost.dll" | Select-Object Name, Length, LastWriteTime

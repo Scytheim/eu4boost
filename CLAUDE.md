@@ -18,6 +18,9 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 - 10-21: AI 루프 분석(사용자 본 게임 1874년 복사본 `save_backup_20261021\GER_1874.eu4`). 부대 AI 떼어 내기(`ai_split`)는 효과 없음. 프로빈스 평가 점수 미리 계산(`ai_prov_split`, 실험 기본 꺼짐): 같은 실행 번갈아 비교 큰 평가 90.6 → 26.8ms, 검증 18만 번 일치. 남은 큰 지연은 외교 장관(최대 2.6초).
 - 10-22: 외교 장관 평화 협상안의 AE 계산(`ai_ae_cache`, 실험 기본 꺼짐): AI 루프의 잠금 걸린 공유 AE 맵 대신 스레드별 표를 쓰고 AE 합계를 C로 다시 짬. 합계마다 번갈아 비교 61.0 → 27.6µs(2.2배), 검증 합계 1만 6천 번 일치. 큰 협상은 실행마다 나오기도 하고 안 나오기도 해서 날 단위 비교로는 잴 수 없음.
 - 10-22: 후반부 시간 지도(두 실험 켬): 하루 88.7ms 중 AI 루프 21%, 월간 25%, 나라 직렬 10%, 렌더 9%. 부대 AI 이동 검사(`ai_army_fast`, 실험 기본 꺼짐): 플래그 먼저 + 부대 능력 0xe0을 AI 작업 실행 동안 기억. 검사 0.339 → 0.085µs(4배), 검증 7,900만 번 일치.
+- 10-22: 매월 프로빈스 설명 문장 재사용(`[modifiers] prov_text_cache`, guard.c의 hk_tip, 배포 설정 1): 문장 하나 82 → 2.65µs, 매월 1일 약 190ms 단축, 검증 13만 7천 번 일치. 측정 때 런처 플레이 세트를 짭짭죽으로 바꿨다가 기본으로 되돌림(사용자는 GER_Test를 기본 세트로 플레이 중).
+- 10-22 밤: 후반부 전체 측정(1874.07 → 1880.01, `bench\results\late_1022`): 플러그인 없음 4.00분, 기본 2.92분(1.37배), 실험 5개 켬 2.71분(1.48배). 새 시간 지도(`profile_1022b`): AI 루프 15%, 나라 직렬 12%, 월간 21%(MonthlyUpdateSerial 7%, 프로빈스 월간 6%: CalculateModifier 3.4%·제도 전파 3.3%), 첩보망 등 5%, 렌더 10%.
+- 10-23: 사용자 불편(저장 창·불러오기 화면·삭제가 느림) 원인 = EU4dll용 0 채우기가 세이브 목록의 68MB 할당마다 0을 씀 → `[allocator] zero_fill_windows_kb`로 수정(목록 73.9 → 7.2ms). 온라인 제한은 날짜가 넘어갈 때만(`[online] only_while_running`). 크래시 보고(`[report]`, src/crash.c·report.c, worker/crash-report.js): 기본 주소 EB_REPORT_URL은 Worker 배포 뒤에 넣는다. 진단용 `[general] ui_timing`. 느려짐 보고(`[report] slow`: 목록 0.3초, 멈칫 2초, 불러오기 90초) + 불러오기 시간 로그 `load:`. 배포 전 확인: 후반부 진행 0.4.0 2.45분 vs 0.4.1 2.36분, 불러오기 기능 끔 19.2초 vs 0.4.1 17.0초(평균). 0.4.1 배포. 크래시 보고 저장소 `Scytheim/eu4boost-crash-reports`는 이 PC의 gh(GitHub CLI, winget 설치, PATH에 없으면 기본 설치 위치)로 읽는다. 테스트가 끝나면 게임 폴더 ini의 `ab_test=0` 확인.
 - 다음 일: HANDOFF.md §9(0번: 커밋·기본값은 사용자 결정 대기).
 
 ## 사용자
@@ -27,7 +30,8 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 ## 명령
 ```sh
 sh build.sh                   # → build/eu4boost.dll. Windows(Git Bash): <도구 폴더>\llvm-mingw-* 자동 사용, WSL/Linux: clang + lld + mingw-w64
-sh test/run_tests.sh          # 스모크 테스트 13개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 13 cases passed"
+sh test/run_tests.sh          # 스모크 테스트 14개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 14 cases passed"
+node test/worker_test.mjs     # 크래시 보고 중간 서버(worker/crash-report.js)를 가짜 GitHub로 시험
 sh tools/release.sh           # 릴리스 파일(zip, eu4boost.dll, .sha256) → build/release/v버전/ (버전에 -dev가 없어야 함)
 powershell -File build_windows.ps1   # PowerShell 빌드 (build.sh와 같은 코드)
 python tools/re/fn.py 14093fe30                 # Ghidra 디컴파일 보기 (EU4_DECOMP)

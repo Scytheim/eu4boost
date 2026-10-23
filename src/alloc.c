@@ -45,12 +45,23 @@ static inline int ours(const void* p) { return mi_is_in_heap_region(p); }
 // from 0x3D88 to 0x103D88 bytes ("Font buffer expansion") and relies on the extra glyph table
 // being zero. Zeroing every allocation cost ~2% of the main thread in a 5x-speed profile, so by
 // default (mode 2) only allocations of at least zero_fill_min_bytes (64 KB) are zeroed.
+// Zeroed allocations of at least zero_fill_windows_kb (1 MB) come from the Windows heap with
+// HEAP_ZERO_MEMORY - exactly what the game's malloc does with EU4dll. Blocks that big are fresh pages
+// from the system, zero already, and only the pages the game touches are ever faulted in; mimalloc
+// would reuse a freed block and write zeros over all of it. The save list reads every save's meta
+// through a ~68 MB buffer (FUN_1405cd120), so 0.4.0 wrote ~68 MB of zeros per save file: 7 ms per file
+// whenever a list is built (save dialog, load screen, twice after deleting; users reported all three).
+// To mimalloc these blocks are foreign, and free/realloc/msize already hand those to the Windows heap.
 static int g_zero_malloc;      // 0 off, 1 all, 2 large only
-static size_t g_zero_min = 65536;
-static volatile LONG64 g_zeroed;
+static size_t g_zero_min = 65536, g_zero_os;
+static volatile LONG64 g_zeroed, g_zeroed_bytes, g_zeroed_os;
 
 static void* __cdecl hk_malloc(size_t n) {
-    if (g_zero_malloc && (g_zero_malloc == 1 || n >= g_zero_min)) { g_zeroed++; return mi_zalloc(n); }
+    if (g_zero_malloc && (g_zero_malloc == 1 || n >= g_zero_min)) {
+        if (g_zero_os && n >= g_zero_os) { g_zeroed_os++; return HeapAlloc(g_heap, HEAP_ZERO_MEMORY, n ? n : 1); }
+        g_zeroed++; g_zeroed_bytes += n;
+        return mi_zalloc(n);
+    }
     return mi_malloc(n);
 }
 static void* __cdecl hk_calloc(size_t count, size_t size) {
@@ -189,8 +200,10 @@ int eb_alloc_install(void) {
     }
     if (g_cfg.zero_min_bytes > 0) g_zero_min = (size_t)g_cfg.zero_min_bytes;
     if (g_zero_malloc == 2 && g_zero_min > 0x103D88) g_zero_min = 0x103D88;   // never miss EU4dll's font buffer
+    if (g_zero_malloc && g_cfg.zero_os_kb > 0) g_zero_os = (size_t)g_cfg.zero_os_kb << 10;
     if (g_zero_malloc == 1) eb_log("allocator: zero-filled malloc ON for every allocation");
     else if (g_zero_malloc == 2) eb_log("allocator: zero-filled malloc ON for allocations >= %zu bytes (EU4dll font buffer)", g_zero_min);
+    if (g_zero_os) eb_log("allocator: zero-filled blocks >= %zu KB come from the Windows heap (fresh zero pages, as in the game)", g_zero_os >> 10);
     else eb_log("allocator: zero-filled malloc off");
 
     mi_register_output(mi_out, NULL);
@@ -256,9 +269,12 @@ int eb_alloc_install(void) {
     return 1;
 }
 
+// uitime.c: mallocs zero-filled by mimalloc so far and their bytes (statistics, not exact across threads)
+void eb_alloc_zero_stats(LONG64* n, LONG64* bytes) { *n = g_zeroed; *bytes = g_zeroed_bytes; }
+
 void eb_alloc_report(void) {
-    eb_log("allocator: foreign frees %lld, foreign reallocs %lld, guard hits %lld, zero-filled mallocs %lld",
-           (long long)g_foreign_free, (long long)g_foreign_realloc, (long long)g_guard_hits, (long long)g_zeroed);
+    eb_log("allocator: foreign frees %lld, foreign reallocs %lld, guard hits %lld, zero-filled mallocs %lld (+ %lld from the Windows heap)",
+           (long long)g_foreign_free, (long long)g_foreign_realloc, (long long)g_guard_hits, (long long)g_zeroed, (long long)g_zeroed_os);
     size_t elapsed, user, sys, rss, peak_rss, commit, peak_commit, faults;
     mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
     eb_log("process: peak working set %zu MB, peak commit %zu MB, cpu user %zu s, sys %zu s",

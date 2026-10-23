@@ -20,6 +20,17 @@
 // tick are checked again), and readability is tested by reading one aligned qword per page through
 // eb_probe8, whose access violation a vectored handler turns into "not readable" (no system call).
 //
+// EXPERIMENT [modifiers] prov_text_cache=1 (2 = + verify, 3 = A/B, default off): the same function
+// makes the text the province monthly update stores - FUN_1409f35c0 -> FUN_140a2c5e0 picks the country
+// with the largest modifier 0x98 among the province's list at +0x490 and asks FUN_1408e8ca0 for the
+// condensed text of that country's modifier 0x98 (descriptor: no total, no entry list - the text is
+// the only output). In the late game this is 6.5% of the main thread (profile 2026-10-22), and most
+// provinces ask about the same few countries. With the experiment a call from that one call site
+// (return address 0x140a2c7ea) is answered from a copy made by the first such call for the same
+// container on the same day (the daily tick hook counts days); the copy goes into the caller's
+// std::string through the game's own assign (FUN_140095110). Verify mode builds the text again on
+// every hit and compares; A/B alternates calls between the original and the copy and times both.
+//
 // relation ([guard] relation): when a country is annexed, FUN_140a61900 (relation.cpp) looks up the
 // active relation to remove and calls FUN_140a5e130 with NULL when it is missing, right after
 // FUN_1404e1570 logged "!pRelation CDiplomacy::RemActive"; FUN_140a5e130 then dereferences it (crash
@@ -31,6 +42,11 @@
 #include "MinHook.h"
 
 #define RVA_TIP 0x8e8ca0u    // modifier breakdown text (container, std::string* out, descriptor)
+#define RVA_PTC_CALL 0xa2c7e5u  // FUN_140a2c5e0's call of it (e8 rel32); the hook sees return address +5
+#define RVA_STR_ASSIGN 0x095110u   // std::string::assign(const char*, size_t)
+#define RVA_STR_TIDY   0x095660u   // std::string: free the buffer, make it empty
+static const uint8_t sig_assign[16] = { 0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x56,0x57,0x41,0x57,0x48,0x83 };
+static const uint8_t sig_tidy[16]   = { 0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x51,0x18,0x48,0x8b,0xd9,0x48,0x83,0xfa };
 #define RVA_REL 0xa5e130u    // remove an active relation (relation)
 static const uint8_t sig_tip[24] = { 0x48,0x89,0x54,0x24,0x10,0x48,0x89,0x4c,0x24,0x08,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8d };
 static const uint8_t sig_rel[24] = { 0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0xd9,0x48,0x8b,0x0d,0x38,0x1d,0x8e,0x01,0x48,0x81,0xc1,0xb8,0x1b,0x00,0x00,0x48 };
@@ -61,7 +77,15 @@ static int g_sim;                    // main thread: inside the daily tick, outs
 static uintptr_t g_rdata_lo, g_rdata_hi;
 static volatile LONG g_bad_sources, g_bad_containers, g_null_relations;
 
-static uint64_t hk_day(void* gs) { g_sim++; uint64_t r = o_day(gs); g_sim--; return r; }
+static unsigned g_day_n;              // daily ticks so far (main thread)
+volatile ULONGLONG eb_day_ms;         // online.c throttles only while days are processed
+int eb_day_hooked;
+static uint64_t hk_day(void* gs) {
+    eb_day_ms = GetTickCount64();
+    g_sim++; g_day_n++; eb_in_day++; uint64_t r = o_day(gs); eb_in_day--; g_sim--;
+    eb_day_ms = GetTickCount64();
+    return r;
+}
 static uint64_t hk_midtick(void* gs, char a, void* b, uint32_t c) {
     int s = g_sim; g_sim = 0;
     uint64_t r = o_midtick(gs, a, b, c);
@@ -127,8 +151,82 @@ static void* empty_text(uint64_t* out, uint8_t* desc) {
     return out;
 }
 
+// ---- province text cache (main thread only: the province monthly update runs there) ----
+typedef void* (*str_assign_t)(uint64_t* s, const char* p, size_t n);
+typedef void (*str_tidy_t)(uint64_t* s);
+static str_assign_t g_str_assign;
+static str_tidy_t g_str_tidy;
+static uintptr_t g_ptc_ret;          // absolute return address of the cached call site
+#define NPTC 4096
+typedef struct { uint8_t* c; char* data; size_t len; } ptc_t;
+static ptc_t g_ptc[NPTC];
+static unsigned g_ptc_day = ~0u;
+static LONG64 g_ptc_calls, g_ptc_hits, g_ptc_ver, g_ptc_bad, g_ptc_t[2], g_ptc_n[2], g_ptc_months;
+static unsigned g_ptc_flip, g_ptc_logday = ~0u;
+static double g_ptc_ms;
+
+static const char* str_data(const uint64_t* s) { return s[3] > 15 ? (const char*)s[0] : (const char*)s; }
+static void ptc_clear(void) {
+    for (int i = 0; i < NPTC; i++) { free(g_ptc[i].data); g_ptc[i].c = NULL; g_ptc[i].data = NULL; }
+}
+static void ptc_report(void) {
+    eb_log("modifiers: province text cache: %lld months, %lld texts asked, %lld copied (%.1f%%) | verify %lld, mismatches %lld",
+           (long long)g_ptc_months, (long long)g_ptc_calls, (long long)g_ptc_hits, g_ptc_calls ? 100.0 * g_ptc_hits / g_ptc_calls : 0.0,
+           (long long)g_ptc_ver, (long long)g_ptc_bad);
+    if (g_cfg.prov_text_cache == 3)
+        for (int s = 0; s < 2; s++)
+            eb_log("modifiers: province text A/B %s: %lld texts, avg %.2f us, total %.1f ms", s ? "B (cache)   " : "A (original)",
+                   (long long)g_ptc_n[s], g_ptc_n[s] ? g_ptc_t[s] * g_ptc_ms * 1000.0 / g_ptc_n[s] : 0.0, g_ptc_t[s] * g_ptc_ms);
+}
+static void* ptc_text(uint8_t* c, uint64_t* out, uint8_t* desc) {
+    if (g_day_n != g_ptc_day) {                       // a new day: texts of earlier days are stale
+        if (g_ptc_calls && g_ptc_logday != g_ptc_day) {
+            g_ptc_months++; g_ptc_logday = g_ptc_day;
+            if (g_ptc_months % 12 == 0) ptc_report();
+        }
+        ptc_clear(); g_ptc_day = g_day_n;
+    }
+    g_ptc_calls++;
+    int side = 1;
+    LARGE_INTEGER t0;
+    if (g_cfg.prov_text_cache == 3) { side = (int)(++g_ptc_flip & 1); QueryPerformanceCounter(&t0); }
+    void* r = out;
+    unsigned h = (unsigned)(((uintptr_t)c >> 4) * 2654435761u) & (NPTC - 1);
+    ptc_t* e = NULL;
+    for (int k = 0; k < NPTC; k++, h = (h + 1) & (NPTC - 1))
+        if (!g_ptc[h].c || g_ptc[h].c == c) { e = &g_ptc[h]; break; }
+    if (side && e && e->c == c) {
+        g_ptc_hits++;
+        out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 15;   // empty std::string, then the game's assign
+        g_str_assign(out, e->data, e->len);
+        if (g_cfg.prov_text_cache == 2) {
+            uint64_t tmp[4];
+            o_tip(c, tmp, desc);
+            g_ptc_ver++;
+            if (tmp[2] != e->len || memcmp(str_data(tmp), e->data, e->len)) {
+                g_ptc_bad++;
+                if (g_ptc_bad <= 10) eb_log("modifiers: VERIFY MISMATCH province text of container %p: kept %zu bytes, the game made %zu", (void*)c, e->len, (size_t)tmp[2]);
+            }
+            g_str_tidy(tmp);
+        }
+    } else {
+        r = o_tip(c, out, desc);
+        if (side && e && !e->c) {
+            char* d = (char*)malloc(out[2] + 1);
+            if (d) { memcpy(d, str_data(out), out[2]); d[out[2]] = 0; e->c = c; e->data = d; e->len = out[2]; }
+        }
+    }
+    if (g_cfg.prov_text_cache == 3) {
+        LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+        g_ptc_t[side] += t1.QuadPart - t0.QuadPart; g_ptc_n[side]++;
+    }
+    return r;
+}
+
 static void* hk_tip(uint8_t* c, uint64_t* out, uint8_t* desc) {
-    if (g_sim) return o_tip(c, out, desc);
+    if (g_ptc_ret && g_sim && (uintptr_t)__builtin_return_address(0) == g_ptc_ret && GetCurrentThreadId() == g_main_tid)
+        return ptc_text(c, out, desc);
+    if (g_sim || !g_cfg.guard_tooltip) return o_tip(c, out, desc);
     if (!container_ok(c)) {
         if (InterlockedIncrement(&g_bad_containers) <= 20) eb_log("guard: tooltip skipped an invalid modifier container %p", (void*)c);
         return empty_text(out, desc);
@@ -172,7 +270,8 @@ static int hook(uint8_t* t, const uint8_t* sig, size_t n, void* fn, void** orig,
 }
 
 int eb_guard_install(void) {
-    if (!g_cfg.guard_tooltip && !g_cfg.guard_relation) return 1;
+    int want_day_time = g_cfg.online_poll_ms > 0 && g_cfg.online_running_only;
+    if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.prov_text_cache && !want_day_time) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
 #ifdef EB_TEST
@@ -190,13 +289,33 @@ int eb_guard_install(void) {
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) { eb_log("guard: MinHook init failed"); return 0; }
     int ok = 0;
-    // the tooltip guard needs the daily tick hooks: without them every province would be checked monthly
-    if (g_cfg.guard_tooltip && g_rdata_lo && day && midtick && AddVectoredExceptionHandler(1, probe_veh) &&
-        hook(day, sday, sizeof sig_day, (void*)hk_day, (void**)&o_day, "daily tick") &&
-        hook(midtick, smid, sizeof sig_midtick, (void*)hk_midtick, (void**)&o_midtick, "mid-tick frame") &&
-        hook(tip, stip, sizeof sig_tip, (void*)hk_tip, (void**)&o_tip, "tooltip")) {
-        ok++; eb_log("guard: modifier tooltips skip freed or invalid sources (outside the daily tick)");
+#ifndef EB_TEST
+    // the province text cache: the one call site must still be a call of the text function
+    if (g_cfg.prov_text_cache) {
+        uint8_t* cs = b + RVA_PTC_CALL;
+        if (cs[0] == 0xe8 && cs + 5 + *(int32_t*)(cs + 1) == b + RVA_TIP && !memcmp(b + RVA_STR_ASSIGN, sig_assign, sizeof sig_assign) &&
+            !memcmp(b + RVA_STR_TIDY, sig_tidy, sizeof sig_tidy)) {
+            g_ptc_ret = (uintptr_t)(cs + 5);
+            g_str_assign = (str_assign_t)(b + RVA_STR_ASSIGN);
+            g_str_tidy = (str_tidy_t)(b + RVA_STR_TIDY);
+            LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ptc_ms = 1000.0 / (double)f.QuadPart;
+        } else eb_log("modifiers: province text cache: call site not found - off");
     }
+#endif
+    // the daily tick hooks: the tooltip guard needs them (without them every province would be checked
+    // monthly), so does the province text cache; the online throttle reads the time of the latest tick
+    int want_tip = g_cfg.guard_tooltip || g_ptc_ret;
+    if ((want_tip || want_day_time) && day && midtick &&
+        hook(day, sday, sizeof sig_day, (void*)hk_day, (void**)&o_day, "daily tick") &&
+        hook(midtick, smid, sizeof sig_midtick, (void*)hk_midtick, (void**)&o_midtick, "mid-tick frame"))
+        eb_day_hooked = 1;
+    if (want_tip && eb_day_hooked && g_rdata_lo && AddVectoredExceptionHandler(1, probe_veh) &&
+        hook(tip, stip, sizeof sig_tip, (void*)hk_tip, (void**)&o_tip, "tooltip")) {
+        if (g_cfg.guard_tooltip) { ok++; eb_log("guard: modifier tooltips skip freed or invalid sources (outside the daily tick)"); }
+        if (g_ptc_ret)
+            eb_log("modifiers: EXPERIMENT province text cache on%s - the monthly province text of a country is built once a day",
+                   g_cfg.prov_text_cache == 2 ? " with VERIFY" : g_cfg.prov_text_cache == 3 ? " as A/B (calls alternate)" : "");
+    } else g_ptc_ret = 0;
     if (g_cfg.guard_relation && hook(rel, srel, sizeof sig_rel, (void*)hk_rel, (void**)&o_rel, "relation")) {
         ok++; eb_log("guard: a missing relation on annexation is skipped instead of crashing");
     }
@@ -204,6 +323,7 @@ int eb_guard_install(void) {
 }
 
 void eb_guard_report(void) {
+    if (g_ptc_ret) ptc_report();
     if (g_bad_containers || g_bad_sources || g_null_relations)
         eb_log("guard: %ld invalid tooltip containers, %ld invalid tooltip sources, %ld missing relations",
                (long)g_bad_containers, (long)g_bad_sources, (long)g_null_relations);

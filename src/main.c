@@ -80,7 +80,9 @@ static void load_config(void) {
     c->days_per_frame       = ini_int(ini, L"render",    L"speed5_days_per_frame", 1);    // experimental
     c->frame_budget_ms      = ini_int(ini, L"render",    L"speed5_frame_budget_ms", 100);
     c->online_poll_ms       = ini_int(ini, L"online",    L"poll_interval_ms", 100);
+    c->online_running_only  = ini_int(ini, L"online",    L"only_while_running", 1);
     c->zero_min_bytes       = ini_int(ini, L"allocator", L"zero_fill_min_bytes", 65536);
+    c->zero_os_kb           = ini_int(ini, L"allocator", L"zero_fill_windows_kb", 1024);
     c->save_par             = ini_int(ini, L"save",      L"parallel_compress", 0); // experimental
     c->save_block_kb        = ini_int(ini, L"save",      L"block_kb", 2048);
     c->save_threads         = ini_int(ini, L"save",      L"threads", 0);
@@ -90,6 +92,7 @@ static void load_config(void) {
     c->mod_fast             = ini_int(ini, L"modifiers", L"fast_add", 0);         // experimental
     c->mod_verify           = ini_int(ini, L"modifiers", L"verify", 0);
     c->mod_search           = ini_int(ini, L"modifiers", L"fast_search", 1);
+    c->prov_text_cache      = ini_int(ini, L"modifiers", L"prov_text_cache", 0);   // experimental
     c->mod_stats            = ini_int(ini, L"modifiers", L"stats", 0);
     c->country_stats        = ini_int(ini, L"country",   L"stats", 0);
     c->country_parallel_refresh = ini_int(ini, L"country", L"parallel_refresh", 0); // experimental
@@ -97,6 +100,19 @@ static void load_config(void) {
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
+    c->ui_timing            = ini_int(ini, L"general",   L"ui_timing", 0);       // diagnostics
+    c->report_capture       = ini_int(ini, L"report",    L"capture", 1);
+    c->report_upload        = ini_int(ini, L"report",    L"upload", -1);
+    c->report_hang_s        = ini_int(ini, L"report",    L"hang_seconds", 45);
+    c->report_test_keys     = ini_int(ini, L"report",    L"test_keys", 0);
+    c->report_slow          = ini_int(ini, L"report",    L"slow", 1);
+    c->slow_ui_ms           = ini_int(ini, L"report",    L"slow_list_ms", 300);
+    c->slow_stall_ms        = ini_int(ini, L"report",    L"slow_stall_ms", 2000);
+    c->slow_load_s          = ini_int(ini, L"report",    L"slow_load_s", 90);
+    if (c->slow_ui_ms < 1) c->slow_ui_ms = 1;
+    if (c->slow_stall_ms < 1000) c->slow_stall_ms = 1000;
+    if (c->slow_load_s < 1) c->slow_load_s = 1;
+    GetPrivateProfileStringW(L"report", L"url", L"", c->report_url, 256, ini);
     {
         wchar_t v[32];
         GetPrivateProfileStringW(L"threads", L"main_thread", L"free", v, 32, ini);
@@ -179,6 +195,9 @@ static void init(void) {
     eb_console_install();
     eb_guard_install();
     eb_aiprof_install();
+    eb_uitime_install();
+    eb_crash_install();          // last: its frame counter chains to the other POPS hooks
+    eb_report_start();
     if (g_cfg.prof_enabled) {
         if (eb_prof_start_thread()) eb_log("profiler: ready (Ctrl+Alt+P to start/stop)");
     }
@@ -201,6 +220,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         eb_modifier_report();
         eb_country_report();
         eb_guard_report();
+        eb_crash_exit();
         eb_log("process exit");
     }
     return TRUE;

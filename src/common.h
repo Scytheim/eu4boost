@@ -5,7 +5,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.0"
+#define EU4BOOST_VERSION "0.4.1"
+#define EB_W2(x) L##x
+#define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
 typedef struct {
     int log;
@@ -50,8 +52,10 @@ typedef struct {
     int main_affinity;            // -1 = game default (pinned), 0 = free, k+1 = pin to logical CPU k
     // online services
     int online_poll_ms;           // min. interval between POPS/Nakama callback pumps (0 = every frame, game default)
+    int online_running_only;      // 1 = ... only while game days are processed (paused, menus, loading: every frame)
     // allocator zero-fill threshold
     int zero_min_bytes;           // in large-only zero mode, zero allocations of at least this size
+    int zero_os_kb;               // zeroed allocations of at least this many KB come from the Windows heap (0 = mimalloc zeroes them)
     // saves (savezip.c)
     int save_par;                 // 1 = compress the zip entries of a save on all cores
     int save_block_kb;            // block size for the parallel compression
@@ -64,6 +68,7 @@ typedef struct {
     int mod_verify;               // 1 = diagnostics: run the game's add and compare the fast path with it
     int mod_stats;                // 1 = count the adds by path (diagnostics)
     int mod_search;               // 1 = small adds and dense containers: the game's algorithm with a SIMD search
+    int prov_text_cache;          // guard.c: EXPERIMENT 1 = the monthly province text of a country's modifier 0x98 is built once a day, 2 = + verify, 3 = A/B
     // country update (country.c)
     int country_stats;            // 1 = diagnostics: time the country loop and its dirty-bundle functions
     int country_parallel_refresh; // EXPERIMENT: 1 = RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check
@@ -73,6 +78,18 @@ typedef struct {
     // crash guards (guard.c)
     int guard_tooltip;            // 1 = modifier tooltips skip freed/invalid source containers
     int guard_relation;           // 1 = a missing relation on annexation is skipped instead of crashing
+    // diagnostics (uitime.c)
+    int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
+    // crash reports (crash.c writes them, report.c sends them)
+    int report_capture;           // 1 = write a local report when the game crashes, hangs or ends abnormally
+    int report_upload;            // -1 = ask once, 0 = never send, 1 = send pending reports at launch
+    int report_hang_s;            // no frame for this many seconds counts as a hang (0 = no hang reports)
+    int report_test_keys;         // 1 = Ctrl+Alt+Shift+F9 crashes, F10 hangs, F11 stalls the main thread (testing only)
+    int report_slow;              // 1 = slow save lists, loads and stalls become events of a slow report
+    int slow_ui_ms;               // ... a save list (save dialog, load screen, deleting) over this many ms
+    int slow_stall_ms;            // ... no frame for this many ms outside a load
+    int slow_load_s;              // ... a load (start -> first game frame) over this many seconds
+    wchar_t report_url[256];      // report endpoint ("" = the one built in)
 } eb_config_t;
 
 extern eb_config_t g_cfg;
@@ -86,6 +103,7 @@ void eb_log(const char* fmt, ...);
 // alloc.c
 int  eb_alloc_install(void);
 void eb_alloc_report(void);
+void eb_alloc_zero_stats(LONG64* n, LONG64* bytes);
 
 // threads.c
 int  eb_threads_install(void);
@@ -130,6 +148,26 @@ extern int (*eb_par_linger)(uint8_t* ctx);
 // guard.c
 int  eb_guard_install(void);
 void eb_guard_report(void);
+// daily tick hook, installed for the tooltip guard, the province text cache or the online throttle
+extern volatile ULONGLONG eb_day_ms;   // GetTickCount64() at the start and at the end of the latest daily tick
+extern int eb_day_hooked;
+
+extern volatile int eb_in_day;         // crash.c: inside the daily tick (set by guard.c)
+
+// uitime.c
+int  eb_uitime_install(void);
+
+// crash.c, report.c
+extern wchar_t eb_rep_dir[MAX_PATH];   // <plugins>\crash_reports\ .
+int  eb_crash_install(void);
+void eb_crash_exit(void);
+void eb_report_start(void);
+void eb_rm_dir(const wchar_t* dir);    // a folder with files only
+extern volatile int eb_loading;        // uitime.c: a save is being loaded or a new game set up
+void eb_slow_event(const char* what, double ms, double limit_ms, const char* detail);
+void eb_load_samples_reset(void);      // crash.c samples the main thread every 5 s during a load
+int  eb_load_samples_take(char* out, size_t n);
+int  eb_docs_dir(wchar_t* out, size_t n);   // Documents\Paradox Interactive\Europa Universalis IV\ .
 
 // profiler.c
 int  eb_prof_start_thread(void);

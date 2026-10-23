@@ -468,22 +468,38 @@ int main(int argc, char** argv) {
             memset(a, 0xEE, sz);
             t_free(a);
         }
+        // a big zeroed block (from the Windows heap by default) grown with realloc keeps its bytes
+        unsigned char* big = t_malloc(8u << 20);
+        for (size_t i = 0; i < (8u << 20); i += 4093) ok &= big[i] == 0;
+        memset(big, 0x5A, 8u << 20);
+        big = t_realloc(big, 9u << 20);
+        ok &= big != NULL && big[0] == 0x5A && big[(8u << 20) - 1] == 0x5A;
+        t_free(big);
         CHECK(ok);
         printf("large zero-fill check %s\n", ok ? "ok" : "FAILED");
     }
 
     // 3d. online polling throttle: two handles pumped every "frame" (~5 ms) for ~1 s from this
-    //     thread must each run about every 100 ms; calls from another thread pass through.
+    //     thread while "days" run (a daily tick every frame) must each run about every 100 ms; calls
+    //     from another thread pass through. Then 0.5 s without days (paused, menus): every pump runs,
+    //     unless only_while_running=0 ("always").
     {
         void* h1 = (void*)0x1111; void* h2 = (void*)0x2222; void* h3 = (void*)0x3333;
         ULONGLONG t0 = GetTickCount64(); int frames = 0;
-        while (GetTickCount64() - t0 < 1000) { POPS_RunCallbacks(h1); POPS_RunCallbacks(h2); Sleep(5); frames++; }
+        while (GetTickCount64() - t0 < 1000) { t_day(NULL); POPS_RunCallbacks(h1); POPS_RunCallbacks(h2); Sleep(5); frames++; }
         HANDLE ot = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(void*)other_thread_pops, h3, 0, NULL);
         WaitForSingleObject(ot, INFINITE);
         long c1 = POPS_TestCount(h1), c2 = POPS_TestCount(h2), c3 = POPS_TestCount(h3);
-        printf("online throttle: %d frames, handle1 %ld runs, handle2 %ld runs, other thread %ld/50\n", frames, c1, c2, c3);
-        if (argc > 4 && strcmp(argv[4], "nothrottle") == 0) { CHECK(c1 == frames && c2 == frames); }
-        else { CHECK(c1 >= 5 && c1 <= 14); CHECK(c2 >= 5 && c2 <= 14); }
+        Sleep(400);
+        int still = 0; t0 = GetTickCount64();
+        while (GetTickCount64() - t0 < 500) { POPS_RunCallbacks(h1); POPS_RunCallbacks(h2); Sleep(5); still++; }
+        long d1 = POPS_TestCount(h1) - c1, d2 = POPS_TestCount(h2) - c2;
+        printf("online throttle: %d frames with days: handle1 %ld runs, handle2 %ld runs, other thread %ld/50; "
+               "%d frames without days: handle1 %ld runs, handle2 %ld runs\n", frames, c1, c2, c3, still, d1, d2);
+        if (argc > 4 && strcmp(argv[4], "nothrottle") == 0) { CHECK(c1 == frames && c2 == frames); CHECK(d1 == still && d2 == still); }
+        else if (argc > 4 && strcmp(argv[4], "always") == 0) {
+            CHECK(c1 >= 5 && c1 <= 14); CHECK(c2 >= 5 && c2 <= 14); CHECK(d1 >= 3 && d1 <= 8); CHECK(d2 >= 3 && d2 <= 8);
+        } else { CHECK(c1 >= 5 && c1 <= 14); CHECK(c2 >= 5 && c2 <= 14); CHECK(d1 == still && d2 == still); }
         CHECK(c3 == 50);
     }
 
