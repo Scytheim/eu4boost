@@ -23,7 +23,8 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 - 10-23: 사용자 불편(저장 창·불러오기 화면·삭제가 느림) 원인 = EU4dll용 0 채우기가 세이브 목록의 68MB 할당마다 0을 씀 → `[allocator] zero_fill_windows_kb`로 수정(목록 73.9 → 7.2ms). 온라인 제한은 날짜가 넘어갈 때만(`[online] only_while_running`). 크래시 보고(`[report]`, src/crash.c·report.c, worker/crash-report.js): 기본 주소 EB_REPORT_URL은 `https://eu4boost-report.eu4boost.workers.dev/report`(Worker 코드를 바꾸면 사용자가 Cloudflare에 다시 붙여 넣는다). 진단용 `[general] ui_timing`. 느려짐 보고(`[report] slow`: 목록 0.3초, 멈칫 2초, 불러오기 90초) + 불러오기 시간 로그 `load:`. 배포 전 확인: 후반부 진행 0.4.0 2.45분 vs 0.4.1 2.36분, 불러오기 기능 끔 19.2초 vs 0.4.1 17.0초(평균). 0.4.1 배포. 크래시 보고 저장소 `Scytheim/eu4boost-crash-reports`는 이 PC의 gh(GitHub CLI, winget 설치, PATH에 없으면 기본 설치 위치)로 읽는다. 테스트가 끝나면 게임 폴더 ini의 `ab_test=0` 확인.
 - 10-23 오후: 실제 사용자 보고 2건(ANALYSIS_LOG). 크래시 = 느려짐 보고가 다시 돌린 메인 스레드의 스택을 읽다 난 것 → 0.4.2-dev에서 다 읽을 때까지 세워 두고 오류 막이(eb_guard_call) 안에서 읽음, 보고서에 모드 이름 목록 추가. 느림 = 세이브 895개(7.4GB)를 저장 창을 열 때마다 하나씩 여는 데(CreateFileW, 한 개 5.4ms, 백신 검사 추정) 5.6초. 테스트 15개.
 - 10-23 밤: 메모리 조사 1차(진단 [diag] mem_sites, 게임 자체 증가는 후반부 1년에 약 10MB). 9번 보고(세이브 구조 손상) 검토 → 저장 기능 세 가지는 원인이 될 수 없음, 그래도 나라 바이트 구조 검사(balanced)·저장 기록(saves.txt)·이전 세션 로그 확인을 넣음(저장 22번 검사 실패 0, +6ms). 남은 일: 플러그인 쪽 메모리 증가(5.4년 +339MB vs 없음 +113MB), Anbennar(윾타지) 호환 확인, 0.4.2 배포.
-- 10-23 밤: 자동 업데이트(src/update.c, [update] auto=1 기본, 다음 실행부터, ECDSA P-256 서명 확인, 서명 도구 tools/sign.c, 비밀 키는 <작업 폴더>\keys\). release.sh가 eu4boost.dll과 .sig도 만든다 → 릴리스에 zip·dll·sig 세 파일.
+- 10-23 밤: 자동 업데이트(src/update.c, [update] auto=1 기본, 다음 실행부터, ECDSA P-256 서명 확인, 서명 도구 tools/sign.c, 비밀 키는 <작업 폴더>\keys\). 릴리스 파일은 zip 하나(DLL은 무압축 저장, 서명은 zip 주석 — release.sh가 만들고 다시 읽어 확인).
+- 10-23 밤: **0.4.2 배포**(릴리스는 zip 하나, 업데이트가 zip에서 DLL·서명을 읽음). 남은 일: 플러그인 쪽 메모리 증가, Anbennar(윾타지) 호환 확인, 0.4.1 사용자의 불러오기 크래시 보고 추적.
 - 다음 일: HANDOFF.md §9(0번: 커밋·기본값은 사용자 결정 대기).
 
 ## 사용자
