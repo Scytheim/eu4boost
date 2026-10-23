@@ -731,7 +731,7 @@
   - 전송: 처음 한 번 동의를 묻고(ini에 저장), 다음 실행 15초 뒤 WinHTTP로 한 번에 3개까지 보낸다. 사용자 폴더·사용자 이름·PC 이름과 계정 키 값(session-token, userid 등), meta.yml의 LaunchArguments 줄을 지운다. Worker는 다시 지우고, 같은 서명·버전이면 기존 이슈에 댓글, 아니면 새 이슈(로그는 댓글 2개).
   - 시험(실제 게임, 이 PC의 시험용 수신 서버): 동의창 → 일부러 크래시(Ctrl+Alt+Shift+F9, `test_keys=1`일 때만) → 다음 실행에서 31KB 전송, 서명 `EXCEPTION_ACCESS_VIOLATION eu4boost.dll+0x178a7`. 멈춤 46초에 기록 → 회복 후 삭제. 멈춘 채 강제 종료 → 다음 실행에 멈춤 보고 전송. 그냥 강제 종료 → 비정상 종료 보고. 정상 종료 → 보고 없음. Worker는 test/worker_test.mjs(가짜 GitHub) 13개 확인 통과.
 
-- **배포(10-23 낮)**: 사용자가 비공개 저장소 `Scytheim/eu4boost-crash-reports`, 이슈 전용 토큰, Cloudflare Worker `eu4boost-report`(서브도메인 `eu4boost`)를 만들었다. 보고 주소 `https://eu4boost-report.eu4boost.workers.dev/report`를 src/report.c의 EB_REPORT_URL에 넣었다. 실제 시험: 시험 보고 2개를 연달아 보내니 둘 다 새 이슈(1, 2번)가 됨(GitHub 목록이 1~2초 늦게 반영), 10초 뒤 보낸 것은 2번에 댓글로 붙음(`repeat:true`). 시험 이슈는 사용자가 지운다(토큰은 삭제 권한 없음, 이 PC에 gh 없음).
+- **배포(10-23 낮)**: 사용자가 비공개 저장소 `Scytheim/eu4boost-crash-reports`, 이슈 전용 토큰, Cloudflare Worker `eu4boost-report`(서브도메인 `eu4boost`)를 만들었다. 보고 주소 `https://eu4boost-report.eu4boost.workers.dev/report`를 src/report.c의 EB_REPORT_URL에 넣었다. 실제 시험: 시험 보고 2개를 연달아 보내니 둘 다 새 이슈(1, 2번)가 됨(GitHub 목록이 1~2초 늦게 반영), 10초 뒤 보낸 것은 2번에 댓글로 붙음(`repeat:true`). 시험 이슈 1·2번은 사용자가 지웠다(토큰은 삭제 권한 없음). 그 뒤 이 PC에 gh(GitHub CLI)를 설치해 Scytheim으로 로그인했고, 이제 시험 이슈는 gh로 지운다(`gh issue delete N --repo Scytheim/eu4boost-crash-reports --yes`).
 
 ## 2026-10-23 느려짐 보고와 0.4.1 배포 전 확인
 
@@ -741,4 +741,5 @@
 - **배포 전 확인**(1874 복사본, 짭짭죽, 5배속 1874.07.01 → 1880.01.01, `bench\results\late_1023`): 0.4.0 2.335·2.559분(평균 2.447), 0.4.1 2.376·2.341분(평균 2.359) → 느려지지 않음(어제 0.4.0 측정 2.71분보다 오늘 전체가 빠름, 실행 사이 흔들림 약 10%).
 - **불러오기**(같은 0.4.1 DLL, `load:` 기준): 플러그인 기능 모두 끔 16.9·21.4초, 0.4.1 배포 설정 13.2·19.6·18.1초. 세부: 세이브 읽기 3.06~3.12 → 2.66초, Initializing savegame 253 → 203ms, savegame fixes 451 → 330ms. 플러그인이 불러오기를 느리게 하지 않는다.
 - 중간 서버(`worker/crash-report.js`)는 "느림" 종류를 추가했으므로 Cloudflare에 다시 붙여 넣어야 한다. 그 전에 온 보고는 거절(400)되지만, 플러그인이 다섯 번까지 다음 실행에 다시 보낸다.
+- **중간 서버 다시 배포(10-23, 0.4.1 배포 뒤)**: 사용자가 새 코드를 붙여 넣고 Deploy. 시험: 로컬 시험 보고(`bench\report_test\recv_1.json`, 느림)의 서명을 "TEST relay check (slow kind) - delete me", 버전을 0.4.1-test로 바꿔 보냄 → `{"ok":true,"issue":3,"repeat":false}`. 이슈 3번 "[느림] …" 본문에 PC·설정·DLL 해시·세이브 줄과 보고서, 댓글 2개(플러그인 로그, 게임 로그) 확인. 3번은 gh로 지움 → 저장소 이슈 0개(다음 실제 보고는 4번부터).
 
