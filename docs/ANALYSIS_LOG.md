@@ -872,3 +872,9 @@
 - **창**: 시험 모드에서는 게임 창을 뜨자마자 SW_SHOWMINNOACTIVE로 최소화(처음 60초는 항상, 그 뒤엔 앞에 있지 않을 때만), `[threads] background_full_speed=1`로 최소화 상태에서도 돌게 함.
 - **스크립트**(`<작업 폴더>\bench\auto`, 저장소 밖): run.sh(사용자 세이브 해시 확인, eb_auto 복사, continue_game.json 바꿨다 되돌림, DLL·ini 설치, 실행, 기다림, 로그·crash_reports 보관, eb_ 세이브 지움), restore.sh(플레이 DLL·ini로 되돌림).
 - **확인**: 1874.07.01 → 09.01: 켜기부터 종료까지 68초, 창 최소화, 경고 건너뜀, 불러오기 6.0초, 2개월 8.3초, state=exit, 사용자 세이브·continue_game.json 그대로. 최소화 상태의 속도는 앞에 둔 창보다 느릴 수 있다(이 2개월 7.5일/초) → 속도 비교는 같은 조건끼리만.
+
+## 2026-10-25 0.4.4 배포
+
+- **배포**: 로컬 aeedd8c(24번 수정) + f1b7340(자동 진행), 공개 커밋 66c3a86(4b83530 위, 트리 같음), 태그 0.4.4, GitHub 릴리스 0.4.4(설명 비움) = eu4boost_v0.4.4.zip 하나(a0c6ec18…, 안의 DLL 355176ad…, zip 주석 서명 확인 OK). 릴리스에서 다시 받은 zip 해시 같음. 처음 만든 zip(DLL 9f81ae8c, 자동 진행 없음)은 올리지 않음.
+- **배포 DLL 최종 확인**(이 DLL 그대로, 클릭 없는 자동 시험 `bench\auto\runs\rel044`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1): 켜기부터 종료까지 195초(2년 반 131.6초, 최소화), 저장 10번 나라 검사 16,680번 실패 0, 검증 불일치 0, 정상 종료(state=exit), 보낼 보고 없음, 사용자 세이브 그대로.
+- 시험 뒤: 게임 폴더에 0.4.4 배포 DLL(355176ad)·플레이 ini(0.4.4 배포 ini + report.upload=1, ab_test=0, auto=1). continue_game.json 그대로.
