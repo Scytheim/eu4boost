@@ -298,6 +298,7 @@ static int tip_run(unsigned char* c, unsigned long long* visited);
 static void tip_tick_valid(void* c) { tick_total = tip_run((unsigned char*)c, &tick_visited); }
 static void tip_tick_reused(void* c) { tick_total = tip_run((unsigned char*)c, &tick_visited); }
 static void tick_then_mid(void* c) { tick_body = (tick_fn_t)(void*)tip_tick_reused; t_midtick(c, 0, NULL, 0); }
+static void gp_test(void);
 static void guard_test(void) {
     tip_entry = t_tip;
     unsigned long long n;
@@ -342,6 +343,54 @@ static void guard_test(void) {
     t_rel(NULL);
     t_rel(rel);
     CHECK(rel[0x28] == 1);
+    gp_test();
+}
+
+// great project references: t_gp_setbuf mimics FUN_1407db530 (moves the 0x1d38-byte elements into a new
+// buffer and gives the old one back to the system), t_hc_read mimics the has_construction read
+// FUN_140cc6e40 (stores the address of element idx of the manager's array at +0x78, or 0)
+__declspec(dllexport) unsigned char* t_gp_mgr;
+__declspec(dllexport) void* t_hc_vt[4];
+__declspec(dllexport) __attribute__((noinline)) void t_gp_setbuf(unsigned char* arr, unsigned char* buf, unsigned cap) {
+    unsigned char* old = *(unsigned char**)(arr + 8);
+    int n = *(int*)(arr + 0x14);
+    if (old) { memcpy(buf, old, (size_t)n * 0x1d38); VirtualFree(old, 0, MEM_RELEASE); }
+    *(unsigned char**)(arr + 8) = buf; *(unsigned*)(arr + 0x10) = cap;
+}
+__declspec(dllexport) __attribute__((noinline)) unsigned long long t_hc_read(unsigned char* t, void* tok) {
+    int idx = (int)(intptr_t)tok;
+    *(unsigned char**)(t + 0x78) = idx >= 0 ? *(unsigned char**)(t_gp_mgr + 0x48) + (size_t)idx * 0x1d38 : NULL;
+    return 1;
+}
+static void gp_add(unsigned char type) {   // FUN_1407db120: grow by doubling, then fill the element
+    unsigned char* arr = t_gp_mgr + 0x40;
+    int n = *(int*)(arr + 0x14); unsigned cap = *(unsigned*)(arr + 0x10);
+    if ((unsigned)n + 1 > cap) {
+        unsigned nc = cap ? cap * 2 : 1;
+        t_gp_setbuf(arr, VirtualAlloc(NULL, (size_t)nc * 0x1d38, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), nc);
+    }
+    (*(unsigned char**)(arr + 8))[(size_t)n * 0x1d38 + 0x1d36] = type;
+    *(int*)(arr + 0x14) = n + 1;
+}
+static void gp_test(void) {
+    t_gp_mgr = calloc(1, 0x58);
+    unsigned char* t[4];
+    for (int i = 0; i < 4; i++) { t[i] = calloc(1, 0x88); *(void**)t[i] = t_hc_vt; }
+    for (int i = 0; i < 3; i++) gp_add((unsigned char)(1 + i % 2));    // count 3 of capacity 4
+    t_hc_read(t[0], (void*)1);         // names an earlier project (Anbennar: dwarovar_marrhold_tunnel)
+    gp_add(1);
+    t_hc_read(t[1], (void*)3);         // names itself (Anbennar's valley tunnels)
+    t_hc_read(t[2], (void*)0);
+    t_hc_read(t[3], (void*)-1);        // names no project: nothing to track
+    memset(t[2], 0x55, 0x88);          // freed and reused: must not be written
+    for (int i = 4; i < 40; i++) gp_add((unsigned char)(1 + i % 2)); // moves at 5, 9, 17 and 33
+    unsigned char* base = *(unsigned char**)(t_gp_mgr + 0x48);
+    unsigned char *a = *(unsigned char**)(t[0] + 0x78), *b = *(unsigned char**)(t[1] + 0x78);
+    printf("great projects: references at element %lld and %lld of the moved array\n",
+           (long long)(a - base) / 0x1d38, (long long)(b - base) / 0x1d38);
+    CHECK(a == base + 1 * 0x1d38 && b == base + 3 * 0x1d38);
+    CHECK(a[0x1d36] == 2 && b[0x1d36] == 1);
+    CHECK(*(unsigned long long*)(t[2] + 0x78) == 0x5555555555555555ull && *(void**)(t[3] + 0x78) == NULL);
 }
 
 // zip-entry round trip: the output must be one valid stored-block stream with exactly one final
@@ -561,6 +610,9 @@ int main(int argc, char** argv) {
         int (*tu)(void) = (int (*)(void))GetProcAddress(h, "eb_test_update");          // update.c: versions, release list, signature
         CHECK(tu != NULL);
         if (tu) { int d = tu(); printf("auto-update checks: %d wrong answers\n", d); CHECK(d == 0); }
+        int (*tl)(void) = (int (*)(void))GetProcAddress(h, "eb_test_savelist");        // savelist.c: text cut, meta zip
+        CHECK(tl != NULL);
+        if (tl) { int d = tl(); printf("save list cache checks: %d wrong answers\n", d); CHECK(d == 0); }
     }
 
     // 3h. modifier-container add (fast path vs the game's algorithm)

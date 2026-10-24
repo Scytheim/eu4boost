@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.2"
+#define EU4BOOST_VERSION "0.4.3"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -63,6 +63,8 @@ typedef struct {
     int save_stats;               // 1 = log the time of every save and of its compression
     int save_fmt;                 // 1 = exact fast integer formatting at two sprintf call sites of the save writer
     int save_countries;           // savepar.c: 1 = serialize the countries of a save on all cores, 2/3 = + verify
+    int save_list_cache;          // savelist.c: 1 = unchanged saves are listed from cached meta without opening them, 2 = + log every item
+    int script_fast_vars;         // script.c: 1 = variable reads search the scope's store without building store lists, 2 = + verify
     // modifiers (modifier.c)
     int mod_fast;                 // 1 = O(n) add of modifier containers into sparse ones (same result)
     int mod_verify;               // 1 = diagnostics: run the game's add and compare the fast path with it
@@ -78,6 +80,7 @@ typedef struct {
     // crash guards (guard.c)
     int guard_tooltip;            // 1 = modifier tooltips skip freed/invalid source containers
     int guard_relation;           // 1 = a missing relation on annexation is skipped instead of crashing
+    int guard_great_project;      // 1 = has_construction triggers that name a great project follow the array when it moves
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
     int mem_sites;                // memdiag.c: keep the call sites of 1 in N allocations (0 = off; needs the allocator)
@@ -143,6 +146,12 @@ void eb_savepar_report(void);
 void eb_savepar_mark(void);              // savezip.c, around every save: what the country loop did
 const char* eb_savepar_status(void);
 const char* eb_save_journal(void);       // savezip.c: the session's last saves (crash.c puts it in reports)
+// savelist.c
+int  eb_savelist_install(void);
+void eb_savelist_report(void);
+// script.c
+int  eb_script_install(void);
+void eb_script_report(void);
 
 // console.c
 int  eb_console_install(void);

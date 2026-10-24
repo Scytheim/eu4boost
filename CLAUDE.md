@@ -25,6 +25,9 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 - 10-23 밤: 메모리 조사 1차(진단 [diag] mem_sites, 게임 자체 증가는 후반부 1년에 약 10MB). 9번 보고(세이브 구조 손상) 검토 → 저장 기능 세 가지는 원인이 될 수 없음, 그래도 나라 바이트 구조 검사(balanced)·저장 기록(saves.txt)·이전 세션 로그 확인을 넣음(저장 22번 검사 실패 0, +6ms). 남은 일: 플러그인 쪽 메모리 증가(5.4년 +339MB vs 없음 +113MB), Anbennar(윾타지) 호환 확인, 0.4.2 배포.
 - 10-23 밤: 자동 업데이트(src/update.c, [update] auto=1 기본, 다음 실행부터, ECDSA P-256 서명 확인, 서명 도구 tools/sign.c, 비밀 키는 <작업 폴더>\keys\). 릴리스 파일은 zip 하나(DLL은 무압축 저장, 서명은 zip 주석 — release.sh가 만들고 다시 읽어 확인).
 - 10-23 밤: **0.4.2 배포**(릴리스는 zip 하나, 업데이트가 zip에서 DLL·서명을 읽음). 남은 일: 플러그인 쪽 메모리 증가, Anbennar(윾타지) 호환 확인, 0.4.1 사용자의 불러오기 크래시 보고 추적.
+- 10-24: 이슈 4~21 검토. 18번(Anbennar 크래시) = 기념물 정의 안의 has_construction이 대형 사업 배열이 두 배로 늘 때 옛 주소를 들고 있는 게임 버그 → `[guard] great_project`(기본 켬, 불러오기 때만 동작). 윾타지 플레이세트로 실제 확인(트리거 2개를 3번 옮김, 정상 종료). 0.4.3 배포는 사용자 결정 대기. 다음 후보: 세이브 목록 캐시(20번, 저장 창 20초), 플러그인 쪽 메모리 증가, 이슈 제목 버전.
+- 10-24: 세이브 목록 캐시(`[save] list_cache`, src/savelist.c, 기본 켬): 47개 목록 1,328 → 34ms, 항목 비교 차이 0, 망가진 캐시는 원래 세이브로 다시 읽음. 비압축 세이브가 느린 원인 = 게임 meta 읽기가 "}" 뒤 키를 놓쳐 첫 프로빈스까지 약 3MB를 한 글자씩 읽음. 게임 재시작(싱글 화면 "뒤로") 때 비정상 종료 오보고도 고침(session.txt pid). 남은 일: 메모리 증가, 스크립트 변수(19번), 그다음 0.4.3 배포.
+- 10-25: 스크립트 변수 읽기(`[script] fast_variables`, src/script.c, 기본 켬): MEIOU(사용자가 구독, 시험 플레이세트 eb_MEIOU)에서 1월 2일 멈춤 8.7 → 6.8초, 4년 −7.8%, 11억 번 비교 차이 0. 남은 일: 메모리 증가(mimalloc 주기 정리 1.7%도 같이), 그다음 0.4.3 배포.
 - 다음 일: HANDOFF.md §9(0번: 커밋·기본값은 사용자 결정 대기).
 
 ## 사용자
@@ -34,7 +37,7 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 ## 명령
 ```sh
 sh build.sh                   # → build/eu4boost.dll. Windows(Git Bash): <도구 폴더>\llvm-mingw-* 자동 사용, WSL/Linux: clang + lld + mingw-w64
-sh test/run_tests.sh          # 스모크 테스트 15개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 15 cases passed"
+sh test/run_tests.sh          # 스모크 테스트 16개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 16 cases passed"
 node test/worker_test.mjs     # 크래시 보고 중간 서버(worker/crash-report.js)를 가짜 GitHub로 시험
 sh tools/release.sh           # 릴리스 파일(zip, eu4boost.dll, .sha256) → build/release/v버전/ (버전에 -dev가 없어야 함)
 powershell -File build_windows.ps1   # PowerShell 빌드 (build.sh와 같은 코드)

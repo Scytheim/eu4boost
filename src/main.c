@@ -89,6 +89,8 @@ static void load_config(void) {
     c->save_stats           = ini_int(ini, L"save",      L"stats", 0);
     c->save_fmt             = ini_int(ini, L"save",      L"fast_format", 0);      // experimental
     c->save_countries       = ini_int(ini, L"save",      L"parallel_countries", 0); // experimental
+    c->save_list_cache      = ini_int(ini, L"save",      L"list_cache", 1);
+    c->script_fast_vars     = ini_int(ini, L"script",    L"fast_variables", 1);
     c->mod_fast             = ini_int(ini, L"modifiers", L"fast_add", 0);         // experimental
     c->mod_verify           = ini_int(ini, L"modifiers", L"verify", 0);
     c->mod_search           = ini_int(ini, L"modifiers", L"fast_search", 1);
@@ -100,6 +102,7 @@ static void load_config(void) {
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
+    c->guard_great_project  = ini_int(ini, L"guard",     L"great_project", 1);
     c->ui_timing            = ini_int(ini, L"general",   L"ui_timing", 0);       // diagnostics
     c->mem_sites            = ini_int(ini, L"diag",      L"mem_sites", 0);
     c->mem_sites_s          = ini_int(ini, L"diag",      L"mem_sites_s", 60);
@@ -194,6 +197,8 @@ static void init(void) {
     eb_parallel_install();
     eb_savezip_install();
     eb_savepar_install();
+    eb_savelist_install();       // before uitime: in its diagnostics mode it hooks the save list item
+    eb_script_install();
     eb_modifier_install();
     eb_country_install();
     eb_console_install();
@@ -222,6 +227,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         eb_parallel_report();
         eb_savezip_report();
         eb_savepar_report();
+        eb_savelist_report();
+        eb_script_report();
         eb_modifier_report();
         eb_country_report();
         eb_guard_report();

@@ -36,6 +36,23 @@
 // FUN_1404e1570 logged "!pRelation CDiplomacy::RemActive"; FUN_140a5e130 then dereferences it (crash
 // 21:34, a peace deal annexing a country in a personal union). The other call site already tests the
 // relation for NULL after this call, so a NULL relation is skipped.
+//
+// great_project ([guard] great_project): the has_construction trigger keeps the great project it names
+// as a raw address in the great project array. Its read FUN_140cc6e40 looks the name up with
+// FUN_1407db3a0 (index * 0x1d38 + array data) and stores the element's address at +0x78. The array
+// (manager DAT_14242bc90 +0x40: data +0x48, capacity +0x50, count +0x54) is filled while the great
+// project files are read: FUN_1407db120 adds an element - doubling the capacity through FUN_1407db530,
+// which moves the elements into a new buffer and frees the old one - and then reads it, triggers and
+// all. A trigger inside a great project that names an earlier project, or itself, keeps an address in a
+// buffer that a later doubling frees. Anbennar does this (its tunnels: NOT = { 6830 = { ...
+// has_construction = dwarovar_valley_tunnel } } inside dwarovar_valley_tunnel). The evaluation
+// FUN_140cc7550 reads the type byte at +0x1d36 of that address: when the buffer was given back to the
+// system it crashes (report 18: Anbennar with four monument submods, AI building evaluation, the same day
+// every time); when it is still mapped it reads stale memory, and the address never equals the
+// construction's (+0x80), so the trigger was always false. Vanilla's great projects name no other project.
+// The guard records every has_construction trigger that holds a great project address and moves those
+// addresses along when the array moves (only a trigger that still has its vtable and the recorded
+// address). Both functions run while the game data is read, not during play.
 #include "common.h"
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +67,14 @@ static const uint8_t sig_tidy[16]   = { 0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,
 #define RVA_REL 0xa5e130u    // remove an active relation (relation)
 static const uint8_t sig_tip[24] = { 0x48,0x89,0x54,0x24,0x10,0x48,0x89,0x4c,0x24,0x08,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8d };
 static const uint8_t sig_rel[24] = { 0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0xd9,0x48,0x8b,0x0d,0x38,0x1d,0x8e,0x01,0x48,0x81,0xc1,0xb8,0x1b,0x00,0x00,0x48 };
+#define RVA_HC_READ   0xcc6e40u    // has_construction trigger: read its value (trigger, token)
+#define RVA_GP_SETBUF 0x7db530u    // great project array: move the elements into a new buffer (array, buffer, capacity)
+#define RVA_GP_MGR    0x242bc90u   // great project manager (pointer)
+#define RVA_HC_VT     0x1d17230u   // vtable of the has_construction trigger
+static const uint8_t sig_hc_read[24] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7c,0x24,0x20,0x55,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57 };
+static const uint8_t sig_gp_setbuf[24] = { 0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x57,0x41,0x56,0x41,0x57,0x48,0x83,0xec,0x20,0x44,0x8b,0x49,0x14,0x45 };
+#define GP_SIZE 0x1d38             // one great project
+#define HC_GP   0x78               // trigger: address of the great project it names (or 0)
 
 // modifier container (see modifier.c)
 #define M_DENSE 0x10
@@ -262,6 +287,63 @@ static void hk_rel(void* rel) {
     o_rel(rel);
 }
 
+typedef uint64_t (*hc_read_t)(uint8_t* t, void* tok);
+typedef void (*gp_setbuf_t)(uint8_t* arr, uint8_t* buf, uint32_t cap);
+static hc_read_t o_hc_read;
+static gp_setbuf_t o_gp_setbuf;
+static uint8_t** g_gp_mgr;            // where the game keeps the manager's address
+static void* g_hc_vt;
+typedef struct { uint8_t* t; uint8_t* gp; } hcref_t;
+#define NHC 8192
+static hcref_t g_hc[NHC];
+static int g_nhc, g_hc_lost;
+static CRITICAL_SECTION g_gp_cs;
+static int g_gp_moves, g_gp_moved;
+
+static uint64_t hk_hc_read(uint8_t* t, void* tok) {
+    EnterCriticalSection(&g_gp_cs);   // the array cannot move between the lookup and the record
+    uint64_t r = o_hc_read(t, tok);
+    uint8_t* gp = *(uint8_t**)(t + HC_GP);
+    if (gp) {
+        if (g_nhc < NHC) { g_hc[g_nhc].t = t; g_hc[g_nhc].gp = gp; g_nhc++; }
+        else if (g_hc_lost++ == 0) eb_log("guard: more than %d has_construction triggers name a great project - the rest are not tracked", NHC);
+    }
+    LeaveCriticalSection(&g_gp_cs);
+    return r;
+}
+
+static void hk_gp_setbuf(uint8_t* arr, uint8_t* buf, uint32_t cap) {
+    EnterCriticalSection(&g_gp_cs);
+    uint8_t* old = *(uint8_t**)(arr + 8);
+    int n = *(int*)(arr + 0x14);
+    o_gp_setbuf(arr, buf, cap);
+    uint8_t* mgr = *g_gp_mgr;
+    if (old && buf && old != buf && n > 0 && mgr && arr == mgr + 0x40) {
+        uintptr_t lo = (uintptr_t)old, hi = lo + (uintptr_t)n * GP_SIZE;
+        int moved = 0;
+        for (int i = 0; i < g_nhc; i++) {
+            hcref_t* h = &g_hc[i];
+            uint64_t vt, gp;
+            if ((uintptr_t)h->gp < lo || (uintptr_t)h->gp >= hi) continue;
+            // the trigger may have been freed since: it must still look like the one recorded
+            if (!eb_probe8(h->t, &vt) || vt != (uintptr_t)g_hc_vt || !eb_probe8(h->t + HC_GP, &gp) || gp != (uintptr_t)h->gp) continue;
+            h->gp = buf + ((uintptr_t)h->gp - lo);
+            *(uint8_t**)(h->t + HC_GP) = h->gp;
+            moved++;
+        }
+        g_gp_moves++;
+        g_gp_moved += moved;
+        if (moved) eb_log("guard: great projects moved to a new array (%d of capacity %u) - %d has_construction triggers moved with them", n, cap, moved);
+    }
+    LeaveCriticalSection(&g_gp_cs);
+}
+
+static int g_probe_on;
+static int probe_init(void) {
+    if (!g_probe_on && AddVectoredExceptionHandler(1, probe_veh)) g_probe_on = 1;
+    return g_probe_on;
+}
+
 static int hook(uint8_t* t, const uint8_t* sig, size_t n, void* fn, void** orig, const char* what) {
     if (!t) { eb_log("guard: %s target not found", what); return 0; }
     if (sig && memcmp(t, sig, n)) { eb_log("guard: %s signature mismatch - not installed", what); return 0; }
@@ -271,17 +353,21 @@ static int hook(uint8_t* t, const uint8_t* sig, size_t n, void* fn, void** orig,
 
 int eb_guard_install(void) {
     int want_day_time = g_cfg.online_poll_ms > 0 && g_cfg.online_running_only;
-    if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.prov_text_cache && !want_day_time) return 1;
+    if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.guard_great_project && !g_cfg.prov_text_cache && !want_day_time) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
 #ifdef EB_TEST
     uint8_t* tip = (uint8_t*)GetProcAddress(g_exe, "t_tip"); uint8_t* rel = (uint8_t*)GetProcAddress(g_exe, "t_rel");
     uint8_t* day = (uint8_t*)GetProcAddress(g_exe, "t_day"); uint8_t* midtick = (uint8_t*)GetProcAddress(g_exe, "t_midtick");
-    const uint8_t *stip = NULL, *srel = NULL, *sday = NULL, *smid = NULL;
+    uint8_t* hc = (uint8_t*)GetProcAddress(g_exe, "t_hc_read"); uint8_t* gpb = (uint8_t*)GetProcAddress(g_exe, "t_gp_setbuf");
+    g_gp_mgr = (uint8_t**)GetProcAddress(g_exe, "t_gp_mgr"); g_hc_vt = (void*)GetProcAddress(g_exe, "t_hc_vt");
+    const uint8_t *stip = NULL, *srel = NULL, *sday = NULL, *smid = NULL, *shc = NULL, *sgpb = NULL;
 #else
     if (nt->FileHeader.TimeDateStamp != 0x66FE6AB9u) { eb_log("guard: unknown eu4.exe - not installed"); return 0; }
     uint8_t* tip = b + RVA_TIP; uint8_t* rel = b + RVA_REL; uint8_t* day = b + RVA_DAY; uint8_t* midtick = b + RVA_MIDTICK;
-    const uint8_t *stip = sig_tip, *srel = sig_rel, *sday = sig_day, *smid = sig_midtick;
+    uint8_t* hc = b + RVA_HC_READ; uint8_t* gpb = b + RVA_GP_SETBUF;
+    g_gp_mgr = (uint8_t**)(b + RVA_GP_MGR); g_hc_vt = b + RVA_HC_VT;
+    const uint8_t *stip = sig_tip, *srel = sig_rel, *sday = sig_day, *smid = sig_midtick, *shc = sig_hc_read, *sgpb = sig_gp_setbuf;
 #endif
     IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
@@ -309,7 +395,7 @@ int eb_guard_install(void) {
         hook(day, sday, sizeof sig_day, (void*)hk_day, (void**)&o_day, "daily tick") &&
         hook(midtick, smid, sizeof sig_midtick, (void*)hk_midtick, (void**)&o_midtick, "mid-tick frame"))
         eb_day_hooked = 1;
-    if (want_tip && eb_day_hooked && g_rdata_lo && AddVectoredExceptionHandler(1, probe_veh) &&
+    if (want_tip && eb_day_hooked && g_rdata_lo && probe_init() &&
         hook(tip, stip, sizeof sig_tip, (void*)hk_tip, (void**)&o_tip, "tooltip")) {
         if (g_cfg.guard_tooltip) { ok++; eb_log("guard: modifier tooltips skip freed or invalid sources (outside the daily tick)"); }
         if (g_ptc_ret)
@@ -319,11 +405,23 @@ int eb_guard_install(void) {
     if (g_cfg.guard_relation && hook(rel, srel, sizeof sig_rel, (void*)hk_rel, (void**)&o_rel, "relation")) {
         ok++; eb_log("guard: a missing relation on annexation is skipped instead of crashing");
     }
+    if (g_cfg.guard_great_project && g_gp_mgr && g_hc_vt && probe_init()) {
+        InitializeCriticalSection(&g_gp_cs);
+        // both or neither: the trigger reads are recorded only for the array moves
+        if (hook(hc, shc, sizeof sig_hc_read, (void*)hk_hc_read, (void**)&o_hc_read, "has_construction read")) {
+            if (hook(gpb, sgpb, sizeof sig_gp_setbuf, (void*)hk_gp_setbuf, (void**)&o_gp_setbuf, "great project array")) {
+                ok++; eb_log("guard: has_construction triggers that name a great project follow the great project array when it moves");
+            } else MH_DisableHook(hc);
+        }
+    }
     return ok;
 }
 
 void eb_guard_report(void) {
     if (g_ptc_ret) ptc_report();
+    if (g_nhc || g_gp_moved)
+        eb_log("guard: %d has_construction triggers name a great project, the array moved %d times, %d trigger addresses moved with it",
+               g_nhc + g_hc_lost, g_gp_moves, g_gp_moved);
     if (g_bad_containers || g_bad_sources || g_null_relations)
         eb_log("guard: %ld invalid tooltip containers, %ld invalid tooltip sources, %ld missing relations",
                (long)g_bad_containers, (long)g_bad_sources, (long)g_null_relations);

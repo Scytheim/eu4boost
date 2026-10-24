@@ -21,7 +21,7 @@ Run @("-O3", "-DNDEBUG", "-DMI_STAT=0", "-DMI_SECURE=0", "-I$MI/include", "-c", 
 foreach ($f in "hook", "buffer", "trampoline") { Run ($CFLAGS + @("-w", "-I$MH/include", "-c", "$MH/src/$f.c", "-o", "$OUT/mh_$f.o")) }
 Run ($CFLAGS + @("-w", "-c", "$MH/src/hde/hde64.c", "-o", "$OUT/mh_hde64.o"))
 $objs = @()
-foreach ($f in "main", "alloc", "profiler", "threads", "online", "speed", "parallel", "savezip", "savepar", "modifier", "country", "console", "guard", "aiprof", "uitime", "crash", "report", "memdiag", "update") {
+foreach ($f in "main", "alloc", "profiler", "threads", "online", "speed", "parallel", "savezip", "savepar", "modifier", "country", "console", "guard", "aiprof", "uitime", "crash", "report", "memdiag", "update", "savelist", "script") {
     Run ($CFLAGS + @("-I$MI/include", "-I$MH/include", "-c", "src/$f.c", "-o", "$OUT/$f.o")); $objs += "$OUT/$f.o"
 }
 # same link order as build.sh (its mh_*.o glob is alphabetical), so both scripts give the same code

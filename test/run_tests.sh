@@ -12,8 +12,8 @@ CC="clang --target=x86_64-w64-windows-gnu"
 CFLAGS="-O2 -DNDEBUG -DEB_TEST -D__USE_MINGW_ANSI_STDIO=1 -D_WIN32_WINNT=0x0A00 -Wall -Wno-unused-function -fno-strict-aliasing"
 # the EB_TEST build skips the eu4.exe signature checks, so those tables are unused there
 CFLAGS="$CFLAGS -Wno-unused-const-variable"
-for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report memdiag update; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $T/$f.o; done
-$CC -shared -static -fuse-ld=lld -o $T/eu4boost_test.dll $T/main.o $T/alloc.o $T/profiler.o $T/threads.o $T/online.o $T/speed.o $T/parallel.o $T/savezip.o $T/savepar.o $T/modifier.o $T/country.o $T/console.o $T/guard.o $T/aiprof.o $T/uitime.o $T/crash.o $T/report.o $T/memdiag.o $T/update.o build/mimalloc.o build/mh_*.o \
+for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report memdiag update savelist script; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $T/$f.o; done
+$CC -shared -static -fuse-ld=lld -o $T/eu4boost_test.dll $T/main.o $T/alloc.o $T/profiler.o $T/threads.o $T/online.o $T/speed.o $T/parallel.o $T/savezip.o $T/savepar.o $T/modifier.o $T/country.o $T/console.o $T/guard.o $T/aiprof.o $T/uitime.o $T/crash.o $T/report.o $T/memdiag.o $T/update.o $T/savelist.o $T/script.o build/mimalloc.o build/mh_*.o \
     -Wl,--exclude-all-symbols -lpsapi -lwinmm -ladvapi32 -lwinhttp -lbcrypt -luser32 -lkernel32
 $CC -shared -fuse-ld=lld -o $T/pops_api.dll test/fake_pops.c -Wl,--out-implib,$T/libpops_api.a
 $CC -O1 -fuse-ld=lld -o $T/harness.exe test/harness.c -L$T -lpops_api

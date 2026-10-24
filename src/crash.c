@@ -12,6 +12,10 @@
 //   process never reaches a filter. crash_reports\session.txt says "running" until a normal exit
 //   (DLL_PROCESS_DETACH) writes "exit"; at the next launch a session that did not end with "exit"
 //   gets a report, and the game's logs of that session are copied before the game rewrites them.
+//   The game restarts itself (back from the single player screen to the main menu, seen 2026-10-24):
+//   the new eu4.exe starts before the old one has ended. session.txt names the process (pid=), so a new
+//   session whose predecessor is the same program and still running waits up to 3 s for it and makes no
+//   report; an ending session writes "exit" only if session.txt is still its own.
 // hang: a watchdog thread counts frames (one POPS_RunCallbacks call with the first handle seen, as
 //   in uitime.c). With no frame for hang_seconds (45) the main thread's stack is written; the report
 //   is dropped if frames resume or the game exits normally, and sent if the session ends abnormally.
@@ -421,8 +425,9 @@ static void new_dir(wchar_t* out, const wchar_t* stamp, const wchar_t* kind) {  
 }
 static void set_session(const char* state) {
     char t[160]; sb_t b = { t, 0, sizeof t };
+    char pid[16]; snprintf(pid, sizeof pid, "%lu", (unsigned long)GetCurrentProcessId());
     s_put(&b, "state="); s_put(&b, state); s_put(&b, "\r\nstart="); s_w(&b, g_start);
-    s_put(&b, "\r\nversion=" EU4BOOST_VERSION "\r\n");
+    s_put(&b, "\r\nversion=" EU4BOOST_VERSION "\r\npid="); s_put(&b, pid); s_put(&b, "\r\n");
     HANDLE h = CreateFileW(g_session, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, t, (DWORD)b.n, &w, NULL); FlushFileBuffers(h); CloseHandle(h); }
 }
@@ -788,6 +793,24 @@ static void check_previous(void) {
     if (h == INVALID_HANDLE_VALUE) return;                      // first run with reports
     DWORD rd = 0; ReadFile(h, t, sizeof t - 1, &rd, NULL); CloseHandle(h);
     int clean = !strncmp(t, "state=exit", 10);
+    const char* q = strstr(t, "pid=");
+    DWORD pid = q ? (DWORD)strtoul(q + 4, NULL, 10) : 0;
+    if (!clean && pid && pid != GetCurrentProcessId()) {
+        HANDLE ph = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (ph) {
+            wchar_t a[MAX_PATH], me[MAX_PATH]; DWORD an = MAX_PATH;
+            int same = QueryFullProcessImageNameW(ph, 0, a, &an) && GetModuleFileNameW(NULL, me, MAX_PATH) && !_wcsicmp(a, me);
+            if (same && WaitForSingleObject(ph, 0) == WAIT_TIMEOUT) {
+                // the game restarted itself: its old process is still ending (and finishes its own reports)
+                DWORD w = WaitForSingleObject(ph, 3000);
+                CloseHandle(ph);
+                eb_log("report: the previous session (pid %lu) was still running - the game restarted itself%s, no abnormal-exit report",
+                       (unsigned long)pid, w == WAIT_OBJECT_0 ? " (it ended within 3 s)" : "");
+                return;
+            }
+            CloseHandle(ph);
+        }
+    }
     wchar_t prev[20] = L"";
     const char* p = strstr(t, "start=");
     if (p) for (int i = 0; i < 15 && p[6 + i] && p[6 + i] != '\r'; i++) { prev[i] = (wchar_t)p[6 + i]; prev[i + 1] = 0; }
@@ -891,7 +914,10 @@ void eb_crash_exit(void) {                                    // DLL_PROCESS_DET
                           (long long)g_samples, g_sample_t * g_ms * 1000.0 / g_samples, g_sample_max * g_ms * 1000.0, g_guard_faults);
     drop_unconfirmed(g_start);
     if (g_slow_dir[0]) finalize_slow(g_slow_dir, L"eu4boost.log", g_mods);
-    set_session("exit");
+    // a new session may have started already (the game restarting itself): its record stays
+    char t[256], mine[64]; sb_t b = { mine, 0, sizeof mine };
+    s_put(&b, "start="); s_w(&b, g_start); mine[b.n < sizeof mine ? b.n : sizeof mine - 1] = 0;
+    if (!read_small(g_session, t, sizeof t) || strstr(t, mine)) set_session("exit");
 }
 
 #ifdef EB_TEST
