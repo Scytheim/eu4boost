@@ -21,6 +21,14 @@
 //   calls for another country when a relation bit changes (and which can start the game's own
 //   parallel for), is recorded on the workers and replayed on the main thread afterwards, in country
 //   order. The player's (and observed) country is not precomputed (it raises UI messages).
+//   UI messages: every message of the game goes through the handler FUN_1408c07b0(handler, message by
+//   value, const std::function&), which adds it to the message log (FUN_141241af0: more than 100 entries
+//   -> the oldest is deleted). Other countries' refreshes raise messages too: FUN_140a675b0 recomputes a
+//   relation's truce bit (+0x45 bit 0) and, when a truce with the player ends, posts OURTRUCEENDS. Two
+//   workers posting at once deleted the same log entry (report 24, 0.4.1: crash in FUN_141241ed0). So
+//   on a worker the handler is not run: the message is moved out with the game's move constructor
+//   FUN_1401af350 (0x90 bytes), the callback copied with its own _Copy, and both are recorded with the
+//   job's UpdateOpinionCache calls; the main thread posts them in the same replay, in country order.
 //   Modes: 1 = on, 2 = on + verify (the original runs again at the country's turn and the country's
 //   bytes and relation array are compared with the precomputed ones), 3 = serial precompute on the
 //   main thread + verify (separates "the state changed in between" from thread effects), 4 = race
@@ -51,6 +59,12 @@
 #define RVA_OPCACHE 0x38b340u   // UpdateOpinionCache (country, relation key, char)
 #define RVA_KCACHE  0x2f1120u   // FUN_1402f1120 (country, char): cached values +0xe1c..+0xe34, RefreshKnowledge's first step
 #define RET_BUNDLE_RK 0x2f087bu // return address of the bundle's RefreshKnowledge call in FUN_1402ee280
+#define RVA_MSG     0x8c07b0u   // message handler (handler, message by value - the callee destroys it, const std::function*)
+#define RVA_MSGMOVE 0x1af350u   // message move constructor (dst, src): takes src's key list and text
+#define RVA_STRFREE 0x095660u   // std::string tidy (the message text at +0x60)
+#define RVA_LSTFREE 0x1af710u   // the message's key/value list (+0x10) free
+#define MSG_SIZE    0x90
+#define FN_SIZE     0x40        // MSVC std::function: storage, impl pointer at +0x38 (vtable: [0] _Copy(where), [4] _Delete_this(bool))
 #define DAILY_SIZE  11174u      // size of FUN_1402ee280 (return addresses inside it = called from the daily update)
 static const uint8_t sig_serial[16]  = { 0x40,0x53,0x55,0x56,0x57,0x48,0x83,0xec,0x68,0x0f,0x29,0x74,0x24,0x50,0x48,0x8b };
 static const uint8_t sig_daily[16]   = { 0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8d,0xac };
@@ -59,6 +73,10 @@ static const uint8_t sig_cm[16]      = { 0x48,0x89,0x5c,0x24,0x10,0x55,0x56,0x57
 static const uint8_t sig_ucb[16]     = { 0x48,0x83,0xec,0x28,0x80,0x79,0x18,0x00,0x75,0x07,0x32,0xc0,0x48,0x83,0xc4,0x28 };
 static const uint8_t sig_kcache[24]  = { 0x48,0x89,0x5c,0x24,0x08,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8b,0xec,0x48,0x83,0xec,0x60,0x0f };
 static const uint8_t sig_opcache[16] = { 0x48,0x89,0x5c,0x24,0x08,0x44,0x88,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10,0x57 };
+static const uint8_t sig_msg[16]     = { 0x48,0x89,0x5c,0x24,0x08,0x4c,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10,0x55 };
+static const uint8_t sig_msgmove[16] = { 0x45,0x33,0xc0,0x48,0x8d,0x05,0x86,0x33,0xa9,0x01,0x48,0x89,0x01,0x48,0x8b,0x42 };
+static const uint8_t sig_strfree[16] = { 0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x51,0x18,0x48,0x8b,0xd9,0x48,0x83,0xfa };
+static const uint8_t sig_lstfree[16] = { 0x48,0x89,0x5c,0x24,0x10,0x56,0x48,0x83,0xec,0x20,0x48,0x8b,0x19,0x48,0x8b,0xf1 };
 #define C_TAG       0x20
 #define C_PROVINCES 0x1344
 #define C_REL       0x1510      // relation array (begin, end), 0x48 bytes per tag
@@ -71,6 +89,7 @@ static const uint8_t sig_opcache[16] = { 0x48,0x89,0x5c,0x24,0x08,0x44,0x88,0x44
 #define GS_COUNTRIES 0x1d08
 #define GS_NCOUNTRIES 0x1d14
 #define GS_SESSION  0x1e00
+#define GS_DATE     0x1dd0      // today, in hours
 
 enum { F_SERIAL, F_DAILY, F_RK, F_CM, F_UCB, NF };
 static const char* const fname[NF] = { "country loop", "country daily", "RefreshKnowledge", "CalculateModifier", "UpdateCasusBellis" };
@@ -93,7 +112,14 @@ typedef void  (*cm_t)(void*, const char*, char);
 typedef uint8_t (*ucb_t)(void*, void*);
 typedef void  (*opc_t)(void*, uint64_t, char);
 typedef void  (*kc_t)(void*, char);
+typedef void  (*msg_t)(void*, void*, void*);
+typedef void* (*mmove_t)(void*, void*);
+typedef void* (*fcopy_t)(void*, void*);
+typedef void  (*fdel_t)(void*, char);
 static kc_t g_kcache;
+static msg_t o_msg;
+static mmove_t g_msgmove;
+static v1_t g_strfree, g_lstfree;
 static v1_t o_serial, o_daily;
 static v2_t o_rk;
 static cm_t o_cm;
@@ -116,7 +142,8 @@ static void record(int f, LONGLONG t0, void* ret) {
 // ---- parallel RefreshKnowledge -------------------------------------------------------------------
 #define MAXJOBS 4096
 #define MAXWORKERS 15
-typedef struct { void* country; uint64_t key; char flag; } opcall_t;
+// a recorded UpdateOpinionCache call, or (msg set) a message for the handler in .country
+typedef struct { void* country; uint64_t key; char flag; uint8_t* msg; uint8_t* fn; } opcall_t;
 typedef struct { uint8_t* c; opcall_t* ops; int nops, capops; uint8_t pre[C_KCACHE_N]; } job_t;
 static job_t g_jobs[MAXJOBS];
 static volatile LONG g_njobs, g_next, g_done, g_pending;   // g_pending: woken workers not yet back to waiting
@@ -124,6 +151,8 @@ static HANDLE g_wake[MAXWORKERS];
 static int g_nworkers;
 static __thread int t_job = -1;                 // job running on this thread (workers), -1 = none
 static LONG64 g_pr_loops, g_pr_jobs, g_pr_skipped, g_pr_redirty, g_pr_leftover, g_pr_deferred, g_pr_ver, g_pr_ver_bad;
+static LONG64 g_pr_msgs, g_pr_msg_oom;          // messages posted from the replay; posted on a worker (out of memory)
+static LONG64 g_pr_test;                        // test_truce_end: relations set to a truce that has just ended
 static double g_pr_us;                          // main-thread time of the parallel phase
 static LONG64 g_pr_dep;                         // left out: the group leader is refreshed in the same phase
 static uint8_t g_tagbits[65536 / 8];
@@ -131,17 +160,49 @@ static LONG64 g_fix_calls, g_fix_changed, g_kc_checked, g_kc_post_diff;
 static double g_fix_us;
 static const char g_where[] = "eu4boost parallel_refresh";
 
-static void hk_opcache(void* c, uint64_t key, char flag) {
-    int j = t_job;
-    if (j < 0) { o_opcache(c, key, flag); return; }
-    job_t* jb = &g_jobs[j];                     // worker: record, the main thread replays it later
+static opcall_t* new_op(int j) {
+    job_t* jb = &g_jobs[j];
     if (jb->nops == jb->capops) {
         int n = jb->capops ? jb->capops * 2 : 8;
         opcall_t* p = (opcall_t*)realloc(jb->ops, (size_t)n * sizeof *p);
-        if (!p) { o_opcache(c, key, flag); return; }   // out of memory: run it here (best effort)
+        if (!p) return NULL;
         jb->ops = p; jb->capops = n;
     }
-    jb->ops[jb->nops].country = c; jb->ops[jb->nops].key = key; jb->ops[jb->nops].flag = flag; jb->nops++;
+    opcall_t* o = &jb->ops[jb->nops++];
+    o->msg = NULL; o->fn = NULL;
+    return o;
+}
+
+static void hk_opcache(void* c, uint64_t key, char flag) {
+    int j = t_job;
+    if (j < 0) { o_opcache(c, key, flag); return; }
+    opcall_t* o = new_op(j);                    // worker: record, the main thread replays it later
+    if (!o) { o_opcache(c, key, flag); return; }   // out of memory: run it here (best effort)
+    o->country = c; o->key = key; o->flag = flag;
+}
+
+static void hk_msg(void* h, void* msg, void* fn) {
+    int j = t_job;
+    if (j < 0 || g_cfg.country_test_no_defer) { o_msg(h, msg, fn); return; }
+    // worker: keep the message for the main thread. The handler owns msg (by value): move it out with
+    // the game's move constructor and free what is left, as the handler does when it drops a message.
+    uint8_t* m = (uint8_t*)malloc(MSG_SIZE);
+    uint8_t* f = (uint8_t*)malloc(FN_SIZE);
+    opcall_t* o = (m && f) ? new_op(j) : NULL;
+    if (!o) { free(m); free(f); InterlockedIncrement64(&g_pr_msg_oom); o_msg(h, msg, fn); return; }
+    g_msgmove(m, msg);
+    g_strfree((uint8_t*)msg + 0x60);
+    g_lstfree((uint8_t*)msg + 0x10);
+    void* impl = *(void**)((uint8_t*)fn + 0x38);   // the caller keeps (and destroys) its std::function
+    *(void**)(f + 0x38) = impl ? ((fcopy_t)(*(void***)impl)[0])(impl, f) : NULL;
+    o->country = h; o->msg = m; o->fn = f;
+}
+
+static void post_msg(opcall_t* o) {
+    o_msg(o->country, o->msg, o->fn);           // the handler frees the message's contents
+    void* impl = *(void**)(o->fn + 0x38);
+    if (impl) ((fdel_t)(*(void***)impl)[4])(impl, impl != (void*)o->fn);
+    free(o->msg); free(o->fn);
 }
 
 static void run_jobs(int deferred) {
@@ -202,6 +263,18 @@ static void precompute(uint8_t* gs) {
     memset(g_tagbits, 0, sizeof g_tagbits);
     m = k;
     if (m < 2) return;
+    if (g_cfg.country_test_truce_end > 0) {                     // testing only: their refresh posts truce-end messages
+        int today = *(int*)(gs + GS_DATE);
+        for (LONG i = 0, n = 0; i < m && n < g_cfg.country_test_truce_end; i++) {
+            uint8_t* c = g_jobs[i].c;
+            uint8_t* rb = *(uint8_t**)(c + C_REL); uint8_t* re = *(uint8_t**)(c + C_REL + 8);
+            if (!*(int*)(c + C_PROVINCES) || shown < 0 || !rb || rb + ((size_t)shown + 1) * 0x48 > re) continue;
+            uint8_t* r = rb + (size_t)shown * 0x48;
+            r[0x45] |= 1;                                       // truce bit on, war ended 30 years ago
+            *(int*)(r + 0x34) = today - 30 * 365 * 24;
+            g_pr_test++; n++;
+        }
+    }
     int mode = g_cfg.country_parallel_refresh;
     if (mode == 4)                                              // the fixup's values on the state before the refresh
         for (LONG i = 0; i < m; i++) { g_kcache(g_jobs[i].c, 1); memcpy(g_jobs[i].pre, g_jobs[i].c + C_KCACHE, C_KCACHE_N); }
@@ -218,10 +291,11 @@ static void precompute(uint8_t* gs) {
         run_jobs(1);
         while (g_done < m) YieldProcessor();
     }
-    // replay UpdateOpinionCache calls in country order, as the serial loop would have made them
+    // replay UpdateOpinionCache calls and messages in country order, as the serial loop would have made them
     for (LONG i = 0; i < m; i++)
         for (int k = 0; k < g_jobs[i].nops; k++) {
             opcall_t* o = &g_jobs[i].ops[k];
+            if (o->msg) { post_msg(o); g_pr_msgs++; continue; }
             o_opcache(o->country, o->key, o->flag);
             g_pr_deferred++;
         }
@@ -348,6 +422,7 @@ int eb_country_install(void) {
         { RVA_CM,      sig_cm,      (void*)hk_cm,      (void**)&o_cm,      "CalculateModifier" },
         { RVA_UCB,     sig_ucb,     (void*)hk_ucb,     (void**)&o_ucb,     "UpdateCasusBellis" },
         { RVA_OPCACHE, sig_opcache, (void*)hk_opcache, (void**)&o_opcache, "UpdateOpinionCache" },
+        { RVA_MSG,     sig_msg,     (void*)hk_msg,     (void**)&o_msg,     "message handler" },
     };
     int nt_ = (int)(sizeof t / sizeof t[0]);
     if (nt->FileHeader.TimeDateStamp != 0x66FE6AB9u) { eb_log("country: unexpected eu4.exe - off"); return 0; }
@@ -356,6 +431,11 @@ int eb_country_install(void) {
     // the bundle's call: E8 rel32 to RefreshKnowledge right before the return address
     if (memcmp(b + RVA_KCACHE, sig_kcache, sizeof sig_kcache) != 0) { eb_log("country: signature mismatch at FUN_1402f1120 - off"); return 0; }
     g_kcache = (kc_t)(b + RVA_KCACHE);
+    if (memcmp(b + RVA_MSGMOVE, sig_msgmove, 16) != 0 || memcmp(b + RVA_STRFREE, sig_strfree, 16) != 0 ||
+        memcmp(b + RVA_LSTFREE, sig_lstfree, 16) != 0) { eb_log("country: signature mismatch at the message helpers - off"); return 0; }
+    g_msgmove = (mmove_t)(b + RVA_MSGMOVE);
+    g_strfree = (v1_t)(b + RVA_STRFREE);
+    g_lstfree = (v1_t)(b + RVA_LSTFREE);
     uint8_t* call = b + RET_BUNDLE_RK - 5;
     if (call[0] != 0xe8 || call + 5 + *(int32_t*)(call + 1) != b + RVA_RK) { eb_log("country: bundle call site mismatch - off"); return 0; }
     g_bundle_ret = b + RET_BUNDLE_RK;
@@ -374,7 +454,7 @@ int eb_country_install(void) {
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("country: MinHook init failed"); return 0; }
     for (int i = 0; i < nt_; i++) {
-        if (t[i].rva == RVA_OPCACHE && !g_cfg.country_parallel_refresh) continue;
+        if ((t[i].rva == RVA_OPCACHE || t[i].rva == RVA_MSG) && !g_cfg.country_parallel_refresh) continue;
         // timing-only hooks: not needed to play
         if ((t[i].rva == RVA_DAILY || t[i].rva == RVA_CM || t[i].rva == RVA_UCB) && !g_cfg.country_stats) continue;
         if (MH_CreateHook(b + t[i].rva, t[i].hook, t[i].orig) != MH_OK || MH_EnableHook(b + t[i].rva) != MH_OK) {
@@ -396,10 +476,14 @@ int eb_country_install(void) {
 void eb_country_report(void) {
     if (!o_serial) return;
     if (g_cfg.country_parallel_refresh)
-        eb_log("country: parallel refresh: %lld loops, %lld precomputed (%.1f per loop, %.0f us per loop on the main thread), %lld skipped at the bundle, %lld marked again, %lld not reached, %lld opinion-cache calls replayed, %lld left out (group leader also dirty) | verify %lld, mismatches %lld",
+        eb_log("country: parallel refresh: %lld loops, %lld precomputed (%.1f per loop, %.0f us per loop on the main thread), %lld skipped at the bundle, %lld marked again, %lld not reached, %lld opinion-cache calls replayed, %lld messages posted on the main thread (%lld on a worker: out of memory), %lld left out (group leader also dirty) | verify %lld, mismatches %lld",
                (long long)g_pr_loops, (long long)g_pr_jobs, g_pr_loops ? (double)g_pr_jobs / (double)g_pr_loops : 0.0,
                g_pr_loops ? g_pr_us / (double)g_pr_loops : 0.0, (long long)g_pr_skipped, (long long)g_pr_redirty,
-               (long long)g_pr_leftover, (long long)g_pr_deferred, (long long)g_pr_dep, (long long)g_pr_ver, (long long)g_pr_ver_bad);
+               (long long)g_pr_leftover, (long long)g_pr_deferred, (long long)g_pr_msgs, (long long)g_pr_msg_oom,
+               (long long)g_pr_dep, (long long)g_pr_ver, (long long)g_pr_ver_bad);
+    if (g_cfg.country_test_truce_end || g_cfg.country_test_no_defer)
+        eb_log("country: TEST truce_end %d no_defer %d: %lld relations set to a truce that has just ended",
+               g_cfg.country_test_truce_end, g_cfg.country_test_no_defer, (long long)g_pr_test);
     if (g_cfg.country_parallel_refresh && g_cfg.country_refresh_fixup)
         eb_log("country: fixup: %lld calls (%.1f us each), values changed %lld", (long long)g_fix_calls,
                g_fix_calls ? g_fix_us / (double)g_fix_calls : 0.0, (long long)g_fix_changed);

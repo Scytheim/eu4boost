@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.3"
+#define EU4BOOST_VERSION "0.4.4"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -75,6 +75,11 @@ typedef struct {
     int country_stats;            // 1 = diagnostics: time the country loop and its dirty-bundle functions
     int country_parallel_refresh; // EXPERIMENT: 1 = RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check
     int country_refresh_fixup;    // 1 = recompute the cached values of FUN_1402f1120 (+0xe1c..+0xe34) at the country's turn
+    int country_test_truce_end;   // testing only: N precomputed countries a day get a truce with the player that has just ended
+    int country_test_no_defer;    // testing only: 1 = workers run the message handler themselves (as 0.4.3 did)
+    int autorun_until;            // testing only ([test] autorun_until=1877.01.01): after the load speed 5 to this date, then exit (0 = off)
+    int autorun_stuck_s;          // testing only: close the game after this many seconds without a new day
+    int autorun_minimize;         // testing only: 1 = keep the game window minimized during an autorun
     // console (console.c)
     int console_hotkey;           // 1 = Ctrl+Alt+C unlocks console commands in single-player ironman until the next game start
     // crash guards (guard.c)
@@ -173,6 +178,10 @@ extern volatile int eb_in_day;         // crash.c: inside the daily tick (set by
 
 // uitime.c
 int  eb_uitime_install(void);
+int  eb_autorun_install(void);       // autorun.c: test autopilot, driven from uitime.c
+int  eb_autorun_date(const char* s);
+void eb_autorun_loaded(void);
+void eb_autorun_frame(void);
 
 // memdiag.c (called by alloc.c's hooks while eb_md_on)
 extern int eb_md_on;

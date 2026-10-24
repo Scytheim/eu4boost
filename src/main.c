@@ -99,6 +99,16 @@ static void load_config(void) {
     c->country_stats        = ini_int(ini, L"country",   L"stats", 0);
     c->country_parallel_refresh = ini_int(ini, L"country", L"parallel_refresh", 0); // experimental
     c->country_refresh_fixup = ini_int(ini, L"country", L"refresh_fixup", 1);
+    c->country_test_truce_end = ini_int(ini, L"country", L"test_truce_end", 0);   // testing only, not in the ini files
+    c->country_test_no_defer = ini_int(ini, L"country", L"test_no_defer", 0);
+    {
+        wchar_t w[32]; char a[32];                              // testing only, not in the ini files
+        GetPrivateProfileStringW(L"test", L"autorun_until", L"", w, 32, ini);
+        WideCharToMultiByte(CP_ACP, 0, w, -1, a, sizeof a, NULL, NULL);
+        c->autorun_until = a[0] ? eb_autorun_date(a) : 0;
+        c->autorun_stuck_s = ini_int(ini, L"test", L"autorun_stuck_s", 300);
+        c->autorun_minimize = ini_int(ini, L"test", L"autorun_minimize", 1);
+    }
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
@@ -205,6 +215,7 @@ static void init(void) {
     eb_guard_install();
     eb_aiprof_install();
     eb_uitime_install();
+    eb_autorun_install();
     eb_crash_install();          // last: its frame counter chains to the other POPS hooks
     eb_report_start();
     eb_update_start();

@@ -129,6 +129,7 @@ static void load_end(LONGLONG t) {
     }
     g_load_t0 = 0; g_load_done = 0; g_load_first = g_load_settle = 0;
     eb_loading = 0;
+    eb_autorun_loaded();
 }
 
 static uintptr_t hk_rcb(void* a, void* b) {
@@ -151,6 +152,7 @@ static uintptr_t hk_rcb(void* a, void* b) {
                     eb_log("ui: long frame %.1f ms", (t - g_frame_last) * g_ms);   // e.g. the loading screen's steps
             }
             g_frame_last = t;
+            eb_autorun_frame();
         }
     }
     return o_rcb(a, b);
