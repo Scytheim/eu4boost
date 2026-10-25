@@ -500,6 +500,7 @@ static DWORD WINAPI sender(LPVOID unused) {
     const wchar_t* url = g_cfg.report_url[0] ? g_cfg.report_url : EB_REPORT_URL;
     if (!url[0]) { eb_log("report: no report address in this build - reports stay in crash_reports\\pending"); return 0; }
     Sleep(12000);
+    for (int i = 0; i < 200 && !eb_wer_done; i++) Sleep(100);   // crash.c is still adding Windows' record to an exit report
     scrub_init();
     prune_old();
     send_all(url);

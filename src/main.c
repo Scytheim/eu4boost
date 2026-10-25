@@ -110,6 +110,8 @@ static void load_config(void) {
         c->autorun_until = a[0] ? eb_autorun_date(a) : 0;
         c->autorun_stuck_s = ini_int(ini, L"test", L"autorun_stuck_s", 300);
         c->autorun_minimize = ini_int(ini, L"test", L"autorun_minimize", 1);
+        c->test_warview = ini_int(ini, L"test", L"warview", 0);
+        c->autorun_fastfail = ini_int(ini, L"test", L"autorun_fastfail", 0);
     }
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);

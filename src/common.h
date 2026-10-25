@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.5"
+#define EU4BOOST_VERSION "0.4.6"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -81,6 +81,8 @@ typedef struct {
     int country_test_no_defer;    // testing only: 1 = workers run the message handler themselves (as 0.4.3 did)
     int autorun_until;            // testing only ([test] autorun_until=1877.01.01): after the load speed 5 to this date, then exit (0 = off)
     int autorun_stuck_s;          // testing only: close the game after this many seconds without a new day
+    int autorun_fastfail;         // testing only: end the autorun with 1 = __fastfail, 2 = TerminateProcess instead of closing the window
+    int test_warview;             // testing only ([test] warview=N): the war view's peace computations every N country loops (aiprof.c)
     int autorun_minimize;         // testing only: 1 = keep the game window minimized during an autorun
     // console (console.c)
     int console_hotkey;           // 1 = Ctrl+Alt+C unlocks console commands in single-player ironman until the next game start
@@ -165,6 +167,7 @@ int  eb_console_install(void);
 
 // aiprof.c
 int  eb_aiprof_install(void);
+void eb_warview_test(uint8_t* gs);
 // parallel.c: set by aiprof.c when ai_split is on
 extern int (*eb_par_help)(void);
 extern int (*eb_par_linger)(uint8_t* ctx);
@@ -199,6 +202,7 @@ void eb_crash_exit(void);
 void eb_report_start(void);
 void eb_update_start(void);            // update.c
 void eb_rm_dir(const wchar_t* dir);    // a folder with files only
+extern volatile LONG eb_wer_done;    // crash.c: 0 while an abnormal-exit report waits for Windows' crash record
 extern volatile int eb_loading;        // uitime.c: a save is being loaded or a new game set up
 void eb_slow_event(const char* what, double ms, double limit_ms, const char* detail);
 void eb_load_samples_reset(void);      // crash.c samples the main thread every 5 s during a load

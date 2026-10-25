@@ -13,6 +13,7 @@
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
+#include <intrin.h>
 #include "MinHook.h"
 
 #define RVA_GS       0x233fe78u  // gamestate pointer
@@ -65,6 +66,14 @@ static BOOL CALLBACK close_cb(HWND h, LPARAM l) {
     return TRUE;
 }
 static void close_game(const char* why) {
+    if (g_cfg.autorun_fastfail == 1) {                         // testing the abnormal-exit report: as a heap check would
+        eb_log("autorun: %s - TEST __fastfail", why);
+        __fastfail(7);
+    }
+    if (g_cfg.autorun_fastfail == 2) {                         // ... and as a program that ends itself would
+        eb_log("autorun: %s - TEST TerminateProcess", why);
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
     int n = 0; EnumWindows(close_cb, (LPARAM)&n);
     g_closed = 1;
     char a[16], b[16]; fmt_date(g_start_date, a, sizeof a); fmt_date(g_last_date, b, sizeof b);

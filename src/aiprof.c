@@ -636,11 +636,31 @@ static aecalc_t g_aecalc;
 static etsget_t g_etsget;
 static void* volatile g_ae_cache;                 // the current AI loop's shared AE map (NULL outside the loop)
 static volatile LONG g_ae_gen = 1;                // AI loop number: the per-thread tables are valid for one
-typedef struct { uint64_t key; int32_t v; uint32_t gen; } aent_t;
-typedef struct { aent_t* e; uint32_t mask, n, gen; void** slot; LONG64 hit, calc, neg, ver, bad; } atab_t;
+static int g_ae_unit;                             // 100000: the value the game's map entries are computed with
+typedef struct { uint64_t key; int32_t v; uint32_t gen; int32_t val; } aent_t;   // val: the value v was computed with
+typedef struct { aent_t* e; uint32_t mask, n, gen; void** slot; LONG64 hit, calc, neg, ver, bad; int ui; } atab_t;
 static __thread atab_t t_at;
 static volatile LONG64 g_ae_hit, g_ae_calc, g_ae_neg, g_ae_ver, g_ae_bad, g_ae_badlog, g_ae_nomem;
 static volatile LONG g_ae_maxn;
+// Outside the AI loop (the war view, the peace windows, the AI's own peace checks on the main thread) the
+// game has no map for the whole loop: FUN_14098c0e0 (fill a deal) puts an unlocked map of its own in the
+// slot for its run, FUN_1401bf150 (acceptance) runs without one and computes every AE again
+// (FUN_140385d40 with the real value). Report 29: 2.5 - 4.3 s per war view refresh in a big war. On the
+// main thread one top-level call of either is one generation of t_ut: the same AE lookups and sums in C
+// as in the AI loop; without a map the entries are computed with the real value, as the game does.
+static __thread atab_t t_ut;
+static __thread uint32_t t_ugen;
+static __thread int t_ui, t_ui_block;             // depth inside such a call; t_ui_block: the game's code (A/B test)
+static __thread uintptr_t t_ui_frame;             // the top-level hook's frame: a call from above it is not inside
+static inline int ui_in(void) {                   // (a call left without its hook returning, e.g. an exception)
+    if (!t_ui) return 0;
+    if ((uintptr_t)__builtin_frame_address(0) < t_ui_frame) return 1;
+    t_ui = 0;
+    return 0;
+}
+static volatile LONG64 g_ui_hit, g_ui_calc, g_ui_neg, g_ui_ver, g_ui_bad, g_ui_n[2], g_ui_t[2], g_ui_sums;
+static LONG64 g_ui_calc_t, g_ui_sum_t;            // testing ([test] warview): time in FUN_140385d40 and in ae_sum
+static volatile LONG g_ui_maxn;
 #define RVA_AEALL   0x38a530u     // FUN_14038a530(taker, int64* out, int* value, province, deal items, cache): AE sum over all countries
 #define RVA_AE_ZERO   0x23582d0u  // int64 the sum starts from
 #define RVA_AE_DEFS   0x233ff08u  // defines object (lazy); +0x190 -> AE defines, +0x50 int factor
@@ -672,6 +692,12 @@ static volatile LONG64 g_ae_ab_t[2], g_ae_ab_n[2], g_ae_ab_max[2];   // A/B: tim
 static volatile LONG64 g_ae_sums, g_ae_sum_ver, g_ae_sum_bad, g_ae_sum_badlog;
 
 static void ae_flush(atab_t* t) {
+    if (t->ui) {
+        g_ui_hit += t->hit; g_ui_calc += t->calc; g_ui_neg += t->neg; g_ui_ver += t->ver; g_ui_bad += t->bad;
+        if ((LONG)t->n > g_ui_maxn) g_ui_maxn = (LONG)t->n;
+        t->hit = t->calc = t->neg = t->ver = t->bad = 0;
+        return;
+    }
     if (t->hit) InterlockedAdd64(&g_ae_hit, t->hit);
     if (t->calc) InterlockedAdd64(&g_ae_calc, t->calc);
     if (t->neg) InterlockedAdd64(&g_ae_neg, t->neg);
@@ -693,7 +719,10 @@ static int ae_reset(atab_t* t, LONG gen) {
     t->n = 0; t->gen = (uint32_t)gen;
     return 1;
 }
-static inline uint32_t ae_hash(uint64_t k) { k *= 0x9E3779B97F4A7C15ull; return (uint32_t)(k >> 40) ^ (uint32_t)(k >> 13); }
+static inline uint32_t ae_hash(uint64_t k, int32_t val) {
+    k = (k ^ (uint64_t)(uint32_t)val << 20) * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(k >> 40) ^ (uint32_t)(k >> 13);
+}
 static int ae_grow(atab_t* t) {
     uint32_t cap = (t->mask + 1) * 2;
     if (cap > (1u << 22)) return 0;
@@ -702,20 +731,21 @@ static int ae_grow(atab_t* t) {
     for (uint32_t i = 0; i <= t->mask; i++) {
         aent_t* o = &t->e[i];
         if (o->gen != t->gen) continue;
-        uint32_t j = ae_hash(o->key) & (cap - 1);
+        uint32_t j = ae_hash(o->key, o->val) & (cap - 1);
         while (e[j].gen == t->gen) j = (j + 1) & (cap - 1);
         e[j] = *o;
     }
     free(t->e); t->e = e; t->mask = cap - 1;
     return 1;
 }
-// the game's cached path: FUN_140385d40 with value 100000 (args laid out as FUN_140388880's local at rbp-0x20)
-static int ae_calc(uint8_t* taker, uint8_t* prov, uint8_t flag, uint64_t obs) {
+// FUN_140385d40 as FUN_140388880 calls it (args laid out as its local at rbp-0x20): with value 100000 on
+// the map path, with the real value without a map
+static int ae_calc(uint8_t* taker, uint8_t* prov, uint8_t flag, uint64_t obs, int32_t val) {
     uint8_t args[0x20];
     memset(args, 0, sizeof args);
     *(uint8_t**)(args + 0x00) = prov;
     *(uint64_t*)(args + 0x08) = 0;                                  // p6 (tooltip text): none
-    *(int32_t*)(args + 0x10) = *(int32_t*)((uint8_t*)g_exe + RVA_AE_UNIT);
+    *(int32_t*)(args + 0x10) = val;
     memcpy(args + 0x14, &obs, 8);
     args[0x1c] = flag;
     int v = 0;
@@ -728,29 +758,60 @@ static inline int ae_scale(int value, int v) {
     int64_t q2 = ((int64_t)(int32_t)q1 * 1000) / 100000;
     return (int)q2;
 }
-// the cached AE of one province (FUN_140385d40 at value 100000) from this thread's table
-static inline int ae_value(atab_t* t, uint8_t* taker, uint8_t* prov, uint8_t flag, uint64_t obs) {
+// the AE of one province (FUN_140385d40 with value val) from this thread's table
+static inline int ae_value(atab_t* t, uint8_t* taker, uint8_t* prov, uint8_t flag, uint64_t obs, int32_t val) {
     uint64_t key = (uint64_t)*(uint16_t*)(taker + 0x24) | (uint64_t)(uint16_t)(obs >> 32) << 16 |
                    (uint64_t)(uint16_t)*(uint32_t*)(prov + 0x20) << 32 | (uint64_t)flag << 48;
-    uint32_t i = ae_hash(key) & t->mask;
+    uint32_t h = ae_hash(key, val), i = h & t->mask;
     for (;; i = (i + 1) & t->mask) {
         aent_t* e = &t->e[i];
         if (e->gen != t->gen) break;
-        if (e->key == key) { t->hit++; return e->v; }
+        if (e->key == key && e->val == val) { t->hit++; return e->v; }
     }
-    int v = ae_calc(taker, prov, flag, obs);          // not there: compute
+    LONG64 c0 = t->ui && g_cfg.test_warview ? qpc() : 0;
+    int v = ae_calc(taker, prov, flag, obs, val);     // not there: compute
+    if (c0) g_ui_calc_t += qpc() - c0;
     if (v < 0) { t->neg++; return v; }                // the game recomputes negative values every time too
     t->calc++;
     if ((t->n + 1) * 2 > t->mask + 1 && !ae_grow(t)) return v;
-    for (i = ae_hash(key) & t->mask; t->e[i].gen == t->gen; i = (i + 1) & t->mask) {}
-    t->e[i].key = key; t->e[i].v = v; t->e[i].gen = t->gen; t->n++;
+    for (i = ae_hash(key, val) & t->mask; t->e[i].gen == t->gen; i = (i + 1) & t->mask) {}
+    t->e[i].key = key; t->e[i].v = v; t->e[i].gen = t->gen; t->e[i].val = val; t->n++;
     return v;
 }
-// FUN_140388880 on the cached path: value <= 0 gives 0, else the scaled table value
-static inline int ae_prov(atab_t* t, uint8_t* taker, int value, uint8_t* prov, uint8_t flag, uint64_t obs) {
-    return value <= 0 ? 0 : ae_scale(value, ae_value(t, taker, prov, flag, obs));
+// FUN_140388880: value <= 0 gives 0; with a map the scaled value at 100000, without one (direct) the
+// value computed with the real value
+static inline int ae_prov(atab_t* t, uint8_t* taker, int value, uint8_t* prov, uint8_t flag, uint64_t obs, int direct) {
+    if (value <= 0) return 0;
+    return direct ? ae_value(t, taker, prov, flag, obs, value) : ae_scale(value, ae_value(t, taker, prov, flag, obs, g_ae_unit));
+}
+static __thread int t_wv;                         // inside the war view test (testing only)
+static volatile LONG64 g_wv_aep, g_wv_aep_cache, g_wv_aep_slot, g_wv_aep_none;
+static int* ui_aep(uint8_t* taker, int* out, int* value, uint8_t* prov, uint8_t flag, uint64_t p6, uint64_t obs, void* cache) {
+    if (p6 || t_ae_orig) return o_aep(taker, out, value, prov, flag, p6, obs, cache);
+    atab_t* t = &t_ut;
+    int r = ae_prov(t, taker, *value, prov, flag, obs, !cache && !*t->slot);
+    if (g_aec == 2 && *value > 0) {
+        int g = 0;
+        o_aep(taker, &g, value, prov, flag, p6, obs, cache);
+        t->ver++;
+        if (g != r) {
+            t->bad++;
+            if (InterlockedIncrement64(&g_ae_badlog) <= 20)
+                eb_log("ai ae: VERIFY MISMATCH outside the AI loop (%s) taker %.3s province %d observer %d flag %d value %d: game %d, table %d",
+                       !cache && !*t->slot ? "no map" : "map", (char*)(taker + 0x20), (int)(uint16_t)*(uint32_t*)(prov + 0x20),
+                       (int)(int16_t)(obs >> 32), flag, *value, g, r);
+        }
+    }
+    *out = r;
+    return out;
 }
 static int* hk_aep(uint8_t* taker, int* out, int* value, uint8_t* prov, uint8_t flag, uint64_t p6, uint64_t obs, void* cache) {
+    if (t_wv) {                                       // which path the game takes outside the AI loop
+        g_wv_aep++;
+        if (cache) g_wv_aep_cache++;
+        else { uint8_t found; void** s = g_etsget((uint8_t*)g_exe + RVA_AE_ETS, &found); if (s && *s) g_wv_aep_slot++; else g_wv_aep_none++; }
+    }
+    if (ui_in()) return ui_aep(taker, out, value, prov, flag, p6, obs, cache);
     void* shared = g_ae_cache;
     if (p6 || !shared || t_ae_orig) return o_aep(taker, out, value, prov, flag, p6, obs, cache);
     atab_t* t = &t_at;
@@ -759,7 +820,7 @@ static int* hk_aep(uint8_t* taker, int* out, int* value, uint8_t* prov, uint8_t 
     if (!cache) cache = *t->slot;
     if (cache != shared) return o_aep(taker, out, value, prov, flag, p6, obs, cache);
     if (*value <= 0) { *out = 0; return out; }
-    int v = ae_value(t, taker, prov, flag, obs);
+    int v = ae_value(t, taker, prov, flag, obs, g_ae_unit);
     int r = ae_scale(*value, v);
     if (g_aec == 2) {
         int g = 0;
@@ -775,15 +836,68 @@ static int* hk_aep(uint8_t* taker, int* out, int* value, uint8_t* prov, uint8_t 
     *out = r;
     return out;
 }
-// FUN_14038a530 + FUN_140388b40 in C on this thread's table (see the header); 0 = not applicable
-static int ae_sum(uint8_t* taker, int64_t* out, int value, uint8_t* prov, void** deal) {
+// The deal's part of a sum: FUN_14099fc60 sums the AE of a candidate item over its own entries followed by
+// the entries of the items already in the deal (FUN_140979340), each again for every country; FUN_14098b670
+// does that for every candidate with the same deal. The common last entries (found by comparing with the
+// previous call's) are summed once per country (32-bit adds as the game's) while they, the taker and the
+// table generation stay the same.
+typedef struct {
+    atab_t* t; uint32_t gen, id; uint8_t* taker; int direct, ncap;
+    size_t pnb, pcap, snb, scap; uint8_t* prev; uint8_t* suf; int32_t* d; uint32_t* stamp;
+} dmemo_t;
+static __thread dmemo_t t_dm;
+static volatile LONG64 g_dm_new, g_dm_reuse;
+static int dm_room(uint8_t** p, size_t* cap, size_t n) {
+    if (n <= *cap) return 1;
+    uint8_t* q = (uint8_t*)realloc(*p, n * 2);
+    if (!q) return 0;
+    *p = q; *cap = n * 2;
+    return 1;
+}
+// the number of bytes at the end of e0..e0+nb that are the kept common part (0: none)
+static size_t dm_begin(dmemo_t* m, atab_t* t, uint8_t* taker, int direct, const uint8_t* e0, size_t nb, int ncl) {
+    if (ncl > m->ncap) {
+        int n = ncl + 256;
+        int32_t* d = (int32_t*)malloc((size_t)n * sizeof *d);
+        uint32_t* s = (uint32_t*)calloc((size_t)n, sizeof *s);
+        if (!d || !s) { free(d); free(s); m->t = NULL; return 0; }
+        free(m->d); free(m->stamp); m->d = d; m->stamp = s; m->ncap = n; m->id = 0; m->snb = 0; m->t = NULL;
+    }
+    int same = m->t == t && m->gen == t->gen && m->taker == taker && m->direct == direct;
+    size_t keep = 0;
+    if (same && m->snb && nb >= m->snb && !memcmp(e0 + nb - m->snb, m->suf, m->snb)) { keep = m->snb; InterlockedIncrement64(&g_dm_reuse); }
+    else {
+        size_t c = 0;
+        if (same) while (c + 0x30 <= nb && c + 0x30 <= m->pnb && !memcmp(e0 + nb - c - 0x30, m->prev + m->pnb - c - 0x30, 0x30)) c += 0x30;
+        m->snb = 0;
+        if (c && dm_room(&m->suf, &m->scap, c)) {
+            memcpy(m->suf, e0 + nb - c, c); m->snb = keep = c;
+            if (++m->id == 0) { memset(m->stamp, 0, (size_t)m->ncap * sizeof *m->stamp); m->id = 1; }
+            InterlockedIncrement64(&g_dm_new);
+        }
+    }
+    if (!dm_room(&m->prev, &m->pcap, nb)) { m->t = NULL; return 0; }
+    memcpy(m->prev, e0, nb); m->pnb = nb;
+    m->t = t; m->gen = t->gen; m->taker = taker; m->direct = direct;
+    return keep;
+}
+// the AE of deal entries a..b for one observer (FUN_140388b40's loop)
+static inline uint32_t ae_items(atab_t* t, uint8_t* taker, uint8_t** byidx, uint8_t* a, uint8_t* b, uint64_t otag, int direct) {
+    uint32_t s = 0;
+    for (uint8_t* e = a; e != b; e += 0x30) {
+        uint8_t* pv;
+        if (e[0x1f]) pv = *(uint8_t**)(byidx[(int16_t)(*(uint64_t*)(e + 0x18) >> 32)] + 0x14b0);
+        else if (!e[0x27] && *(uint8_t**)(e + 8)) pv = *(uint8_t**)(e + 8);
+        else continue;
+        s += (uint32_t)ae_prov(t, taker, *(int*)(e + 0x28), pv, e[0x2c], otag, direct);
+    }
+    return s;
+}
+// FUN_14038a530 + FUN_140388b40 in C on table t (see the header); direct: no map (the real values); 0 = not applicable
+static int ae_sum(atab_t* t, int direct, uint8_t* taker, int64_t* out, int value, uint8_t* prov, void** deal) {
     uint8_t* b = (uint8_t*)g_exe;
     uint8_t* dobj = *(uint8_t* volatile*)(b + RVA_AE_DEFS);
     if (!dobj) return 0;                              // not created yet: the game's code creates it
-    atab_t* t = &t_at;
-    LONG gen = g_ae_gen;
-    if (t->gen != (uint32_t)gen && !ae_reset(t, gen)) return 0;
-    if (*t->slot != g_ae_cache) return 0;
     uint8_t* defs = *(uint8_t**)(dobj + 0x190);
     uint8_t* gs = *(uint8_t**)(b + RVA_GAMESTATE);
     uint8_t** cl = *(uint8_t***)(gs + 0x1d08);
@@ -793,6 +907,9 @@ static int ae_sum(uint8_t* taker, int64_t* out, int value, uint8_t* prov, void**
     int tidx = (int16_t)(ttag >> 32);
     uint8_t* e0 = deal ? (uint8_t*)deal[0] : NULL;
     uint8_t* e1 = deal ? (uint8_t*)deal[1] : NULL;
+    dmemo_t* dm = &t_dm;
+    size_t keep = e1 - e0 >= 2 * 0x30 ? dm_begin(dm, t, taker, direct, e0, (size_t)(e1 - e0), ncl) : 0;
+    uint8_t* em = e1 - keep;                          // e0..em summed here, em..e1 the kept common part
     int64_t sum = *(int64_t*)(b + RVA_AE_ZERO);
     for (int ci = 0; ci < ncl; ci++) {
         uint8_t* c = cl[ci];
@@ -812,14 +929,14 @@ static int ae_sum(uint8_t* taker, int64_t* out, int value, uint8_t* prov, void**
         if (p != pe) continue;
         uint8_t half = rel[0x45] & 1;
         // FUN_140388b40(out, taker, &value, deal != 0, province, observer tag, deal, 0)
-        int ae = ae_prov(t, taker, value, prov, (uint8_t)(value > 0), otag);
-        for (uint8_t* e = e0; e != e1; e += 0x30) {
-            uint8_t* pv;
-            if (e[0x1f]) pv = *(uint8_t**)(byidx[(int16_t)(*(uint64_t*)(e + 0x18) >> 32)] + 0x14b0);
-            else if (!e[0x27] && *(uint8_t**)(e + 8)) pv = *(uint8_t**)(e + 8);
-            else continue;
-            ae = (int)((uint32_t)ae + (uint32_t)ae_prov(t, taker, *(int*)(e + 0x28), pv, e[0x2c], otag));   // 32-bit add as the game's
+        int ae = ae_prov(t, taker, value, prov, (uint8_t)(value > 0), otag, direct);
+        uint32_t part = 0;                            // the deal entries' AE for this country (32-bit adds as the game's)
+        if (keep) {
+            if (dm->stamp[ci] == dm->id) part = (uint32_t)dm->d[ci];
+            else { part = ae_items(t, taker, byidx, em, e1, otag, direct); dm->d[ci] = (int32_t)part; dm->stamp[ci] = dm->id; }
         }
+        part += ae_items(t, taker, byidx, e0, em, otag, direct);
+        ae = (int)((uint32_t)ae + part);
         int64_t q = ((int64_t)(int32_t)((uint32_t)*(int*)(defs + 0x50) * 1000u) * (int64_t)ae) / 1000;
         int iq = (int)q;
         if (iq >= 0) continue;
@@ -839,15 +956,26 @@ static int ae_sum(uint8_t* taker, int64_t* out, int value, uint8_t* prov, void**
         sum = (int64_t)((uint64_t)sum + (uint64_t)((int64_t)((uint64_t)m * (uint64_t)st) >> 15));
     }
     *out = sum;
-    InterlockedIncrement64(&g_ae_sums);
+    if (t->ui) g_ui_sums++; else InterlockedIncrement64(&g_ae_sums);
     return 1;
 }
 static int64_t* hk_aeall(uint8_t* taker, int64_t* out, int* value, uint8_t* prov, void** deal, uint64_t cache) {
-    if (!g_ae_cache || t_ae_in || cache) return o_aeall(taker, out, value, prov, deal, cache);
+    if (t_ae_in || cache) return o_aeall(taker, out, value, prov, deal, cache);
+    atab_t* t;
+    if (ui_in()) t = &t_ut;
+    else {
+        if (!g_ae_cache) return o_aeall(taker, out, value, prov, deal, cache);
+        t = &t_at;
+        LONG gen = g_ae_gen;
+        if ((t->gen != (uint32_t)gen && !ae_reset(t, gen)) || *t->slot != g_ae_cache) return o_aeall(taker, out, value, prov, deal, cache);
+    }
     int side = g_aec == 3 ? (int)(++t_ae_flip & 1) : 1;   // A/B: 0 the game's code and map, 1 ae_sum
     LONG64 a0 = g_aec == 3 ? qpc() : 0;
     int64_t* r = out;
-    if (!side || !ae_sum(taker, out, *value, prov, deal)) {
+    LONG64 s0 = t->ui && g_cfg.test_warview ? qpc() : 0;
+    int done = side && ae_sum(t, t->ui && !*t->slot, taker, out, *value, prov, deal);
+    if (s0) g_ui_sum_t += qpc() - s0;
+    if (!done) {
         t_ae_in = 1; t_ae_orig = !side;
         r = o_aeall(taker, out, value, prov, deal, cache);
         t_ae_in = 0; t_ae_orig = 0;
@@ -860,7 +988,8 @@ static int64_t* hk_aeall(uint8_t* taker, int64_t* out, int* value, uint8_t* prov
         if (g != *out) {
             InterlockedIncrement64(&g_ae_sum_bad);
             if (InterlockedIncrement64(&g_ae_sum_badlog) <= 20)
-                eb_log("ai ae: SUM MISMATCH taker %.3s value %d: game %lld, ae_sum %lld", (char*)(taker + 0x20), *value, (long long)g, (long long)*out);
+                eb_log("ai ae: SUM MISMATCH%s taker %.3s value %d: game %lld, ae_sum %lld", t->ui ? " outside the AI loop" : "",
+                       (char*)(taker + 0x20), *value, (long long)g, (long long)*out);
         }
     }
     if (g_aec == 3) {
@@ -869,6 +998,197 @@ static int64_t* hk_aeall(uint8_t* taker, int64_t* out, int* value, uint8_t* prov
         for (LONG64 m = g_ae_ab_max[side]; d > m && InterlockedCompareExchange64(&g_ae_ab_max[side], d, m) != m; m = g_ae_ab_max[side]) {}
     }
     return r;
+}
+
+// ---- calls outside the AI loop (report 29, see t_ut above) ----
+// The war view FUN_141306dd0, whenever it is refreshed, builds the deal the enemy would demand for our
+// surrender: offer FUN_140975d40(buf, enemy, us, 0), acceptance FUN_1401bf150, FUN_14098c0e0 fills it up
+// to the war score budget (every candidate province's AE: FUN_14099fc60 -> FUN_14038a530 ->
+// FUN_140388880), acceptance again, FUN_1409761c0 frees it. The peace windows call the same two.
+#define RVA_OFFER_NEW  0x975d40u
+#define RVA_OFFER_FILL 0x98c0e0u
+#define RVA_ACCEPT     0x1bf150u
+#define RVA_OFFER_FREE 0x9761c0u
+static const uint8_t sig_offer_new[16]  = { 0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x48 };
+static const uint8_t sig_offer_fill[16] = { 0x48,0x89,0x5c,0x24,0x08,0x44,0x88,0x4c,0x24,0x20,0x4c,0x89,0x44,0x24,0x18,0x89 };
+static const uint8_t sig_accept[16]     = { 0x48,0x89,0x5c,0x24,0x08,0x4c,0x89,0x4c,0x24,0x20,0x44,0x88,0x44,0x24,0x18,0x48 };
+static const uint8_t sig_offer_free[16] = { 0x48,0x89,0x5c,0x24,0x08,0x57,0x48,0x83,0xec,0x20,0x48,0x8d,0x05,0xe7,0x16,0x2e };
+typedef uint64_t (*offer_fill_t)(void* offer, uint64_t budget, void* list, uint64_t p4);
+typedef int (*accept_t)(uint8_t* c, void* reasons, uint64_t p3, uint64_t tag, void* offer, uint64_t p6, uint64_t p7, uint64_t p8, uint64_t p9, uint64_t p10);
+static offer_fill_t o_fill;
+static accept_t o_accept;
+static int g_ui_on;
+// a top-level call on the main thread outside the AI loop starts a new generation of t_ut
+static int ui_enter(uintptr_t frame) {
+    if (t_ui && frame < t_ui_frame) { t_ui++; return 1; }
+    t_ui = 0;
+    if (t_ui_block || g_ai_loop_active || g_ae_cache || GetCurrentThreadId() != g_main_tid ||
+        *(volatile uint8_t*)((uint8_t*)g_exe + RVA_FIXED_SEED_FLAG)) return 0;
+    t_ut.ui = 1;
+    if (++t_ugen == 0) t_ugen = 1;
+    if (!ae_reset(&t_ut, (LONG)t_ugen)) return 0;
+    t_ui = 1; t_ui_frame = frame;
+    return 1;
+}
+static void ui_leave(int k, LONG64 t0) {
+    if (t_ui > 0 && --t_ui) return;
+    t_ui = 0;
+    g_ui_n[k]++; g_ui_t[k] += qpc() - t0;
+}
+// Half of a deal fill is FUN_14036eb10(country, war, province): a search over the land from the province
+// (a visited set per call) that the cede-province items' value and checks ask for every candidate in
+// every round. It reads only the country, the war's sides, the province and the map, none of which change
+// during one top-level call, so inside t_ut's generation the answer is kept.
+#define RVA_LANDPATH 0x36eb10u
+static const uint8_t sig_landpath[16] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7c,0x24,0x20,0x55 };
+typedef uint64_t (*landpath_t)(uint8_t* c, uint8_t* w, uint8_t* p);
+static landpath_t o_landpath;
+typedef struct { uint8_t *c, *w, *p; uint32_t gen; uint8_t r; } lpent_t;
+static __thread lpent_t* t_lp;
+static __thread uint32_t t_lp_mask, t_lp_n, t_lp_gen;
+static LONG64 g_lp_calls, g_lp_hit, g_lp_ver, g_lp_bad;
+static inline uint32_t lp_hash(uint8_t* c, uint8_t* w, uint8_t* p) {
+    uint64_t h = (uintptr_t)c * 0x9E3779B97F4A7C15ull ^ (uintptr_t)w * 0xC2B2AE3D27D4EB4Full ^ (uintptr_t)p * 0x165667B19E3779F9ull;
+    return (uint32_t)(h >> 32) ^ (uint32_t)h;
+}
+static int lp_grow(void) {
+    uint32_t cap = t_lp ? (t_lp_mask + 1) * 2 : 1u << 12;
+    if (cap > (1u << 20)) return 0;
+    lpent_t* e = (lpent_t*)calloc(cap, sizeof *e);
+    if (!e) return 0;
+    if (t_lp)
+        for (uint32_t i = 0; i <= t_lp_mask; i++) {
+            lpent_t* o = &t_lp[i];
+            if (o->gen != t_lp_gen) continue;
+            uint32_t j = lp_hash(o->c, o->w, o->p) & (cap - 1);
+            while (e[j].gen == t_lp_gen) j = (j + 1) & (cap - 1);
+            e[j] = *o;
+        }
+    free(t_lp); t_lp = e; t_lp_mask = cap - 1;
+    return 1;
+}
+static uint64_t hk_landpath(uint8_t* c, uint8_t* w, uint8_t* p) {
+    if (!ui_in()) return o_landpath(c, w, p);
+    g_lp_calls++;
+    if (t_lp_gen != t_ugen) { t_lp_gen = t_ugen; t_lp_n = 0; }
+    if (!t_lp && !lp_grow()) return o_landpath(c, w, p);
+    uint32_t i = lp_hash(c, w, p) & t_lp_mask;
+    for (; t_lp[i].gen == t_lp_gen; i = (i + 1) & t_lp_mask) {
+        lpent_t* e = &t_lp[i];
+        if (e->c != c || e->w != w || e->p != p) continue;
+        g_lp_hit++;
+        if (g_aec == 2) {
+            uint8_t g = (uint8_t)o_landpath(c, w, p);
+            g_lp_ver++;
+            if (g != e->r) {
+                g_lp_bad++;
+                if (InterlockedIncrement64(&g_ae_badlog) <= 20)
+                    eb_log("ai ae: VERIFY MISMATCH land search %.3s province %d: kept %d, the game says %d",
+                           (char*)(c + 0x20), (int)(uint16_t)*(uint32_t*)(p + 0x20), e->r, g);
+            }
+        }
+        return e->r;
+    }
+    uint8_t r = (uint8_t)o_landpath(c, w, p);
+    if ((t_lp_n + 1) * 2 > t_lp_mask + 1) {
+        if (!lp_grow()) return r;
+        for (i = lp_hash(c, w, p) & t_lp_mask; t_lp[i].gen == t_lp_gen; i = (i + 1) & t_lp_mask) {}
+    }
+    t_lp[i].c = c; t_lp[i].w = w; t_lp[i].p = p; t_lp[i].gen = t_lp_gen; t_lp[i].r = r; t_lp_n++;
+    return r;
+}
+static uint64_t hk_fill(void* offer, uint64_t budget, void* list, uint64_t p4) {
+    if (!ui_enter((uintptr_t)__builtin_frame_address(0))) return o_fill(offer, budget, list, p4);
+    LONG64 t0 = qpc();
+    uint64_t r = o_fill(offer, budget, list, p4);
+    ui_leave(0, t0);
+    return r;
+}
+static int hk_accept(uint8_t* c, void* reasons, uint64_t p3, uint64_t tag, void* offer, uint64_t p6, uint64_t p7, uint64_t p8, uint64_t p9, uint64_t p10) {
+    if (!ui_enter((uintptr_t)__builtin_frame_address(0))) return o_accept(c, reasons, p3, tag, offer, p6, p7, p8, p9, p10);
+    LONG64 t0 = qpc();
+    int r = o_accept(c, reasons, p3, tag, offer, p6, p7, p8, p9, p10);
+    ui_leave(1, t0);
+    return r;
+}
+
+// testing only ([test] warview=N): every N country loops the war view's calls for both leaders of every
+// active war (gamestate+0x1e28: data +8, count +0x14), with the war view's budget (1 - acceptance) and
+// with the largest (100), each once with the game's code (t_ui_block) and once through t_ut, in
+// alternating order. Acceptance before and after and the filled list must come out the same.
+typedef void (*offer_new_t)(void* buf, uint64_t a, uint64_t b, uint64_t flag);
+typedef void* (*offer_free_t)(void* offer);
+typedef struct { int a, a2; size_t nl; double ms, fill, calc_ms, sum_ms; LONG64 calls, slot, none, calcs; } wvres_t;
+static LONG64 g_wv_views, g_wv_diff, g_wv_logs; static double g_wv_ms[2], g_wv_max[2];
+static void wv_run(uint8_t* b, uint64_t me, uint64_t foe, uint8_t* cf, int force, int block, wvres_t* r) {
+    static uint8_t buf[1024] __attribute__((aligned(16)));
+    struct { uint8_t* b; uint8_t* e; uint8_t* c; } list = { 0, 0, 0 };
+    LONG64 n0 = g_wv_aep, s0 = g_wv_aep_slot, z0 = g_wv_aep_none;
+    LONG64 k0 = t_ut.calc + t_ut.neg + g_ui_calc + g_ui_neg, ct0 = g_ui_calc_t, st0 = g_ui_sum_t;
+    LONG64 t0 = qpc();
+    t_wv = 1; t_ui_block = block;
+    memset(buf, 0, sizeof buf);
+    ((offer_new_t)(b + RVA_OFFER_NEW))(buf, foe, me, 0);
+    r->a = ((accept_t)(b + RVA_ACCEPT))(cf, NULL, 0, me, buf, 0x2d2d2d, 0, 0, 0, 0);
+    int budget = 1 - r->a; if (budget > 100) budget = 100; if (budget < 0) budget = 0;
+    if (force) budget = 100;
+    LONG64 t1 = qpc();
+    ((offer_fill_t)(b + RVA_OFFER_FILL))(buf, (uint64_t)budget, &list, 0);
+    LONG64 t2 = qpc();
+    r->a2 = ((accept_t)(b + RVA_ACCEPT))(cf, NULL, 0, me, buf, 0x2d2d2d, 0, 0, 0, 0);
+    ((offer_free_t)(b + RVA_OFFER_FREE))(buf);
+    t_wv = 0; t_ui_block = 0;
+    r->ms = (qpc() - t0) * g_ms; r->fill = (t2 - t1) * g_ms; r->nl = (size_t)(list.e - list.b);
+    r->calls = g_wv_aep - n0; r->slot = g_wv_aep_slot - s0; r->none = g_wv_aep_none - z0;
+    r->calcs = t_ut.calc + t_ut.neg + g_ui_calc + g_ui_neg - k0; r->calc_ms = (g_ui_calc_t - ct0) * g_ms; r->sum_ms = (g_ui_sum_t - st0) * g_ms;
+}
+void eb_warview_test(uint8_t* gs) {
+    static int loops;
+    int every = g_cfg.test_warview < 0 ? -g_cfg.test_warview : g_cfg.test_warview;   // < 0: only through t_ut (profiling)
+    if (!every || ++loops % every || !g_ui_on) return;
+    uint8_t* b = (uint8_t*)g_exe;
+    if (memcmp(b + RVA_OFFER_NEW, sig_offer_new, 16) || memcmp(b + RVA_OFFER_FREE, sig_offer_free, 16)) return;
+    uint8_t** wars = *(uint8_t***)(gs + 0x1e30);
+    int nw = *(int*)(gs + 0x1e3c), nv = 0;
+    uint8_t** byidx = *(uint8_t***)(*(uint8_t**)(b + RVA_COUNTRIES) + 0x118);
+    double tot[2] = { 0, 0 };
+    for (int i = 0; i < nw; i++) {
+        uint8_t* w = wars[i];
+        uint8_t **a0 = *(uint8_t***)(w + 0x48), **a1 = *(uint8_t***)(w + 0x50), **d0 = *(uint8_t***)(w + 0x78), **d1 = *(uint8_t***)(w + 0x80);
+        if (a1 <= a0 || d1 <= d0) continue;
+        uint64_t att = *(uint64_t*)a0, def = *(uint64_t*)d0;
+        uint8_t* ca = byidx[(int16_t)(att >> 32)]; uint8_t* cd = byidx[(int16_t)(def >> 32)];
+        if (!ca || !cd) continue;
+        for (int k = 0; k < 4; k++) {
+            uint64_t me = k & 1 ? def : att, foe = k & 1 ? att : def;
+            uint8_t* cm = k & 1 ? cd : ca; uint8_t* cf = k & 1 ? ca : cd;
+            wvres_t r[2];
+            int first = (int)(g_wv_views & 1);
+            for (int s = 0; s < 2; s++) {
+                int side = s ^ first;
+                if (!side && g_cfg.test_warview < 0) { r[0] = (wvres_t){ 0 }; continue; }
+                wv_run(b, me, foe, cf, k >= 2, !side, &r[side]);
+            }
+            g_wv_views++; nv++;
+            int same = g_cfg.test_warview < 0 || (r[0].a == r[1].a && r[0].a2 == r[1].a2 && r[0].nl == r[1].nl);
+            if (!same) g_wv_diff++;
+            for (int s = 0; s < 2; s++) { g_wv_ms[s] += r[s].ms; tot[s] += r[s].ms; if (r[s].ms > g_wv_max[s]) g_wv_max[s] = r[s].ms; }
+            if (!same || g_wv_logs < 24 || (r[0].ms >= 5.0 && g_wv_logs < 300)) {
+                g_wv_logs++;
+                eb_log("ai ae: TEST war view %d/%d (%d+%d) %.3s (%d provinces) vs %.3s, budget %s | game %.1f ms (fill %.1f), acceptance %d -> %d, list %zu, AE calls %lld (map %lld, none %lld) | t_ut %.1f ms (fill %.1f, AE sums %.1f, AE computed %lld in %.1f ms), acceptance %d -> %d, list %zu%s",
+                       i + 1, nw, (int)(a1 - a0), (int)(d1 - d0), (char*)(cm + 0x20), *(int*)(cm + 0x1344), (char*)(cf + 0x20),
+                       k >= 2 ? "100 (forced)" : "of the war view", r[0].ms, r[0].fill, r[0].a, r[0].a2, r[0].nl, (long long)r[0].calls,
+                       (long long)r[0].slot, (long long)r[0].none, r[1].ms, r[1].fill, r[1].sum_ms, (long long)r[1].calcs, r[1].calc_ms, r[1].a, r[1].a2, r[1].nl, same ? "" : " - DIFFERENT");
+            }
+        }
+    }
+    ae_flush(&t_ut);
+    if (nv)
+        eb_log("ai ae: TEST war view: %d views now: game %.1f ms, t_ut %.1f ms | all %lld views: game %.1f ms (max %.1f), t_ut %.1f ms (max %.1f), different %lld | deal parts computed %lld, reused %lld | t_ut sums %lld, lookups %lld (%lld hits, %lld computed, %lld negative), land searches %lld (kept %lld) | verify: sums %lld, mismatches %lld; lookups %lld, mismatches %lld; land searches %lld, mismatches %lld",
+               nv, tot[0], tot[1], (long long)g_wv_views, g_wv_ms[0], g_wv_max[0], g_wv_ms[1], g_wv_max[1], (long long)g_wv_diff,
+               (long long)g_dm_new, (long long)g_dm_reuse, (long long)g_ui_sums, (long long)(g_ui_hit + g_ui_calc + g_ui_neg), (long long)g_ui_hit,
+               (long long)g_ui_calc, (long long)g_ui_neg, (long long)g_lp_calls, (long long)g_lp_hit, (long long)g_ae_sum_ver, (long long)g_ae_sum_bad,
+               (long long)g_ui_ver, (long long)g_ui_bad, (long long)g_lp_ver, (long long)g_lp_bad);
 }
 
 // ---- army move check experiment ----
@@ -1154,6 +1474,15 @@ static void hk_loop(uint8_t* items, void* ctx) {
                (long long)(g_ae_hit + g_ae_calc + g_ae_neg), (long long)g_ae_hit, (long long)g_ae_calc, (long long)g_ae_neg, (long)g_ae_maxn,
                (long long)g_ae_sum_ver, (long long)g_ae_sum_bad, (long long)g_ae_ver, (long long)g_ae_bad,
                g_ae_nomem ? " - OUT OF MEMORY, fell back to the game's map" : "");
+        if (g_ui_on) {
+            ae_flush(&t_ut);
+            eb_log("ai ae: outside the AI loop (main thread): %lld deal fills %.1f ms, %lld acceptance checks %.1f ms; %lld AE sums in C; "
+                   "%lld lookups (%lld hits, %lld computed, %lld negative), largest table %ld; land searches %lld (kept %lld) | verify: lookups %lld, mismatches %lld; land searches %lld, mismatches %lld | deal parts computed %lld, reused %lld",
+                   (long long)g_ui_n[0], g_ui_t[0] * g_ms, (long long)g_ui_n[1], g_ui_t[1] * g_ms, (long long)g_ui_sums,
+                   (long long)(g_ui_hit + g_ui_calc + g_ui_neg), (long long)g_ui_hit, (long long)g_ui_calc, (long long)g_ui_neg, (long)g_ui_maxn,
+                   (long long)g_lp_calls, (long long)g_lp_hit, (long long)g_ui_ver, (long long)g_ui_bad, (long long)g_lp_ver, (long long)g_lp_bad,
+                   (long long)g_dm_new, (long long)g_dm_reuse);
+        }
         if (g_aec == 3)
             for (int s = 0; s < 2; s++)
                 eb_log("ai ae A/B %s: %lld AE sums, avg %.2f us, total %.1f ms, max %.3f ms",
@@ -1216,16 +1545,27 @@ int eb_aiprof_install(void) {
         } else {
             g_aecalc = (aecalc_t)(b + RVA_AECALC);
             g_etsget = (etsget_t)(b + RVA_ETS_GET);
+            g_ae_unit = *(int32_t*)(b + RVA_AE_UNIT);
             g_opin_ae = (opin_ae_t)(b + RVA_OPIN_AE);
             g_opin = (opin_t)(b + RVA_OPIN);
             g_allied = (allied_t)(b + RVA_ALLIED);
             g_strength = (strength_t)(b + RVA_STRENGTH);
+            // outside the AI loop: deal fills and acceptance checks on the main thread (report 29)
+            g_ui_on = !memcmp(b + RVA_OFFER_FILL, sig_offer_fill, 16) && !memcmp(b + RVA_ACCEPT, sig_accept, 16) &&
+                      MH_CreateHook(b + RVA_OFFER_FILL, (void*)hk_fill, (void**)&o_fill) == MH_OK &&
+                      MH_CreateHook(b + RVA_ACCEPT, (void*)hk_accept, (void**)&o_accept) == MH_OK &&
+                      MH_EnableHook(b + RVA_OFFER_FILL) == MH_OK && MH_EnableHook(b + RVA_ACCEPT) == MH_OK;
+            if (g_ui_on && (memcmp(b + RVA_LANDPATH, sig_landpath, 16) ||
+                            MH_CreateHook(b + RVA_LANDPATH, (void*)hk_landpath, (void**)&o_landpath) != MH_OK ||
+                            MH_EnableHook(b + RVA_LANDPATH) != MH_OK))
+                eb_log("ai ae: land search signature mismatch or hook failed - not kept");
+            if (!g_ui_on) eb_log("ai ae: deal fill / acceptance signature mismatch or hook failed - only the AI loop uses the tables");
         }
     }
     if (g_stats) {
         int ok = 1;
         for (int k = 0; k < NFM && ok; k++) {
-            if (g_aec && (g_fmf[k].rva == RVA_AEP || g_fmf[k].rva == RVA_AEALL)) continue;   // hooked by the experiment
+            if (g_aec && (g_fmf[k].rva == RVA_AEP || g_fmf[k].rva == RVA_AEALL || (g_ui_on && g_fmf[k].rva == RVA_OFFER_FILL))) continue;   // hooked by the experiment
             ok = !memcmp(b + g_fmf[k].rva, g_fmf[k].sig, 8) && MH_CreateHook(b + g_fmf[k].rva, g_fm_hk[k], (void**)&o_fm[k]) == MH_OK &&
                  MH_EnableHook(b + g_fmf[k].rva) == MH_OK;
         }
@@ -1260,8 +1600,9 @@ int eb_aiprof_install(void) {
         eb_log("ai split: EXPERIMENT on - the army AI of countries with %d+ armies runs beside their other AI tasks", g_cfg.ai_split_min);
     }
     if (g_aec)
-        eb_log("ai ae: EXPERIMENT on%s - AE sums in C and the AI loop's AE cache lookups in per-thread tables",
-               g_aec == 2 ? " with VERIFY" : g_aec == 3 ? " as A/B (AE sums alternate between the game's code and ae_sum)" : "");
+        eb_log("ai ae: EXPERIMENT on%s - AE sums in C and the AI loop's AE cache lookups in per-thread tables%s",
+               g_aec == 2 ? " with VERIFY" : g_aec == 3 ? " as A/B (AE sums alternate between the game's code and ae_sum)" : "",
+               g_ui_on ? "; also deal fills and acceptance checks on the main thread outside the AI loop (war view, peace windows)" : "");
     if (g_stats) eb_log("ai items: timing every country of the AI loop and every AI task run (reports every 100 / 500 loops)");
     return 1;
 }

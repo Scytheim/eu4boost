@@ -12,6 +12,12 @@
 //   process never reaches a filter. crash_reports\session.txt says "running" until a normal exit
 //   (DLL_PROCESS_DETACH) writes "exit"; at the next launch a session that did not end with "exit"
 //   gets a report, and the game's logs of that session are copied before the game rewrites them.
+//   What ended it (reports 7, 15, 31, 32: sessions that just stopped): TerminateProcess on itself is hooked
+//   and names its caller in session.txt (state=terminated, by=module+offset); otherwise the next launch
+//   looks for Windows' own record of the crash (Application log, Application Error event 1000: faulting
+//   module, exception code - 0xc0000409 = __fastfail - and offset, matched by the process id) on a
+//   thread of its own after DllMain and puts it into the report and its signature. No record and no
+//   TerminateProcess: the process was closed from outside (Task Manager, Steam), or the PC shut down.
 //   The game restarts itself (back from the single player screen to the main menu, seen 2026-10-24):
 //   the new eu4.exe starts before the old one has ended. session.txt names the process (pid=), so a new
 //   session whose predecessor is the same program and still running waits up to 3 s for it and makes no
@@ -423,11 +429,13 @@ static void new_dir(wchar_t* out, const wchar_t* stamp, const wchar_t* kind) {  
     _snwprintf(out, MAX_PATH, L"%lspending\\%ls_%ls\\", eb_rep_dir, stamp, kind);
     CreateDirectoryW(out, NULL);
 }
+static char g_session_extra[160];          // one more line for session.txt (how the process ended)
 static void set_session(const char* state) {
-    char t[160]; sb_t b = { t, 0, sizeof t };
+    char t[320]; sb_t b = { t, 0, sizeof t };
     char pid[16]; snprintf(pid, sizeof pid, "%lu", (unsigned long)GetCurrentProcessId());
     s_put(&b, "state="); s_put(&b, state); s_put(&b, "\r\nstart="); s_w(&b, g_start);
     s_put(&b, "\r\nversion=" EU4BOOST_VERSION "\r\npid="); s_put(&b, pid); s_put(&b, "\r\n");
+    if (g_session_extra[0]) { s_put(&b, g_session_extra); s_put(&b, "\r\n"); }
     HANDLE h = CreateFileW(g_session, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, t, (DWORD)b.n, &w, NULL); FlushFileBuffers(h); CloseHandle(h); }
 }
@@ -787,6 +795,117 @@ static void attach_game_logs(const wchar_t* dir) {
     _snwprintf(s, MAX_PATH, L"%lslogs\\system.log", d); copy_tail(s, dir, L"system.log", 64 * 1024);
     _snwprintf(s, MAX_PATH, L"%lsdlc_load.json", d);    copy_tail(s, dir, L"dlc_load.json", 16 * 1024);
 }
+// ---- what ended the previous session ----
+static wchar_t g_wer_dir[MAX_PATH];        // the abnormal-exit report to complete (empty = none)
+static DWORD g_wer_pid;                     // its process id (0 = unknown: matched by time)
+volatile LONG eb_wer_done = 1;              // report.c waits for this before sending
+typedef void* EVT_H;
+typedef EVT_H (WINAPI* evtquery_t)(EVT_H, LPCWSTR, LPCWSTR, DWORD);
+typedef BOOL (WINAPI* evtnext_t)(EVT_H, DWORD, EVT_H*, DWORD, DWORD, PDWORD);
+typedef BOOL (WINAPI* evtrender_t)(EVT_H, EVT_H, DWORD, DWORD, PVOID, PDWORD, PDWORD);
+typedef BOOL (WINAPI* evtclose_t)(EVT_H);
+// the n-th <Data>...</Data> of an event's XML, as UTF-8
+static int xml_data(const wchar_t* x, int n, char* out, int cap) {
+    out[0] = 0;
+    for (const wchar_t* p = x; (p = wcsstr(p, L"<Data")); ) {
+        const wchar_t* gt = wcschr(p, L'>'); if (!gt) return 0;
+        if (gt[-1] == L'/') { p = gt; if (n-- == 0) return 1; continue; }   // <Data/>: empty
+        const wchar_t* end = wcsstr(gt, L"</Data>"); if (!end) return 0;
+        if (n-- == 0) {
+            int len = (int)(end - gt - 1);
+            int k = WideCharToMultiByte(CP_UTF8, 0, gt + 1, len, out, cap - 1, NULL, NULL);
+            out[k > 0 ? k : 0] = 0;
+            return 1;
+        }
+        p = end;
+    }
+    return 0;
+}
+// Windows' crash record of the previous session: Application Error 1000 for eu4.exe with its process id
+static int find_wer(const char* exe, DWORD pid, char* out, int cap, char* sig, int scap) {
+    HMODULE w = LoadLibraryW(L"wevtapi.dll");
+    if (!w) return 0;
+    evtquery_t q = (evtquery_t)(void*)GetProcAddress(w, "EvtQuery");
+    evtnext_t nx = (evtnext_t)(void*)GetProcAddress(w, "EvtNext");
+    evtrender_t rd = (evtrender_t)(void*)GetProcAddress(w, "EvtRender");
+    evtclose_t cl = (evtclose_t)(void*)GetProcAddress(w, "EvtClose");
+    if (!q || !nx || !rd || !cl) return 0;
+    EVT_H rs = q(NULL, L"Application", L"*[System[Provider[@Name='Application Error'] and (EventID=1000) and "
+                 L"TimeCreated[timediff(@SystemTime) <= 259200000]]]", 0x1 | 0x200);   // channel, newest first (3 days)
+    if (!rs) return 0;
+    static wchar_t xml[16384];
+    int found = 0;
+    EVT_H ev[16]; DWORD got = 0;
+    while (!found && nx(rs, 16, ev, 2000, 0, &got) && got) {
+        for (DWORD i = 0; i < got; i++) {
+            DWORD used = 0, props = 0;
+            if (!found && rd(NULL, ev[i], 1, sizeof xml - 2, xml, &used, &props)) {   // EvtRenderEventXml
+                xml[used / 2 < 16383 ? used / 2 : 16383] = 0;
+                char app[64], mod[96], mver[48], code[24], off[40], epid[24];
+                xml_data(xml, 0, app, sizeof app);
+                xml_data(xml, 8, epid, sizeof epid);
+                if (!_stricmp(app, exe) && (pid == 0 || strtoul(epid, NULL, 16) == pid)) {
+                    xml_data(xml, 3, mod, sizeof mod); xml_data(xml, 4, mver, sizeof mver);
+                    xml_data(xml, 6, code, sizeof code); xml_data(xml, 7, off, sizeof off);
+                    const wchar_t* tc = wcsstr(xml, L"SystemTime='"); char when[32] = "";
+                    if (!tc) tc = wcsstr(xml, L"SystemTime=\"");
+                    if (tc) { int k = WideCharToMultiByte(CP_UTF8, 0, tc + 12, 19, when, sizeof when - 1, NULL, NULL); when[k > 0 ? k : 0] = 0; }
+                    uint64_t o = _strtoui64(off, NULL, 16);
+                    unsigned long c = strtoul(code, NULL, 16);
+                    snprintf(out, cap, "windows: Application Error %s UTC (process %s%s): %s %s, exception 0x%08lx%s at %s+0x%llx\r\n",
+                             when, epid, pid ? "" : ", matched by time", mod, mver, c, c == 0xc0000409ul ? " (__fastfail)" : "",
+                             mod, (unsigned long long)o);
+                    snprintf(sig, scap, "ABNORMAL_EXIT 0x%08lx %s+0x%llx", c, mod, (unsigned long long)o);
+                    found = 1;
+                }
+            }
+            cl(ev[i]);
+        }
+        got = 0;
+    }
+    cl(rs);
+    return found;
+}
+static DWORD WINAPI winerr_thread(LPVOID unused) {
+    (void)unused;
+    char line[512] = "", sig[200] = "";
+    if (!find_wer("eu4.exe", g_wer_pid, line, sizeof line, sig, sizeof sig))
+        snprintf(line, sizeof line, "windows: no crash record of that process in the Application log - it was closed or ended from "
+                 "outside (Task Manager, Steam, a shutdown) or the PC lost power\r\n");
+    wchar_t p[MAX_PATH]; _snwprintf(p, MAX_PATH, L"%lsreport.txt", g_wer_dir);
+    static char r[16384], o[17000];
+    int n = read_small(p, r, sizeof r);
+    if (n > 0) {
+        const char* s1 = strstr(r, "signature: ABNORMAL_EXIT\r\n");
+        const char* body = strstr(r, "The previous session");
+        if (s1 && body) {
+            int k = snprintf(o, sizeof o, "%.*s", (int)(s1 - r), r);
+            k += snprintf(o + k, sizeof o - k, "signature: %s\r\n", sig[0] ? sig : "ABNORMAL_EXIT");
+            const char* a = s1 + strlen("signature: ABNORMAL_EXIT\r\n");
+            k += snprintf(o + k, sizeof o - k, "%.*s%s%s", (int)(body - a), a, line, body);
+            write_file(g_wer_dir, L"report.txt", o, k);
+        }
+    }
+    eb_log("report: the previous session's end: %.300s", line);
+    InterlockedExchange(&eb_wer_done, 1);
+    return 0;
+}
+
+typedef BOOL (WINAPI* term_t)(HANDLE, UINT);
+static term_t o_term;
+static BOOL WINAPI hk_term(HANDLE h, UINT code) {
+    if (!g_crashed && (h == GetCurrentProcess() || GetProcessId(h) == GetCurrentProcessId())) {
+        char by[100]; sb_t b = { by, 0, sizeof by };
+        s_put(&b, "by="); s_addr(&b, (uint64_t)(uintptr_t)__builtin_return_address(0));
+        s_put(&b, " code="); s_hex(&b, code, 1);
+        by[b.n < sizeof by ? b.n : sizeof by - 1] = 0;
+        snprintf(g_session_extra, sizeof g_session_extra, "%s", by);
+        set_session("terminated");
+        eb_log("process: TerminateProcess on itself, %s", by + 3);
+    }
+    return o_term(h, code);
+}
+
 static void check_previous(void) {
     char t[256] = {0};
     HANDLE h = CreateFileW(g_session, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -841,13 +960,20 @@ static void check_previous(void) {
         const char* vb = strstr(g_prev_beat, "\nplugin: ");
         if (v) v += 8; else if (vb) v = vb + 9;
         for (int i = 0; v && i < 32 && v[i] && v[i] != '\r' && v[i] != '\n'; i++) { ver[i] = v[i]; ver[i + 1] = 0; }
-        char r[640]; sb_t b = { r, 0, sizeof r };
-        s_put(&b, "eu4boost crash report\r\nkind: exit\r\nsignature: ABNORMAL_EXIT\r\n");
+        char by[96] = "";                                     // state=terminated: who called TerminateProcess
+        const char* bp = strstr(t, "by=");
+        for (int i = 0; bp && i < 90 && bp[3 + i] && bp[3 + i] != '\r' && bp[3 + i] != '\n'; i++) { by[i] = bp[3 + i]; by[i + 1] = 0; }
+        char r[900]; sb_t b = { r, 0, sizeof r };
+        s_put(&b, "eu4boost crash report\r\nkind: exit\r\nsignature: ABNORMAL_EXIT");
+        if (by[0]) { s_put(&b, " TerminateProcess "); s_put(&b, by); }
+        s_put(&b, "\r\n");
         if (ver[0]) { s_put(&b, "plugin: "); s_put(&b, ver); s_put(&b, "\r\n"); }
+        if (by[0]) { s_put(&b, "ended by: TerminateProcess on itself, called from "); s_put(&b, by); s_put(&b, "\r\n"); }
         s_put(&b, "The previous session (started "); s_w(&b, prev); s_put(&b, ") ended without a normal exit and without a crash the plugin "
                   "could catch: a crash through __fastfail (heap corruption, abort), a killed process, a shutdown or a power loss.\r\n");
         wchar_t dir[MAX_PATH]; new_dir(dir, prev[0] ? prev : g_start, L"exit");
         write_file(dir, L"report.txt", r, b.n);
+        if (!by[0]) { wcscpy(g_wer_dir, dir); g_wer_pid = pid; }   // winerr_thread looks for Windows' record
         append_file(dir, L"report.txt", g_prev_mods, (int)strlen(g_prev_mods));
         append_file(dir, L"report.txt", g_prev_saves, (int)strlen(g_prev_saves));
         append_file(dir, L"report.txt", g_prev_beat, (int)strlen(g_prev_beat));
@@ -901,6 +1027,15 @@ int eb_crash_install(void) {
                  MH_CreateHookApiEx(L"kernelbase", "SetUnhandledExceptionFilter", (void*)hk_set_uef, (void**)&o_set_uef, &target) == MH_OK &&
                  MH_EnableHook(target) == MH_OK;
     if (!hooked) eb_log("report: SetUnhandledExceptionFilter hook failed - a filter installed later replaces ours");
+    void* tt = NULL;
+    if (!((st == MH_OK || st == MH_ERROR_ALREADY_INITIALIZED) &&
+          MH_CreateHookApiEx(L"kernelbase", "TerminateProcess", (void*)hk_term, (void**)&o_term, &tt) == MH_OK && MH_EnableHook(tt) == MH_OK))
+        eb_log("report: TerminateProcess hook failed - an abnormal exit cannot name a caller");
+    if (g_wer_dir[0]) {                                        // after DllMain: wevtapi.dll is loaded there
+        InterlockedExchange(&eb_wer_done, 0);
+        HANDLE h = CreateThread(NULL, 0, winerr_thread, NULL, 0, NULL);
+        if (h) CloseHandle(h); else InterlockedExchange(&eb_wer_done, 1);
+    }
     o_rcb = (pops_rcb_t)patch_iat(g_exe, "pops_api.dll", "POPS_RunCallbacks", (void*)hk_rcb);
     if (o_rcb && g_main_thread) {                              // hangs, stalls and the heartbeat
         HANDLE h = CreateThread(NULL, 256 * 1024, watchdog, NULL, 0, NULL);
@@ -978,3 +1113,14 @@ __declspec(dllexport) int eb_test_stackwalk(int samples, int resume_first, doubl
     return ok;
 }
 #endif
+
+#ifdef EB_TEST
+// manual check (not in the smoke tests: it needs the Windows event log): the record of process pid of exe
+__declspec(dllexport) int eb_test_wer(const char* exe, unsigned long pid) {
+    char line[512], sig[200];
+    int f = find_wer(exe, (DWORD)pid, line, sizeof line, sig, sizeof sig);
+    printf("%s%s%s\n", f ? line : "not found\n", f ? "signature: " : "", f ? sig : "");
+    return f;
+}
+#endif
+

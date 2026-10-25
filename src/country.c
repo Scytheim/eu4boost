@@ -395,6 +395,7 @@ static void hk_serial(void* gs) {
     o_serial(gs);
     if (g_cfg.country_parallel_refresh) finish_loop();
     if (g_cfg.country_test_war_all > 0 && g_cfg.country_parallel_war) war_test((uint8_t*)gs);
+    if (g_cfg.test_warview) eb_warview_test((uint8_t*)gs);
     record(F_SERIAL, t0, NULL);
 }
 static void hk_daily(void* c) {
