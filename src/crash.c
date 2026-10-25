@@ -835,9 +835,16 @@ static void check_previous(void) {
     }
     if (clean) return;
     if (!found) {
-        char r[512]; sb_t b = { r, 0, sizeof r };
-        s_put(&b, "eu4boost crash report\r\nkind: exit\r\nsignature: ABNORMAL_EXIT\r\n"
-                  "The previous session (started "); s_w(&b, prev); s_put(&b, ") ended without a normal exit and without a crash the plugin "
+        // that session's version (the issue is filed under it): session.txt's version=, else its last heartbeat
+        char ver[40] = "";
+        const char* v = strstr(t, "version=");
+        const char* vb = strstr(g_prev_beat, "\nplugin: ");
+        if (v) v += 8; else if (vb) v = vb + 9;
+        for (int i = 0; v && i < 32 && v[i] && v[i] != '\r' && v[i] != '\n'; i++) { ver[i] = v[i]; ver[i + 1] = 0; }
+        char r[640]; sb_t b = { r, 0, sizeof r };
+        s_put(&b, "eu4boost crash report\r\nkind: exit\r\nsignature: ABNORMAL_EXIT\r\n");
+        if (ver[0]) { s_put(&b, "plugin: "); s_put(&b, ver); s_put(&b, "\r\n"); }
+        s_put(&b, "The previous session (started "); s_w(&b, prev); s_put(&b, ") ended without a normal exit and without a crash the plugin "
                   "could catch: a crash through __fastfail (heap corruption, abort), a killed process, a shutdown or a power loss.\r\n");
         wchar_t dir[MAX_PATH]; new_dir(dir, prev[0] ? prev : g_start, L"exit");
         write_file(dir, L"report.txt", r, b.n);

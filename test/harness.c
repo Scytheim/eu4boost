@@ -613,6 +613,9 @@ int main(int argc, char** argv) {
         int (*tl)(void) = (int (*)(void))GetProcAddress(h, "eb_test_savelist");        // savelist.c: text cut, meta zip
         CHECK(tl != NULL);
         if (tl) { int d = tl(); printf("save list cache checks: %d wrong answers\n", d); CHECK(d == 0); }
+        int (*tr)(void) = (int (*)(void))GetProcAddress(h, "eb_test_report_version");  // report.c: the version an issue is filed under
+        CHECK(tr != NULL);
+        if (tr) { int d = tr(); CHECK(d == 0); }
     }
 
     // 3h. modifier-container add (fast path vs the game's algorithm)

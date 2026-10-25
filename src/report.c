@@ -7,7 +7,8 @@
 // the GitHub token stays on the Worker) and moves each sent payload to crash_reports\sent\, so the user
 // can read exactly what left the PC. Before sending, the Windows user name, the profile folder and the
 // computer name are replaced in every text.
-// Payload (JSON, schema 1): kind, signature, the report text, plugin version and DLL hash, the
+// Payload (JSON, schema 1): kind, signature, the report text, the plugin version of the session the report
+// is about (the issue title) and of the sender, the DLL hash, the
 // effective config line, game version and mod list (the game's crash meta.yml or dlc_load.json), PC
 // (CPU, threads, RAM, GPU, Windows build, locale), the files in plugins\ with EU4dll's hash, and the
 // tails of the plugin log and the game's game.log / error.log / system.log of that session.
@@ -197,6 +198,21 @@ static void line_value(const buf_t* b, const char* key, char* out, size_t n) {  
     out[k] = 0;
 }
 
+// The version of the session the report is about: its "plugin: " line (crash, hang and slow reports are
+// written by that session; an abnormal-exit report, written by the next launch, names the version from
+// session.txt or the last heartbeat). A report is often sent by a newer DLL after an update (report 17:
+// 0.4.2 sessions filed as 0.4.4). Without a usable line: the sender's version.
+static void report_version(const buf_t* rep, char* out, size_t n) {
+    line_value(rep, "\nplugin: ", out, n);
+    size_t k = strlen(out);
+    int ok = k >= 1 && k <= 32;
+    for (size_t i = 0; ok && i < k; i++) {
+        char c = out[i];
+        ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '+' || c == '-';
+    }
+    if (!ok) snprintf(out, n, "%s", EU4BOOST_VERSION);
+}
+
 // ---- PC ----
 static void pc_info(buf_t* o) {
     int r[4]; char cpu[49] = {0};
@@ -323,7 +339,8 @@ static int build(const wchar_t* dir, const wchar_t* name, buf_t* o, char* title,
     snprintf(title, tn, "%s", sig);
     char id[64]; WideCharToMultiByte(CP_UTF8, 0, name, -1, id, sizeof id, NULL, NULL);
     b_str(o, "{\"schema\":1"); j_kvs(o, "id", id, 1); j_kvs(o, "kind", kind, 1); j_kvs(o, "signature", sig, 1);
-    j_kvs(o, "plugin_version", EU4BOOST_VERSION, 1); j_kvs(o, "config", cfg, 1);
+    char ver[40]; report_version(&rep, ver, sizeof ver);
+    j_kvs(o, "plugin_version", ver, 1); j_kvs(o, "sender_version", EU4BOOST_VERSION, 1); j_kvs(o, "config", cfg, 1);
     plugins_info(o);
     pc_info(o);
     saves_info(o);
@@ -496,3 +513,27 @@ void eb_report_start(void) {
     if (h) CloseHandle(h);
 #endif
 }
+
+#ifdef EB_TEST
+// harness: the version a report is filed under
+__declspec(dllexport) int eb_test_report_version(void) {
+    static const struct { const char* text; const char* want; } t[] = {
+        { "eu4boost crash report\r\nkind: crash\r\nsignature: X\r\nthread: other\r\nplugin: 0.4.1\r\nuptime_s: 5\r\n", "0.4.1" },
+        { "eu4boost crash report\r\nkind: slow\r\nsignature: SLOW x\r\nplugin: 0.4.2\r\n\r\n", "0.4.2" },
+        { "eu4boost crash report\r\nkind: exit\r\nsignature: ABNORMAL_EXIT\r\nplugin: 0.4.2\r\nThe previous session\r\n"
+          "last state of that session:\r\nplugin: 0.4.2\r\n", "0.4.2" },
+        { "eu4boost crash report\r\nkind: exit\r\nsignature: ABNORMAL_EXIT\r\nThe previous session\r\n", EU4BOOST_VERSION },
+        { "eu4boost crash report\r\nkind: crash\r\nplugin: 0.4.1 <x>\r\n", EU4BOOST_VERSION },     // not a version: the sender's
+        { "eu4boost crash report\r\nsignature: no plugin: 9.9.9 here\r\n", EU4BOOST_VERSION },     // only at a line start
+    };
+    int bad = 0;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        buf_t b = {0}; b_str(&b, t[i].text);
+        char v[40]; report_version(&b, v, sizeof v);
+        if (strcmp(v, t[i].want)) { printf("report version case %d: %s, want %s\n", (int)i, v, t[i].want); bad++; }
+        free(b.p);
+    }
+    printf("report       %s (%d failures)\n", bad ? "FAILED" : "ALL TESTS PASSED", bad);
+    return bad;
+}
+#endif

@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.4"
+#define EU4BOOST_VERSION "0.4.5"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -75,6 +75,8 @@ typedef struct {
     int country_stats;            // 1 = diagnostics: time the country loop and its dirty-bundle functions
     int country_parallel_refresh; // EXPERIMENT: 1 = RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check
     int country_refresh_fixup;    // 1 = recompute the cached values of FUN_1402f1120 (+0xe1c..+0xe34) at the country's turn
+    int country_parallel_war;     // 1 = the war refresh (all participants of a war joined or declared) on all cores, 2 = + verify
+    int country_test_war_all;     // testing only: every N country loops all countries that are not dirty go through the war refresh
     int country_test_truce_end;   // testing only: N precomputed countries a day get a truce with the player that has just ended
     int country_test_no_defer;    // testing only: 1 = workers run the message handler themselves (as 0.4.3 did)
     int autorun_until;            // testing only ([test] autorun_until=1877.01.01): after the load speed 5 to this date, then exit (0 = off)

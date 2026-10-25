@@ -99,6 +99,8 @@ static void load_config(void) {
     c->country_stats        = ini_int(ini, L"country",   L"stats", 0);
     c->country_parallel_refresh = ini_int(ini, L"country", L"parallel_refresh", 0); // experimental
     c->country_refresh_fixup = ini_int(ini, L"country", L"refresh_fixup", 1);
+    c->country_parallel_war = ini_int(ini, L"country", L"parallel_war", 0);
+    c->country_test_war_all = ini_int(ini, L"country", L"test_war_all", 0);       // testing only, not in the ini files
     c->country_test_truce_end = ini_int(ini, L"country", L"test_truce_end", 0);   // testing only, not in the ini files
     c->country_test_no_defer = ini_int(ini, L"country", L"test_no_defer", 0);
     {

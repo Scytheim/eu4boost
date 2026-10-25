@@ -63,6 +63,11 @@
 #define RVA_MSGMOVE 0x1af350u   // message move constructor (dst, src): takes src's key list and text
 #define RVA_STRFREE 0x095660u   // std::string tidy (the message text at +0x60)
 #define RVA_LSTFREE 0x1af710u   // the message's key/value list (+0x10) free
+#define RVA_WARREF  0xd8f790u   // (war): RefreshKnowledge of every attacker (war+0x48..0x50) and defender (+0x78..0x80) - joining or declaring a war
+#define WAR_LEA1    0xd8f7cfu   // its lea rdx, "...war.cpp:1546" (attackers) and "...war.cpp:1551" (defenders)
+#define WAR_LEA2    0xd8f827u
+#define RVA_GSP     0x233fe78u  // gamestate pointer
+#define RVA_TAGTAB  0x233d8d0u  // tag table object pointer
 #define MSG_SIZE    0x90
 #define FN_SIZE     0x40        // MSVC std::function: storage, impl pointer at +0x38 (vtable: [0] _Copy(where), [4] _Delete_this(bool))
 #define DAILY_SIZE  11174u      // size of FUN_1402ee280 (return addresses inside it = called from the daily update)
@@ -73,6 +78,7 @@ static const uint8_t sig_cm[16]      = { 0x48,0x89,0x5c,0x24,0x10,0x55,0x56,0x57
 static const uint8_t sig_ucb[16]     = { 0x48,0x83,0xec,0x28,0x80,0x79,0x18,0x00,0x75,0x07,0x32,0xc0,0x48,0x83,0xc4,0x28 };
 static const uint8_t sig_kcache[24]  = { 0x48,0x89,0x5c,0x24,0x08,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8b,0xec,0x48,0x83,0xec,0x60,0x0f };
 static const uint8_t sig_opcache[16] = { 0x48,0x89,0x5c,0x24,0x08,0x44,0x88,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10,0x57 };
+static const uint8_t sig_warref[16] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xec,0x20,0x48 };
 static const uint8_t sig_msg[16]     = { 0x48,0x89,0x5c,0x24,0x08,0x4c,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10,0x55 };
 static const uint8_t sig_msgmove[16] = { 0x45,0x33,0xc0,0x48,0x8d,0x05,0x86,0x33,0xa9,0x01,0x48,0x89,0x01,0x48,0x8b,0x42 };
 static const uint8_t sig_strfree[16] = { 0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x51,0x18,0x48,0x8b,0xd9,0x48,0x83,0xfa };
@@ -83,6 +89,7 @@ static const uint8_t sig_lstfree[16] = { 0x48,0x89,0x5c,0x24,0x10,0x56,0x48,0x83
 #define C_KCACHE    0xe1c       // FUN_1402f1120's fields +0xe1c..+0xe37
 #define C_KCACHE_N  0x1c
 #define C_GROUP     0x1948      // group object; its vector at +0x20 holds tags, the first is the leader
+#define C_OVERLORD  0x18f0      // the overlord's tag (top byte 0 = none)
 #define C_DIRTY     0x2882
 #define C_DIRTY2    0x2885
 #define C_SIZE      0x9b50      // country object size at least (the save writer FUN_1402dc6b0 uses fields up to +0x9b48)
@@ -91,8 +98,8 @@ static const uint8_t sig_lstfree[16] = { 0x48,0x89,0x5c,0x24,0x10,0x56,0x48,0x83
 #define GS_SESSION  0x1e00
 #define GS_DATE     0x1dd0      // today, in hours
 
-enum { F_SERIAL, F_DAILY, F_RK, F_CM, F_UCB, NF };
-static const char* const fname[NF] = { "country loop", "country daily", "RefreshKnowledge", "CalculateModifier", "UpdateCasusBellis" };
+enum { F_SERIAL, F_DAILY, F_RK, F_CM, F_UCB, F_WAR, NF };
+static const char* const fname[NF] = { "country loop", "country daily", "RefreshKnowledge", "CalculateModifier", "UpdateCasusBellis", "war refresh" };
 #define NB 7
 static const double bucket_us[NB - 1] = { 5, 20, 50, 200, 1000, 5000 };
 typedef struct {
@@ -124,6 +131,9 @@ static v1_t o_serial, o_daily;
 static v2_t o_rk;
 static cm_t o_cm;
 static ucb_t o_ucb;
+static v1_t o_warref;
+static uint8_t** g_gsp;
+static LONG64 g_war_parts;                     // stats: participants refreshed by the war refresh
 static opc_t o_opcache;
 
 static inline LONGLONG now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
@@ -144,9 +154,13 @@ static void record(int f, LONGLONG t0, void* ret) {
 #define MAXWORKERS 15
 // a recorded UpdateOpinionCache call, or (msg set) a message for the handler in .country
 typedef struct { void* country; uint64_t key; char flag; uint8_t* msg; uint8_t* fn; } opcall_t;
-typedef struct { uint8_t* c; opcall_t* ops; int nops, capops; uint8_t pre[C_KCACHE_N]; } job_t;
-static job_t g_jobs[MAXJOBS];
+typedef struct { uint8_t* c; const char* where; opcall_t* ops; int nops, capops; uint8_t pre[C_KCACHE_N]; } job_t;
+static job_t g_jobs[MAXJOBS];                  // the loop start's refresh (finish_loop reads it until the loop ends)
+static job_t g_wjobs[MAXJOBS];                 // a war refresh's participants
 static volatile LONG g_njobs, g_next, g_done, g_pending;   // g_pending: woken workers not yet back to waiting
+static job_t* volatile g_batch = g_jobs;       // the jobs the workers run now, and how many
+static volatile LONG g_nbatch;
+static int g_in_batch;
 static HANDLE g_wake[MAXWORKERS];
 static int g_nworkers;
 static __thread int t_job = -1;                 // job running on this thread (workers), -1 = none
@@ -161,7 +175,7 @@ static double g_fix_us;
 static const char g_where[] = "eu4boost parallel_refresh";
 
 static opcall_t* new_op(int j) {
-    job_t* jb = &g_jobs[j];
+    job_t* jb = &g_batch[j];
     if (jb->nops == jb->capops) {
         int n = jb->capops ? jb->capops * 2 : 8;
         opcall_t* p = (opcall_t*)realloc(jb->ops, (size_t)n * sizeof *p);
@@ -208,9 +222,9 @@ static void post_msg(opcall_t* o) {
 static void run_jobs(int deferred) {
     for (;;) {
         LONG i = InterlockedIncrement(&g_next) - 1;
-        if (i >= g_njobs) break;
+        if (i >= g_nbatch) break;
         if (deferred) t_job = (int)i;
-        o_rk(g_jobs[i].c, g_where);
+        o_rk(g_batch[i].c, g_batch[i].where);
         t_job = -1;
         InterlockedIncrement(&g_done);
     }
@@ -226,7 +240,33 @@ static DWORD WINAPI worker(LPVOID arg) {
     return 0;
 }
 
-static void verify_rk(uint8_t* c, const char* w);
+static int verify_rk(uint8_t* c, const char* w, LONG64* ver, LONG64* bad);
+
+// RefreshKnowledge of jobs[0..m) at once (workers and the main thread; serial = on the main thread in
+// order, the verify baseline), then the recorded UpdateOpinionCache calls and messages in job order
+static void run_batch(job_t* jobs, LONG m, int serial) {
+    g_in_batch = 1;
+    while (g_pending) YieldProcessor();                         // every worker of the last batch is back
+    g_next = 0; g_done = 0;
+    g_batch = jobs; g_nbatch = m;
+    MemoryBarrier();
+    if (serial) run_jobs(0);
+    else {
+        int wake = g_nworkers < m - 1 ? g_nworkers : m - 1;
+        InterlockedExchange(&g_pending, wake);
+        for (int w = 0; w < wake; w++) SetEvent(g_wake[w]);
+        run_jobs(1);
+        while (g_done < m) YieldProcessor();
+    }
+    for (LONG i = 0; i < m; i++)
+        for (int k = 0; k < jobs[i].nops; k++) {
+            opcall_t* o = &jobs[i].ops[k];
+            if (o->msg) { post_msg(o); g_pr_msgs++; continue; }
+            o_opcache(o->country, o->key, o->flag);
+            g_pr_deferred++;
+        }
+    g_in_batch = 0;
+}
 
 static void precompute(uint8_t* gs) {
     void** session = *(void***)(gs + GS_SESSION);
@@ -243,7 +283,7 @@ static void precompute(uint8_t* gs) {
         if (!c[C_DIRTY]) continue;
         short tag = (short)(*(uint64_t*)(c + C_TAG) >> 32);
         if (tag == player || tag == shown) continue;
-        g_jobs[m].c = c; g_jobs[m].nops = 0; m++;
+        g_jobs[m].c = c; g_jobs[m].where = g_where; g_jobs[m].nops = 0; m++;
     }
     if (m < 2) return;
     for (LONG i = 0; i < m; i++) { uint16_t tg = (uint16_t)(*(uint64_t*)(g_jobs[i].c + C_TAG) >> 32); g_tagbits[tg >> 3] |= (uint8_t)(1 << (tg & 7)); }
@@ -279,26 +319,8 @@ static void precompute(uint8_t* gs) {
     if (mode == 4)                                              // the fixup's values on the state before the refresh
         for (LONG i = 0; i < m; i++) { g_kcache(g_jobs[i].c, 1); memcpy(g_jobs[i].pre, g_jobs[i].c + C_KCACHE, C_KCACHE_N); }
     LONGLONG t0 = now();
-    while (g_pending) YieldProcessor();                         // every worker of the last phase is back
-    g_next = 0; g_done = 0;
-    MemoryBarrier();
     g_njobs = m;
-    if (mode == 3) run_jobs(0);       // serial precompute (verify baseline)
-    else {
-        int wake = g_nworkers < m - 1 ? g_nworkers : m - 1;
-        InterlockedExchange(&g_pending, wake);
-        for (int w = 0; w < wake; w++) SetEvent(g_wake[w]);
-        run_jobs(1);
-        while (g_done < m) YieldProcessor();
-    }
-    // replay UpdateOpinionCache calls and messages in country order, as the serial loop would have made them
-    for (LONG i = 0; i < m; i++)
-        for (int k = 0; k < g_jobs[i].nops; k++) {
-            opcall_t* o = &g_jobs[i].ops[k];
-            if (o->msg) { post_msg(o); g_pr_msgs++; continue; }
-            o_opcache(o->country, o->key, o->flag);
-            g_pr_deferred++;
-        }
+    run_batch(g_jobs, m, mode == 3);   // mode 3: serial precompute (verify baseline)
     g_pr_us += (double)(now() - t0) * g_qpf_us;
     if (mode == 4)
         for (LONG i = 0; i < m; i++) {
@@ -306,7 +328,7 @@ static void precompute(uint8_t* gs) {
             g_kcache(c, 1);                                     // the fixup on the refreshed state = before?
             g_kc_checked++;
             if (memcmp(c + C_KCACHE, g_jobs[i].pre, C_KCACHE_N) != 0) g_kc_post_diff++;
-            verify_rk(c, g_where);                              // serial redo on the same state: differences = races
+            verify_rk(c, g_where, &g_pr_ver, &g_pr_ver_bad);    // serial redo on the same state: differences = races
         }
     for (LONG i = 0; i < m; i++) {
         uint8_t* c = g_jobs[i].c;
@@ -326,7 +348,7 @@ static void finish_loop(void) {
 static int g_ver_logged;
 static LONG64 g_off_hist[C_SIZE / 4];          // mismatching 4-byte words of the country object
 static LONG64 g_rel_hist[0x48];                 // mismatching bytes by field of a relation entry
-static void verify_rk(uint8_t* c, const char* w) {
+static int verify_rk(uint8_t* c, const char* w, LONG64* ver, LONG64* badn) {
     size_t sz = C_SIZE;                                          // (mi_usable_size is wrong here: the country is not at the start of its block)
     uint8_t* rb = *(uint8_t**)(c + C_REL); uint8_t* re = *(uint8_t**)(c + C_REL + 8);
     size_t rsz = (rb && re > rb) ? (size_t)(re - rb) : 0;
@@ -335,7 +357,7 @@ static void verify_rk(uint8_t* c, const char* w) {
     if (snap) { memcpy(snap, c, sz); snap[C_DIRTY] = 0; }       // the original clears the flag
     if (rsnap) memcpy(rsnap, rb, rsz);
     o_rk(c, w);
-    g_pr_ver++;
+    (*ver)++;
     int bad = 0, first = -1, nd = 0, rfirst = -1, rnd = 0;
     // 8-byte fields whose old and new values are both heap pointers are skipped: lists rebuilt by
     // RefreshKnowledge get new nodes (only their head/tail pointers are seen here, not their contents)
@@ -351,7 +373,7 @@ static void verify_rk(uint8_t* c, const char* w) {
     if (rsnap && rb2 == rb) for (size_t i = 0; i < rsz; i++) if (rsnap[i] != rb[i]) { if (rfirst < 0) rfirst = (int)i; rnd++; g_rel_hist[i % 0x48]++; }
     bad = nd || rnd || rb2 != rb;
     if (bad) {
-        g_pr_ver_bad++;
+        (*badn)++;
         if (g_ver_logged++ < 40) {
             char offs[256]; int len = 0; offs[0] = 0;
             if (snap) for (size_t i = 0; i < sz && len < 200; i++)
@@ -362,14 +384,17 @@ static void verify_rk(uint8_t* c, const char* w) {
         }
     }
     free(snap); free(rsnap);
+    return bad;
 }
 
 // ---- hooks ------------------------------------------------------------------------------------------
+static void war_test(uint8_t* gs);
 static void hk_serial(void* gs) {
     LONGLONG t0 = g_cfg.country_stats ? now() : 0;
     if (g_cfg.country_parallel_refresh) precompute((uint8_t*)gs);
     o_serial(gs);
     if (g_cfg.country_parallel_refresh) finish_loop();
+    if (g_cfg.country_test_war_all > 0 && g_cfg.country_parallel_war) war_test((uint8_t*)gs);
     record(F_SERIAL, t0, NULL);
 }
 static void hk_daily(void* c) {
@@ -389,7 +414,7 @@ static void hk_rk(void* cv, const char* w) {
                 g_fix_us += (double)(now() - t1) * g_qpf_us;
             }
             if (g_cfg.country_parallel_refresh != 2 && g_cfg.country_parallel_refresh != 3) { c[C_DIRTY] = 0; g_pr_skipped++; return; }
-            LONGLONG t0 = now(); verify_rk(c, w); record(F_RK, t0, ret); return;
+            LONGLONG t0 = now(); verify_rk(c, w, &g_pr_ver, &g_pr_ver_bad); record(F_RK, t0, ret); return;
         }
         c[C_DIRTY] = 1;                                          // +0x2885 set meanwhile: original
     }
@@ -405,9 +430,142 @@ static uint8_t hk_ucb(void* o, void* w) {
     void* ret = __builtin_return_address(0);
     LONGLONG t0 = now(); uint8_t r = o_ucb(o, w); record(F_UCB, t0, ret); return r;
 }
+// ---- the war refresh in parallel ([country] parallel_war) ----------------------------------------
+// FUN_140d8f790(war) runs RefreshKnowledge for every attacker (war+0x48..0x50, tags) and then every
+// defender (+0x78..0x80), one after the other; joining or declaring a war calls it. An effect that joins
+// many countries one by one (join_all_offensive_wars_of / join_all_defensive_wars_of in a country loop:
+// 25 files of the 짭짭죽 mod) refreshes all participants again for every join: 5-31 s stalls (report 22).
+// Here the participants are refreshed at once (run_batch: workers + main thread, their opinion-cache
+// calls and messages replayed in participant order). In the original order after them, on the main
+// thread: the player's and the observed country, and every participant that is the group leader of
+// another participant or whose group leader takes part (the member reads the leader's +0x1bf0 list,
+// which the leader's refresh rebuilds). Subjects read their overlord (liberty desire +0xe34:
+// FUN_1403ca1a0 via FUN_1403d79f0 reads the overlord's values; the first verify of the all-countries test
+// differed there in 219 of 2,812), so they run in phases (refresh_set). Nothing to share: the game's order.
+// Mode 2 = + verify: each phase is refreshed again serially on its result and compared.
+// Testing only: [country] test_war_all=D - every D country loops, all countries that are not dirty go
+// through the same path (a war of hundreds of countries), with mode 2 also the serial time of the set.
+static LONG64 g_war_calls, g_war_par, g_war_jobs, g_war_serial, g_war_ver, g_war_bad, g_war_tests;
+static double g_war_us, g_war_ver_us, g_war_test_us, g_war_test_ser_us;
+static LONG64 g_war_test_jobs, g_war_test_serial, g_war_test_ver, g_war_test_bad;
+static const char* g_war_where[2];                     // the game's "where" texts of the two loops
+static uint8_t** g_tagtab;                              // DAT_14233d8d0: tag table object, +0x118 = country by tag
+static int16_t g_tagidx[65536];                         // participant index by tag (-1 = none; reset after use)
+
+// RefreshKnowledge of cs[0..n) as the game would in this order; returns the parallel count.
+// A subject S reads its overlord O (both in the set): in the game's order S sees O's old state when S
+// comes first and O's new state when O comes first. Phase 0 = subjects before their overlord, phase 1 =
+// overlords and everyone else, phase 2 = subjects after their overlord; each phase runs at once and is
+// verified (mode 2) before the next one changes what it read. Serial, after the phases in the game's
+// order: the player's and observed country, group leaders and members in the set, a country that is a
+// subject and an overlord in the set, and every overlord/subject pair one of which is serial.
+static uint8_t g_ph[MAXJOBS];                           // phase 0..2, 3 = serial
+static int16_t g_olidx[MAXJOBS];                        // the overlord's index in the set, -1 = none
+static int refresh_set(uint8_t* gs, uint8_t** cs, const char** ws, int n, double* par_us, double* ver_us) {
+    short player = (short)(*(uint64_t*)(gs + 0x1e60) >> 32), shown = player;
+    if (gs[0x1e66] == 7 && gs[0x1e6f]) shown = (short)(*(uint64_t*)(gs + 0x1e68) >> 32);
+    static uint8_t has_sub[MAXJOBS];
+    for (int i = 0; i < n; i++) { g_ph[i] = 1; g_olidx[i] = -1; has_sub[i] = 0; g_tagidx[(uint16_t)(*(uint64_t*)(cs[i] + C_TAG) >> 32)] = (int16_t)i; }
+    for (int i = 0; i < n; i++) {
+        uint8_t* c = cs[i];
+        uint16_t tg = (uint16_t)(*(uint64_t*)(c + C_TAG) >> 32), lead = tg;
+        if ((short)tg == player || (short)tg == shown) g_ph[i] = 3;
+        uint8_t* grp = *(uint8_t**)(c + C_GROUP);
+        if (grp) {
+            uint64_t* vb = *(uint64_t**)(grp + 0x20); uint64_t* ve = *(uint64_t**)(grp + 0x28);
+            if (vb && ve > vb) lead = (uint16_t)(vb[0] >> 32);
+        }
+        if (lead != tg && g_tagidx[lead] >= 0) { g_ph[i] = 3; g_ph[g_tagidx[lead]] = 3; }
+        if (c[C_OVERLORD + 7]) {
+            uint16_t ol = (uint16_t)(*(uint64_t*)(c + C_OVERLORD) >> 32);
+            if (ol != tg && g_tagidx[ol] >= 0) { g_olidx[i] = g_tagidx[ol]; has_sub[g_tagidx[ol]] = 1; }
+        }
+    }
+    for (int i = 0; i < n; i++) g_tagidx[(uint16_t)(*(uint64_t*)(cs[i] + C_TAG) >> 32)] = -1;
+    for (int i = 0; i < n; i++) if (g_olidx[i] >= 0 && has_sub[i]) g_ph[i] = 3;   // in the middle of a chain
+    for (int changed = 1; changed; ) {                  // a serial overlord makes its subjects serial and back
+        changed = 0;
+        for (int i = 0; i < n; i++) {
+            int o = g_olidx[i];
+            if (o >= 0 && (g_ph[i] == 3) != (g_ph[o] == 3)) { g_ph[i] = g_ph[o] = 3; changed = 1; }
+        }
+    }
+    int cnt[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < n; i++) {
+        if (g_ph[i] != 3 && g_olidx[i] >= 0) g_ph[i] = g_olidx[i] > i ? 0 : 2;
+        cnt[g_ph[i]]++;
+    }
+    if (cnt[0] < 2 && cnt[1] < 2 && cnt[2] < 2) { for (int i = 0; i < n; i++) o_rk(cs[i], ws[i]); return 0; }   // nothing to share: as the game
+    int total = 0;
+    LONGLONG t0 = now();
+    double vus = 0;
+    for (int ph = 0; ph < 3; ph++) {
+        LONG k = 0;
+        for (int i = 0; i < n; i++)
+            if (g_ph[i] == ph) { g_wjobs[k].c = cs[i]; g_wjobs[k].where = ws[i]; g_wjobs[k].nops = 0; k++; }
+        if (k >= 2) { run_batch(g_wjobs, k, 0); total += k; }
+        else for (LONG i = 0; i < k; i++) o_rk(g_wjobs[i].c, g_wjobs[i].where);
+        if (g_cfg.country_parallel_war == 2 && k >= 2) {
+            LONGLONG t1 = now();
+            for (LONG i = 0; i < k; i++) verify_rk(g_wjobs[i].c, g_wjobs[i].where, &g_war_ver, &g_war_bad);
+            vus += (double)(now() - t1) * g_qpf_us;
+        }
+    }
+    for (int i = 0; i < n; i++) if (g_ph[i] == 3) o_rk(cs[i], ws[i]);
+    *par_us += (double)(now() - t0) * g_qpf_us - vus;
+    *ver_us += vus;
+    g_war_jobs += total; g_war_serial += n - total;
+    return total;
+}
+
+static uint8_t* g_wcs[MAXJOBS];
+static const char* g_wws[MAXJOBS];
+static void hk_warref(void* war) {
+    uint8_t* w = (uint8_t*)war;
+    uint64_t* ab = *(uint64_t**)(w + 0x48); uint64_t* ae = *(uint64_t**)(w + 0x50);
+    uint64_t* db = *(uint64_t**)(w + 0x78); uint64_t* de = *(uint64_t**)(w + 0x80);
+    int na = ae > ab ? (int)(ae - ab) : 0, nd = de > db ? (int)(de - db) : 0;
+    g_war_parts += na + nd;
+    LONGLONG t0 = now();
+    uint8_t* gs = *g_gsp;
+    void** session = gs ? *(void***)(gs + GS_SESSION) : NULL;
+    int n = 0;
+    if (g_cfg.country_parallel_war && GetCurrentThreadId() == g_main_tid && !g_in_batch && session && !session[0x6c] &&
+        na + nd >= 3 && na + nd <= MAXJOBS && g_war_where[0]) {
+        uint8_t** tab = *(uint8_t***)(*g_tagtab + 0x118);
+        for (int i = 0; i < na + nd; i++) {
+            uint64_t tag = i < na ? ab[i] : db[i - na];
+            uint8_t* c = tab[(int16_t)(tag >> 32)];
+            if (!c) { n = 0; break; }
+            g_wcs[n] = c; g_wws[n] = g_war_where[i < na ? 0 : 1]; n++;
+        }
+    }
+    g_war_calls++;
+    if (n) { if (refresh_set(gs, g_wcs, g_wws, n, &g_war_us, &g_war_ver_us)) g_war_par++; }
+    else o_warref(war);
+    record(F_WAR, t0, NULL);
+}
+
+static void war_test(uint8_t* gs) {                    // test_war_all: a war of every country that is not dirty
+    static int loops;
+    if (++loops % g_cfg.country_test_war_all) return;
+    uint8_t** list = *(uint8_t***)(gs + GS_COUNTRIES);
+    int nl = *(int*)(gs + GS_NCOUNTRIES), n = 0;
+    for (int i = 0; i < nl && n < MAXJOBS; i++) {
+        uint8_t* c = list[i];
+        if (!c || c[C_DIRTY] || c[C_DIRTY2] || *(int*)(c + C_PROVINCES) <= 0) continue;
+        g_wcs[n] = c; g_wws[n] = g_where; n++;
+    }
+    if (n < 3) return;
+    LONG64 j0 = g_war_jobs, s0 = g_war_serial, v0 = g_war_ver, b0 = g_war_bad;
+    refresh_set(gs, g_wcs, g_wws, n, &g_war_test_us, &g_war_test_ser_us);
+    g_war_tests++; g_war_test_jobs += g_war_jobs - j0; g_war_test_serial += g_war_serial - s0;
+    g_war_test_ver += g_war_ver - v0; g_war_test_bad += g_war_bad - b0;
+    g_war_jobs = j0; g_war_serial = s0; g_war_ver = v0; g_war_bad = b0;
+}
 
 int eb_country_install(void) {
-    if (!g_cfg.country_stats && !g_cfg.country_parallel_refresh) return 0;
+    if (!g_cfg.country_stats && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) return 0;
 #ifdef EB_TEST
     eb_log("country: hooks are not available in the test build");
     return 0;
@@ -423,6 +581,7 @@ int eb_country_install(void) {
         { RVA_UCB,     sig_ucb,     (void*)hk_ucb,     (void**)&o_ucb,     "UpdateCasusBellis" },
         { RVA_OPCACHE, sig_opcache, (void*)hk_opcache, (void**)&o_opcache, "UpdateOpinionCache" },
         { RVA_MSG,     sig_msg,     (void*)hk_msg,     (void**)&o_msg,     "message handler" },
+        { RVA_WARREF,  sig_warref,  (void*)hk_warref,  (void**)&o_warref,  "war refresh" },
     };
     int nt_ = (int)(sizeof t / sizeof t[0]);
     if (nt->FileHeader.TimeDateStamp != 0x66FE6AB9u) { eb_log("country: unexpected eu4.exe - off"); return 0; }
@@ -440,7 +599,21 @@ int eb_country_install(void) {
     if (call[0] != 0xe8 || call + 5 + *(int32_t*)(call + 1) != b + RVA_RK) { eb_log("country: bundle call site mismatch - off"); return 0; }
     g_bundle_ret = b + RET_BUNDLE_RK;
     g_daily_lo = b + RVA_DAILY;
-    if (g_cfg.country_parallel_refresh) {
+    g_gsp = (uint8_t**)(b + RVA_GSP);
+    g_tagtab = (uint8_t**)(b + RVA_TAGTAB);
+    memset(g_tagidx, 0xff, sizeof g_tagidx);
+    for (int k = 0; k < 2; k++) {                       // lea rdx, [rip + text] before each RefreshKnowledge call
+        uint8_t* p = b + (k ? WAR_LEA2 : WAR_LEA1);
+        if (p[0] == 0x48 && p[1] == 0x8d && p[2] == 0x15) {
+            const char* s = (const char*)(p + 7 + *(int32_t*)(p + 3));
+            if (strstr(s, k ? "war.cpp:1551" : "war.cpp:1546")) g_war_where[k] = s;
+        }
+    }
+    if (!g_war_where[0] || !g_war_where[1]) {
+        g_war_where[0] = NULL;
+        if (g_cfg.country_parallel_war) eb_log("country: war refresh texts not found - parallel war refresh off");
+    }
+    if (g_cfg.country_parallel_refresh || g_cfg.country_parallel_war) {
         SYSTEM_INFO si; GetSystemInfo(&si);
         int nw = (int)si.dwNumberOfProcessors - 1;
         if (nw > MAXWORKERS) nw = MAXWORKERS;
@@ -454,9 +627,10 @@ int eb_country_install(void) {
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("country: MinHook init failed"); return 0; }
     for (int i = 0; i < nt_; i++) {
-        if ((t[i].rva == RVA_OPCACHE || t[i].rva == RVA_MSG) && !g_cfg.country_parallel_refresh) continue;
+        if ((t[i].rva == RVA_OPCACHE || t[i].rva == RVA_MSG) && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) continue;
         // timing-only hooks: not needed to play
         if ((t[i].rva == RVA_DAILY || t[i].rva == RVA_CM || t[i].rva == RVA_UCB) && !g_cfg.country_stats) continue;
+        if (t[i].rva == RVA_WARREF && !g_cfg.country_stats && !g_cfg.country_parallel_war) continue;
         if (MH_CreateHook(b + t[i].rva, t[i].hook, t[i].orig) != MH_OK || MH_EnableHook(b + t[i].rva) != MH_OK) {
             eb_log("country: hook %s failed", t[i].name);
             return 0;
@@ -469,6 +643,10 @@ int eb_country_install(void) {
                g_cfg.country_parallel_refresh == 1 ? "on" : g_cfg.country_parallel_refresh == 2 ? "on + verify" :
                g_cfg.country_parallel_refresh == 3 ? "serial precompute + verify" : "on + race check",
                g_cfg.country_refresh_fixup, g_nworkers);
+    if (g_cfg.country_parallel_war && g_war_where[0])
+        eb_log("country: war refresh (joining or declaring a war) on all cores, mode %d (%s), %d worker threads%s",
+               g_cfg.country_parallel_war, g_cfg.country_parallel_war == 2 ? "on + verify" : "on", g_nworkers,
+               g_cfg.country_test_war_all ? " | TEST: every country that is not dirty, as one war" : "");
     return 1;
 #endif
 }
@@ -484,6 +662,14 @@ void eb_country_report(void) {
     if (g_cfg.country_test_truce_end || g_cfg.country_test_no_defer)
         eb_log("country: TEST truce_end %d no_defer %d: %lld relations set to a truce that has just ended",
                g_cfg.country_test_truce_end, g_cfg.country_test_no_defer, (long long)g_pr_test);
+    if (g_cfg.country_parallel_war)
+        eb_log("country: war refresh: %lld calls, %lld in parallel (%lld participants on all cores, %lld after them in order), %.1f ms in total | verify %lld, mismatches %lld (serial redo %.1f ms)",
+               (long long)g_war_calls, (long long)g_war_par, (long long)g_war_jobs, (long long)g_war_serial, g_war_us / 1000.0,
+               (long long)g_war_ver, (long long)g_war_bad, g_war_ver_us / 1000.0);
+    if (g_war_tests)
+        eb_log("country: TEST war of all countries: %lld runs, %lld participants on all cores (%lld after them in order) in %.1f ms | verify %lld, mismatches %lld, serial redo %.1f ms",
+               (long long)g_war_tests, (long long)g_war_test_jobs, (long long)g_war_test_serial, g_war_test_us / 1000.0,
+               (long long)g_war_test_ver, (long long)g_war_test_bad, g_war_test_ser_us / 1000.0);
     if (g_cfg.country_parallel_refresh && g_cfg.country_refresh_fixup)
         eb_log("country: fixup: %lld calls (%.1f us each), values changed %lld", (long long)g_fix_calls,
                g_fix_calls ? g_fix_us / (double)g_fix_calls : 0.0, (long long)g_fix_changed);
@@ -520,4 +706,7 @@ void eb_country_report(void) {
                (long long)s->hist[0], (long long)s->hist[1], (long long)s->hist[2], (long long)s->hist[3],
                (long long)s->hist[4], (long long)s->hist[5], (long long)s->hist[6]);
     }
+    if (g_st[F_WAR].calls)
+        eb_log("country: war refresh: %lld participants refreshed in %lld calls (%.1f per call)", (long long)g_war_parts,
+               (long long)g_st[F_WAR].calls, (double)g_war_parts / (double)g_st[F_WAR].calls);
 }
