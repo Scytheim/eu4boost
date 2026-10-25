@@ -1,5 +1,6 @@
 // Sending the reports crash.c wrote ([report] upload: -1 = ask once, 0 = never, 1 = send). Kinds: crash,
-// hang, exit (abnormal exit) and slow (at most one a day: crash_reports\last_slow.txt holds its date).
+// hang, exit (abnormal exit), slow (at most one a day: crash_reports\last_slow.txt holds its date) and
+// update (update.c: an auto-update done or failed; only the report text goes, without the PC, logs or mods).
 //
 // A background thread asks once (a Yes/No message box listing what is sent, where to and for how long)
 // and stores the answer in eu4boost.ini. With consent it sends up to 3 pending reports per launch to
@@ -340,7 +341,14 @@ static int build(const wchar_t* dir, const wchar_t* name, buf_t* o, char* title,
     char id[64]; WideCharToMultiByte(CP_UTF8, 0, name, -1, id, sizeof id, NULL, NULL);
     b_str(o, "{\"schema\":1"); j_kvs(o, "id", id, 1); j_kvs(o, "kind", kind, 1); j_kvs(o, "signature", sig, 1);
     char ver[40]; report_version(&rep, ver, sizeof ver);
-    j_kvs(o, "plugin_version", ver, 1); j_kvs(o, "sender_version", EU4BOOST_VERSION, 1); j_kvs(o, "config", cfg, 1);
+    j_kvs(o, "plugin_version", ver, 1); j_kvs(o, "sender_version", EU4BOOST_VERSION, 1);
+    if (!strcmp(kind, "update")) {                            // the versions and the result only
+        j_kv(o, "report", rep.p, rep.n, 1);
+        b_str(o, "}");
+        free(rep.p); free(log.p);
+        return 1;
+    }
+    j_kvs(o, "config", cfg, 1);
     plugins_info(o);
     pc_info(o);
     saves_info(o);
@@ -394,7 +402,8 @@ static int post(const wchar_t* url, const char* body, size_t len, char* resp, si
 static const wchar_t g_ask[] =
     L"eu4boost가 게임 튕김과 느려짐을 고칠 수 있도록 보고를 보내도 될까요?\n\n"
     L"게임이 튕기거나, 멈추거나, 비정상 종료되거나, 눈에 띄게 느려지면(화면이 2초 넘게 멈칫, 저장 창·불러오기 목록이 0.3초 이상, "
-    L"불러오기가 90초 이상) 다음 실행 때 원인 분석 정보를 개발자에게 자동으로 보냅니다. 느려짐 보고는 하루에 한 번까지입니다.\n\n"
+    L"불러오기가 90초 이상) 다음 실행 때 원인 분석 정보를 개발자에게 자동으로 보냅니다. 느려짐 보고는 하루에 한 번까지입니다. "
+    L"자동 업데이트가 되거나 실패하면 버전과 결과만 담은 짧은 보고를 보냅니다.\n\n"
     L"보내는 것: 오류·느려진 위치와 호출 기록, 걸린 시간, 플러그인 설정·로그, 게임 버전·모드 목록, 게임 로그 일부, "
     L"PC 사양(CPU·RAM·그래픽카드·Windows 버전·언어), 세이브 파일 수·크기, plugins 폴더의 파일 목록\n"
     L"보내지 않는 것: 세이브 파일, 메모리 덤프, Windows 사용자 이름·PC 이름(지운 뒤 보냄), 계정 정보\n"
@@ -534,6 +543,22 @@ __declspec(dllexport) int eb_test_report_version(void) {
         if (strcmp(v, t[i].want)) { printf("report version case %d: %s, want %s\n", (int)i, v, t[i].want); bad++; }
         free(b.p);
     }
+    // an update report goes without the PC, the plugin files, the logs and the mods
+    wchar_t d[MAX_PATH], f[MAX_PATH]; _snwprintf(d, MAX_PATH, L"%lstest_update_report\\", g_dir); CreateDirectoryW(d, NULL);
+    const char* ut = "eu4boost crash report\r\nkind: update\r\nsignature: UPDATE_OK\r\nplugin: 9.9.9\r\nresult: ok\r\nfrom: 0.4.6\r\nto: 9.9.9\r\n";
+    _snwprintf(f, MAX_PATH, L"%lsreport.txt", d);
+    HANDLE h = CreateFileW(f, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, ut, (DWORD)strlen(ut), &w, NULL); CloseHandle(h); }
+    _snwprintf(f, MAX_PATH, L"%lseu4boost.log", d);
+    h = CreateFileW(f, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, "[x] config: a=1\r\n", 17, &w, NULL); CloseHandle(h); }
+    buf_t o = {0}; char title[200];
+    int built = build(d, L"20261026_120000_update", &o, title, sizeof title);
+    if (!built || !o.p || !strstr(o.p, "\"kind\":\"update\"") || !strstr(o.p, "\"plugin_version\":\"9.9.9\"") || !strstr(o.p, "\"report\":") ||
+        strstr(o.p, "\"pc\"") || strstr(o.p, "plugin_log") || strstr(o.p, "\"config\"") || strstr(o.p, "dll_sha256") || strstr(o.p, "dlc_load")) {
+        printf("update report payload: %s\n", o.p ? o.p : "(none)"); bad++;
+    }
+    free(o.p); eb_rm_dir(d); RemoveDirectoryW(d);
     printf("report       %s (%d failures)\n", bad ? "FAILED" : "ALL TESTS PASSED", bad);
     return bad;
 }

@@ -53,6 +53,17 @@
 // The guard records every has_construction trigger that holds a great project address and moves those
 // addresses along when the array moves (only a trigger that still has its vtable and the recorded
 // address). Both functions run while the game data is read, not during play.
+//
+// ironman_name ([guard] ironman_name, report 36): EU4dll keeps non-Latin text in its escapes (0x10-0x13
+// followed by two bytes of the UTF-16 code unit, escape_tool.cpp), short-cuts the game's file name
+// sanitizer FUN_141705180 and gives ordinary saves a UTF-8 file name (escapedStrToUtf8 at the call sites
+// of "ファイル名をUTF-8に変換して保存できるようにする"). The ironman save builds its paths with
+// FUN_1405ca070(std::string* out, std::string* name, dir, p4) = "<dir>/<name>.eu4" (also the .tmp, the
+// backups), which EU4dll does not convert: PhysFS takes a path as UTF-8, the escape bytes are no valid
+// UTF-8, Windows refuses the name, and DoLocalIronmanSave (FUN_1405c7ac0) throws "Could not open file:
+// save games/<name>.tmp, error: filename is illegal or insecure" - the game crashes at its first ironman
+// save of a game named in Korean. A name with escape bytes (no file can have one) is decoded the way
+// escapedStrToUtf8 decodes it and passed on in UTF-8; other names (ASCII, already UTF-8) unchanged.
 #include "common.h"
 #include <stdlib.h>
 #include <string.h>
@@ -351,9 +362,60 @@ static int hook(uint8_t* t, const uint8_t* sig, size_t n, void* fn, void** orig,
     return 1;
 }
 
+// ---- ironman save names in EU4dll's escapes ----
+#define RVA_SAVE_PATH 0x5ca070u
+static const uint8_t sig_save_path[16] = { 0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x4c,0x24,0x08,0x55 };
+typedef void* (*save_path_t)(void* out, void* name, void* dir, void* p4);
+static save_path_t o_save_path;
+static volatile LONG g_iname_fixed;
+// EU4dll's convertEscapedTextToWideText + convertWideTextToUtf8 (escape_tool.cpp), quirks included: a byte
+// outside an escape goes through CP1252ToUCS2(char), whose switch never matches a signed char, so it is the
+// sign-extended byte. 0 = the text has no escape byte (or does not fit).
+static size_t iname_utf8(const uint8_t* s, size_t n, char* out, size_t cap) {
+    size_t i = 0;
+    while (i < n && (s[i] < 0x10 || s[i] > 0x13)) i++;
+    if (i == n || n > 1024) return 0;
+    wchar_t w[1024]; size_t k = 0;
+    for (i = 0; i < n;) {
+        uint8_t c = s[i++];
+        uint32_t sp;
+        if (c >= 0x10 && c <= 0x13) {
+            uint8_t lo = i < n ? s[i++] : 0, hi = i < n ? s[i++] : 0;    // EU4dll reads the terminating NUL here
+            sp = (uint32_t)hi << 8 | lo;
+            if (c == 0x11) sp -= 0xE; else if (c == 0x12) sp += 0x900; else if (c == 0x13) sp += 0x8F2;
+        } else sp = (uint16_t)(int16_t)(int8_t)c;
+        if (sp > 0xFFFF || (sp < 0x98F && sp > 0x100)) sp = 0x2026;
+        w[k++] = (wchar_t)sp;
+    }
+    int m = WideCharToMultiByte(CP_UTF8, 0, w, (int)k, out, (int)cap - 1, NULL, NULL);
+    if (m <= 0) return 0;
+    out[m] = 0;
+    return (size_t)m;
+}
+static void* hk_save_path(void* out, void* name, void* dir, void* p4) {
+    const uint64_t* q = (const uint64_t*)name;                         // MSVC std::string: text or pointer, size +0x10, capacity +0x18
+    const uint8_t* s = q[3] > 15 ? (const uint8_t*)q[0] : (const uint8_t*)name;
+    size_t sn = (size_t)q[2];
+    // testing only: the save of the autorun copy gets an ironman name typed in Korean ("eb_시험" as EU4dll writes it)
+    static const uint8_t test_name[] = { 'e', 'b', '_', 0x10, 0xDC, 0xC2, 0x10, 0xD8, 0xD5, 0 };
+    uint64_t tq[4] = { 0, 0, 9, 15 };
+    if (g_cfg.test_ironman_name && sn == 7 && !memcmp(s, "eb_auto", 7)) {
+        memcpy(tq, test_name, sizeof test_name);
+        name = tq; s = test_name; sn = 9;
+        if (!g_cfg.guard_ironman_name) return o_save_path(out, name, dir, p4);
+    }
+    char u[3200];
+    size_t m = iname_utf8(s, sn, u, sizeof u);
+    if (!m) return o_save_path(out, name, dir, p4);
+    uint64_t fake[4] = { (uint64_t)(uintptr_t)u, 0, m, m > 15 ? m : 16 };   // read only by the callee
+    if (InterlockedIncrement(&g_iname_fixed) == 1) eb_log("guard: an ironman save name in EU4dll's escapes is saved under its UTF-8 name (%zu bytes)", m);
+    return o_save_path(out, fake, dir, p4);
+}
+
 int eb_guard_install(void) {
     int want_day_time = g_cfg.online_poll_ms > 0 && g_cfg.online_running_only;
-    if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.guard_great_project && !g_cfg.prov_text_cache && !want_day_time) return 1;
+    if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.guard_great_project && !g_cfg.guard_ironman_name && !g_cfg.test_ironman_name &&
+        !g_cfg.prov_text_cache && !want_day_time) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
 #ifdef EB_TEST
@@ -405,6 +467,15 @@ int eb_guard_install(void) {
     if (g_cfg.guard_relation && hook(rel, srel, sizeof sig_rel, (void*)hk_rel, (void**)&o_rel, "relation")) {
         ok++; eb_log("guard: a missing relation on annexation is skipped instead of crashing");
     }
+#ifndef EB_TEST
+    // EU4dll's plugin64.dll loads after this DLL; without it no name has escape bytes and the hook passes all on
+    if ((g_cfg.guard_ironman_name || g_cfg.test_ironman_name) &&
+        hook(b + RVA_SAVE_PATH, sig_save_path, sizeof sig_save_path, (void*)hk_save_path, (void**)&o_save_path, "ironman save name")) {
+        if (g_cfg.guard_ironman_name) { ok++; eb_log("guard: ironman save names in EU4dll's escapes are saved in UTF-8 like ordinary saves"); }
+        if (g_cfg.test_ironman_name) eb_log("guard: TEST the ironman save of eb_auto is named \"eb_\" + Korean in EU4dll's escapes%s",
+                                            g_cfg.guard_ironman_name ? "" : " (without the fix)");
+    }
+#endif
     if (g_cfg.guard_great_project && g_gp_mgr && g_hc_vt && probe_init()) {
         InitializeCriticalSection(&g_gp_cs);
         // both or neither: the trigger reads are recorded only for the array moves
@@ -416,6 +487,54 @@ int eb_guard_install(void) {
     }
     return ok;
 }
+
+#ifdef EB_TEST
+#include <stdio.h>
+// EU4dll's convertWideTextToEscapedText (escape_tool.cpp) for one UTF-16 code unit
+static size_t eu4dll_escape(wchar_t cp, uint8_t* o) {
+    static const uint8_t sp[] = { 0xA4,0xA3,0xA7,0x24,0x5B,0x00,0x5C,0x20,0x0D,0x0A,0x22,0x7B,0x7D,0x40,0x80,0x7E,0x2F,0x5F,0xBD,0x3B,0x5D,
+                                  0x3D,0x23,0x3F,0x3A,0x3C,0x3E,0x2A,0x7C };
+    if (cp > 0x100 && cp < 0xA00) cp = (wchar_t)(cp + 0xE000);
+    uint8_t hi = (uint8_t)(cp >> 8), lo = (uint8_t)cp, e = 0x10;
+    if (!hi) { o[0] = lo; return 1; }
+    if (memchr(sp, hi, sizeof sp)) e += 2;
+    if (memchr(sp, lo, sizeof sp)) e++;
+    if (e == 0x11 || e == 0x13) lo = (uint8_t)(lo + 14);
+    if (e == 0x12 || e == 0x13) hi = (uint8_t)(hi - 9);
+    o[0] = e; o[1] = lo; o[2] = hi;
+    return 3;
+}
+__declspec(dllexport) int eb_test_ironman_name(void) {
+    int bad = 0;
+    uint8_t e[64]; char u[256], want[256];
+    for (wchar_t cp = 0xAC00; cp <= 0xD7A3; cp++) {                      // every Hangul syllable, between ASCII
+        size_t n = 0;
+        e[n++] = 'a'; n += eu4dll_escape(cp, e + n); e[n++] = 'b';
+        wchar_t w[3] = { L'a', cp, L'b' };
+        int wn = WideCharToMultiByte(CP_UTF8, 0, w, 3, want, sizeof want, NULL, NULL);
+        size_t m = iname_utf8(e, n, u, sizeof u);
+        if (m != (size_t)wn || memcmp(u, want, m)) { if (bad < 5) printf("ironman name: U+%04X wrong\n", (unsigned)cp); bad++; }
+    }
+    const wchar_t* names[] = { L"\uC624\uC2A4\uB9CC \uC81C\uAD6D 1444", L"\u5927\u548C", L"\u3042\u3044\u3046" };   // 오스만 제국 1444, 大和, あいう
+    for (size_t k = 0; k < sizeof names / sizeof names[0]; k++) {
+        size_t n = 0;
+        for (const wchar_t* p = names[k]; *p; p++) n += eu4dll_escape(*p, e + n);
+        int wn = WideCharToMultiByte(CP_UTF8, 0, names[k], -1, want, sizeof want, NULL, NULL) - 1;
+        size_t m = iname_utf8(e, n, u, sizeof u);
+        if (m != (size_t)wn || memcmp(u, want, m)) { printf("ironman name %d wrong\n", (int)k); bad++; }
+    }
+    // report 36's name (the bytes of its error.log line) and names that stay as they are
+    const uint8_t r36[] = { 0x11, '2', 0xC6, 0x11, 0xB2, 0xC2, 0x10, 0xCC, 0xB9 };
+    wchar_t w36[3] = { 0xC624, 0xC2A4, 0xB9CC };                         // 오스만
+    int wn = WideCharToMultiByte(CP_UTF8, 0, w36, 3, want, sizeof want, NULL, NULL);
+    size_t m = iname_utf8(r36, sizeof r36, u, sizeof u);
+    if (m != (size_t)wn || memcmp(u, want, m)) { printf("ironman name: report 36 wrong\n"); bad++; }
+    bad += iname_utf8((const uint8_t*)"Ottomans 1444", 13, u, sizeof u) != 0;
+    bad += iname_utf8((const uint8_t*)"\xEC\x98\xA4\xEC\x8A\xA4", 6, u, sizeof u) != 0;          // UTF-8 already
+    printf("ironman name %s (%d failures)\n", bad ? "FAILED" : "ALL TESTS PASSED", bad);
+    return bad;
+}
+#endif
 
 void eb_guard_report(void) {
     if (g_ptc_ret) ptc_report();

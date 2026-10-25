@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.6"
+#define EU4BOOST_VERSION "0.4.7"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -90,6 +90,8 @@ typedef struct {
     int guard_tooltip;            // 1 = modifier tooltips skip freed/invalid source containers
     int guard_relation;           // 1 = a missing relation on annexation is skipped instead of crashing
     int guard_great_project;      // 1 = has_construction triggers that name a great project follow the array when it moves
+    int guard_ironman_name;       // 1 = an ironman save name in EU4dll's escapes gets the UTF-8 file name ordinary saves get
+    int test_ironman_name;        // testing only ([test] ironman_name=1): the ironman save of eb_auto is named "eb_시험" in EU4dll's escapes
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
     int mem_sites;                // memdiag.c: keep the call sites of 1 in N allocations (0 = off; needs the allocator)
@@ -202,6 +204,8 @@ void eb_crash_exit(void);
 void eb_report_start(void);
 void eb_update_start(void);            // update.c
 void eb_rm_dir(const wchar_t* dir);    // a folder with files only
+int  eb_pending_report(const wchar_t* kind, const char* text);   // crash.c: pending\<now>_<kind>\report.txt (sent by report.c)
+extern char eb_prev_version[40];       // crash.c: the plugin version of the previous session (session.txt), "" if unknown
 extern volatile LONG eb_wer_done;    // crash.c: 0 while an abnormal-exit report waits for Windows' crash record
 extern volatile int eb_loading;        // uitime.c: a save is being loaded or a new game set up
 void eb_slow_event(const char* what, double ms, double limit_ms, const char* detail);

@@ -2,7 +2,9 @@
 //
 // The plugin POSTs a JSON report (src/report.c, schema 1) to /report. This Worker checks it, removes
 // Windows profile paths once more and files it as an issue in a private GitHub repository: a new
-// issue per signature and plugin version, a comment for every repeat. The GitHub token lives only
+// issue per signature and plugin version, a comment for every repeat. Update reports (kind "update",
+// auto-update done or failed) carry only the report text: their issue says how to count them (comments
+// + 1) and every repeat is a short comment. The GitHub token lives only
 // here, as the encrypted secret GITHUB_TOKEN (fine-grained token: Issues read and write on that one
 // repository); the plugin never sees it. Nothing is stored here and IP addresses are not kept.
 //
@@ -13,7 +15,8 @@
 const MAX_BODY = 256 * 1024;          // the plugin sends ~100-200 KB at most
 const MAX_FIELD = 128 * 1024;
 const GH_LIMIT = 60000;               // GitHub allows 65536 characters per issue body or comment
-const KINDS = { crash: '크래시', hang: '멈춤', exit: '비정상 종료', slow: '느림' };
+const KINDS = { crash: '크래시', hang: '멈춤', exit: '비정상 종료', slow: '느림', update: '업데이트' };
+const MAX_REPEATS = { update: 2000 };  // comments on one issue (others: 200)
 
 export default {
   async fetch(request, env) {
@@ -35,12 +38,14 @@ export default {
     try {
       const gh = github(env);
       const old = await findIssue(gh, env.REPO, title);
+      const upd = r.kind === 'update';
       if (old) {
-        if (old.comments < 200) await gh('POST', `/repos/${env.REPO}/issues/${old.number}/comments`, { body: repeatBody(r) });
+        if (old.comments < (MAX_REPEATS[r.kind] || 200))
+          await gh('POST', `/repos/${env.REPO}/issues/${old.number}/comments`, { body: upd ? updateRepeat(r) : repeatBody(r) });
         return reply({ ok: true, issue: old.number, repeat: true });
       }
-      const issue = await gh('POST', `/repos/${env.REPO}/issues`, { title, body: issueBody(r) });
-      for (const body of logComments(r)) await gh('POST', `/repos/${env.REPO}/issues/${issue.number}/comments`, { body });
+      const issue = await gh('POST', `/repos/${env.REPO}/issues`, { title, body: upd ? updateBody(r) : issueBody(r) });
+      if (!upd) for (const body of logComments(r)) await gh('POST', `/repos/${env.REPO}/issues/${issue.number}/comments`, { body });
       return reply({ ok: true, issue: issue.number, repeat: false });
     } catch (e) {
       return reply({ ok: false, error: 'github ' + (e && e.message) }, 502);
@@ -130,6 +135,19 @@ function issueBody(r) {
 }
 function repeatBody(r) {
   return head(`### 다시 발생\n${summary(r)}\n\n` + fence(head(r.report, 40000)), GH_LIMIT);
+}
+function updateBody(r) {
+  return head([
+    `**종류:** ${KINDS[r.kind]} · **플러그인:** ${oneLine(r.plugin_version)} · **보고 ID:** ${oneLine(r.id)}`,
+    `**서명:** \`${oneLine(r.signature)}\``,
+    '같은 결과의 업데이트 보고는 이 이슈에 댓글로 하나씩 붙습니다(보고 수 = 댓글 수 + 1).',
+    '',
+    '### 보고서',
+    fence(head(r.report, 4000)),
+  ].join('\n'), GH_LIMIT);
+}
+function updateRepeat(r) {
+  return head(`**보고 ID:** ${oneLine(r.id)}\n` + fence(head(r.report, 4000)), GH_LIMIT);
 }
 function logComments(r) {
   const out = [];

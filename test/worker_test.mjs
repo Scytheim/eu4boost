@@ -49,6 +49,20 @@ ok(j.ok && !/abc123|SECRET9|987654|hunter2|"tok/.test(exitText), 'account ids, t
 r = await post({ ...sample, kind: 'slow', signature: 'SLOW stall eu4.exe+0x75d690', saves: '140 files, 900.0 MB (largest 40.0 MB)' }, '9.9.9.7'); j = await r.json();
 const slowIssue = issues.find((i) => i.number === j.issue);
 ok(j.ok && slowIssue && slowIssue.title.startsWith('[느림] ') && slowIssue.body.includes('**세이브:** 140 files'), 'slow report -> [느림] issue with the save count');
+const upd = { schema: 1, id: '20261026_120000_update', kind: 'update', signature: 'UPDATE_OK', plugin_version: '0.4.7', sender_version: '0.4.7',
+              report: 'eu4boost crash report\r\nkind: update\r\nsignature: UPDATE_OK\r\nplugin: 0.4.7\r\nresult: ok\r\nfrom: 0.4.6\r\nto: 0.4.7\r\n' };
+const nBefore = calls.length;
+r = await post(upd, '9.9.9.6'); j = await r.json();
+const updIssue = issues.find((i) => i.number === j.issue);
+ok(j.ok && !j.repeat && updIssue && updIssue.title === '[업데이트] UPDATE_OK · 0.4.7' && updIssue.body.includes('댓글 수 + 1') &&
+   !updIssue.body.includes('**PC:**'), 'update report -> [업데이트] issue, no PC line: ' + (updIssue && updIssue.title));
+ok(calls.slice(nBefore).filter((c) => c.method === 'POST' && /comments$/.test(c.path)).length === 0, 'update report: no log comments');
+r = await post({ ...upd, id: '20261026_130000_update', report: upd.report.replace('from: 0.4.6', 'from: 0.4.5') }, '9.9.9.5'); j = await r.json();
+const updComment = calls[calls.length - 1];
+ok(j.ok && j.repeat && j.issue === updIssue.number && updIssue.comments === 1 && updComment.body.body.length < 600 &&
+   updComment.body.body.includes('from: 0.4.5'), 'second update report -> one short comment');
+r = await post({ ...upd, signature: 'UPDATE_FAILED rename (error 5)', plugin_version: '0.4.6' }, '9.9.9.4'); j = await r.json();
+ok(j.ok && issues.find((i) => i.number === j.issue).title === '[업데이트] UPDATE_FAILED rename (error 5) · 0.4.6', 'failed update -> its own issue');
 ok((await post('{bad', '2.2.2.2')).status === 400, 'bad JSON refused');
 ok((await post({ ...sample, schema: 2 }, '2.2.2.3')).status === 400, 'wrong schema refused');
 ok((await post({ ...sample, report: 'x' }, '2.2.2.4')).status === 400, 'report text without its header refused');

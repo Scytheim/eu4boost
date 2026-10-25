@@ -616,6 +616,9 @@ int main(int argc, char** argv) {
         int (*tr)(void) = (int (*)(void))GetProcAddress(h, "eb_test_report_version");  // report.c: the version an issue is filed under
         CHECK(tr != NULL);
         if (tr) { int d = tr(); CHECK(d == 0); }
+        int (*ti)(void) = (int (*)(void))GetProcAddress(h, "eb_test_ironman_name");    // guard.c: EU4dll-escaped ironman names to UTF-8
+        CHECK(ti != NULL);
+        if (ti) { int d = ti(); CHECK(d == 0); }
     }
 
     // 3h. modifier-container add (fast path vs the game's algorithm)

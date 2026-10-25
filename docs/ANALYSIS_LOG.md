@@ -914,5 +914,23 @@
 ## 2026-10-25 0.4.6 배포
 
 - **배포**: 로컬 6cd476e, 공개 커밋 8bf8305(de768bf 위, 트리 같음), 태그 0.4.6, GitHub 릴리스 0.4.6(설명 비움) = eu4boost_v0.4.6.zip 하나(86e6e565…, 안의 DLL 8d31a5c9…, zip 주석 서명 확인 OK). 릴리스에서 다시 받은 zip 해시 같음.
-- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `benchutounsel046`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1 + test.warview=60): 모든 기능 설치(AE 실험의 전쟁 창 경로 포함), 저장 10번 나라 검사 16,680번 실패 0, 전쟁 화면 196번 게임 8,174ms → 3,582ms 차이 0, 정상 종료(state=exit), 보낼 보고 없음, 사용자 세이브 그대로.
+- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `benchuto
+uns
+el046`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1 + test.warview=60): 모든 기능 설치(AE 실험의 전쟁 창 경로 포함), 저장 10번 나라 검사 16,680번 실패 0, 전쟁 화면 196번 게임 8,174ms → 3,582ms 차이 0, 정상 종료(state=exit), 보낼 보고 없음, 사용자 세이브 그대로.
 - 시험 뒤: 게임 폴더에 0.4.6 배포 DLL(8d31a5c9)·플레이 ini(0.4.6 배포 ini + report.upload=1, ab_test=0, auto=1).
+
+## 2026-10-25 자동 업데이트가 되는지 확인: 업데이트 결과 보고
+
+- **질문**(사용자): 0.4.6 다운로드 35번이 0.4.2(139번)의 4분의 1인데 업데이트가 잘 되는가. GitHub 다운로드 수는 자동 업데이트와 직접 받기를 나눌 수 없다(같은 browser_download_url). 저장소 방문 통계(14일): 0.4.2 릴리스 페이지 90번(80명), 0.4.1 19번, 0.4.3 3번, 0.4.4~0.4.6은 상위 10개 밖 → 0.4.3 이후는 대부분 자동 업데이트.
+- **보고에서 본 업데이트 흔적**(세션 버전 vs 보낸 DLL): 13600K 0.4.2 → 0.4.4(32번), Ryzen 2600 0.4.2 → 0.4.3(26·31번), Ultra 5 225F 0.4.2 → 0.4.4(33번), 10400F 0.4.3 → 0.4.4(35번), 0.4.6 세션 보고(36번, 공개 3시간 뒤). 반면 0.4.1 DLL(d795c998)의 보고가 10-25에도 3대(30·34·37번): 0.4.1에는 자동 업데이트가 없어 직접 받아야 한다 - 다운로드 수 차이의 대부분.
+- **업데이트 결과 보고**(update.c, report.c, crash.c, Worker): 업데이터가 최신 릴리스까지 간 시도의 결과를 `crash_reports\update.txt`에 남긴다(ok, 또는 실패 이유: no zip, download (HTTP n), rejected, write/rename/place (error n)). 다음 실행이 짧은 보고 하나로 만든다: 이 DLL이 이전 것을 바꿨으면(eu4boost.dll.old를 지움) UPDATE_OK(이전 버전 = update.txt, 없으면 이전 세션 session.txt의 version=), 실패는 UPDATE_FAILED <이유> 한 번(같은 버전·대상·이유는 다시 안 보냄, reported=1), 받았는데 옛 DLL이 다시 돌면 UPDATE_FAILED not loaded. `[report] upload=1`일 때만 보내고 내용은 보고 글뿐(PC·로그·모드·설정·DLL 해시 없음, 접근 거부 진단용으로 게임 폴더가 Program Files 안인지만). crash.c의 이전 세션 확인은 _update 폴더를 그 세션의 보고로 보지 않는다(비정상 종료 보고가 빠지지 않게). Worker: kind update = [업데이트], 이슈 하나에 같은 결과를 댓글로(최대 2000), 로그 댓글 없음. 0.4.6 → 0.4.7 성공부터 보이고, 실패 보고는 0.4.7이 0.4.8을 받을 때부터(실패하는 쪽 DLL에 코드가 있어야 함). 0.4.1 이하는 보내지 않는다.
+- **시험**: 하네스(update.txt 읽기·쓰기, 보고 종류 9가지, Program Files 판정, 업데이트 보고 JSON에 pc·로그·설정 없음) 통과, Worker 시험 4개 추가 통과. 실제 게임(run.sh, 새 KEEP=1 = plugins 폴더를 지난 실행 그대로): 127.0.0.1 가짜 릴리스·보고 서버 + 진짜 키로 서명한 9.9.9 시험판(시험 뒤 삭제). 성공: 1번째 실행 0.4.6이 9.9.9를 받아 설치 → 2번째 실행 9.9.9가 "UPDATE_OK, from 0.4.6, to 9.9.9, 받은 시각, 처음 실행 시각"을 16초 만에 보냄(키 7개뿐). 실패: 서명이 틀린 zip으로 3번 실행 → REJECTED 보고는 2번째 실행에서 한 번만, 3번째는 안 보냄.
+- run.sh 끝의 crash_reports는 옮기지 않고 복사, restore.sh는 eu4boost.dll.old/.new도 지움(시험 .old가 남으면 사용자 게임이 업데이트 보고를 보내므로).
+
+## 2026-10-25 보고 36번(0.4.6 첫 크래시) 검토
+
+- **보고**: 0.4.6 세션(자동 업데이트 뒤 첫 실행, 기본 게임 + 한글 글꼴 모드, EU4dll), 메인 스레드 C++ 예외 0xe06d7363, 실행 102초, 1444.11.11. 스택: 인게임 루프 FUN_14081af10 → FUN_1405cc160 → FUN_1405cc6e0(철인모드 저장, "Game state not ironman, shouldn't happen.") → FUN_1405cbde0 → FUN_1405c7ac0(DoLocalIronmanSave, eu4savegamehelper.cpp)의 catch 블록이 다시 던짐.
+- **원인**(error.log 마지막 줄): `virtualfilesystem_physfs.cpp:1252: Could not open file: save games/<이름>.tmp, error: filename is illegal or insecure` → `eu4savegamehelper.cpp:491: Unknown exception in DoLocalIronmanSave`. 저장 이름이 EU4dll의 다국어 표기(0x10/0x11 + 2바이트)로 된 한글이라 PhysFS가 쓰기용으로 열기를 거부(FUN_141718300 모드 1 = PHYSFS_openWrite 실패) → 게임이 일부러 예외를 던져 튕김. 바로 앞 ConvertUTF.cpp:555 "Failed conversion of utf8 string"도 같은 이름. 플러그인 코드는 이 경로에 없고 세이브 파일을 열어 두지도 않음(savelist.c는 목록 항목의 게임 스트림만 쓰고, savezip/savepar는 열린 뒤의 쓰기만). 플러그인 무관, 우회: 철인모드 저장 이름을 영문으로.
+- **수정**(`[guard] ironman_name`, 기본 1, guard.c): EU4dll(공개 소스 escape_tool.cpp, file_save.cpp)은 일반 저장 이름을 escapedStrToUtf8(convertEscapedTextToWideText + UTF-8)로 바꾸는 패치를 세 곳(0x8d1383, 0x8d14e7, 0x117515c)에 넣고 게임의 파일 이름 정리 FUN_141705180을 건너뛰게 한다(0x1705180). 철인모드 저장 경로는 FUN_1405ca070(out, name, dir, p4) = "<dir>/<name>.eu4"(.tmp·백업도 이것)이 만들고 EU4dll이 바꾸지 않는다: PhysFS가 경로를 UTF-8로 받아 UTF-16으로 바꿀 때 특수 바이트가 깨져 Windows가 이름을 거부(ERROR_INVALID_NAME → "filename is illegal or insecure"). FUN_1405ca070을 후킹해 이름에 0x10~0x13이 있으면(그런 파일은 있을 수 없음) EU4dll과 똑같이(밖의 바이트는 부호 확장되는 CP1252ToUCS2 버릇까지) 풀어 UTF-8로 넘긴다. 그 외 이름(ASCII, 이미 UTF-8)은 그대로. plugin64.dll은 이 DLL 뒤에 로드되므로 조건 없이 설치(EU4dll이 없으면 바꿀 이름이 없음).
+- **시험**: 하네스 - EU4dll의 변환기(convertWideTextToEscapedText)를 옮겨 한글 음절 11,172자, 오스만 제국 1444·大和·あいう, 36번 보고의 바이트(= "오스만")가 모두 EU4dll 결과와 같음, ASCII·UTF-8 이름은 손대지 않음. 실제 게임(시험용 `[test] ironman_name=1`: eb_auto의 철인모드 저장 이름을 EU4dll식 "eb_시험"으로 바꿔 넣음, late 1874.07 → 1875.01): 수정 끔 = 불러온 직후 첫 철인모드 저장에서 36번과 같은 서명(CPP_EXCEPTION eu4.exe+0x1a38c5c, 스택 0x5c8b17 ← 0x5cbe3a)으로 크래시, 수정 켬 = 정상 종료, save games에 "eb_시험.eu4"(UTF-8 이름)가 생김.
+- Worker 확인(이슈를 만들지 않는 요청): 새 코드가 kind update를 받음("report" 단계에서만 거부), 모르는 kind는 여전히 "kind"로 거부.

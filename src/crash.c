@@ -429,6 +429,13 @@ static void new_dir(wchar_t* out, const wchar_t* stamp, const wchar_t* kind) {  
     _snwprintf(out, MAX_PATH, L"%lspending\\%ls_%ls\\", eb_rep_dir, stamp, kind);
     CreateDirectoryW(out, NULL);
 }
+int eb_pending_report(const wchar_t* kind, const char* text) {
+    if (!g_cfg.report_capture) return 0;
+    wchar_t stamp[20], dir[MAX_PATH]; s_stamp(stamp, 20);
+    new_dir(dir, stamp, kind);
+    return write_file(dir, L"report.txt", text, (int)strlen(text));
+}
+char eb_prev_version[40];
 static char g_session_extra[160];          // one more line for session.txt (how the process ended)
 static void set_session(const char* state) {
     char t[320]; sb_t b = { t, 0, sizeof t };
@@ -911,6 +918,10 @@ static void check_previous(void) {
     HANDLE h = CreateFileW(g_session, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return;                      // first run with reports
     DWORD rd = 0; ReadFile(h, t, sizeof t - 1, &rd, NULL); CloseHandle(h);
+    const char* pv = strstr(t, "version=");
+    for (int i = 0; pv && i < (int)sizeof eb_prev_version - 1 && pv[8 + i] && pv[8 + i] != '\r' && pv[8 + i] != '\n'; i++) {
+        eb_prev_version[i] = pv[8 + i]; eb_prev_version[i + 1] = 0;
+    }
     int clean = !strncmp(t, "state=exit", 10);
     const char* q = strstr(t, "pid=");
     DWORD pid = q ? (DWORD)strtoul(q + 4, NULL, 10) : 0;
@@ -942,6 +953,7 @@ static void check_previous(void) {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.' || wcsncmp(fd.cFileName, prev, 15) < 0) continue;
             wchar_t d[MAX_PATH], u[MAX_PATH]; _snwprintf(d, MAX_PATH, L"%lspending\\%ls\\", eb_rep_dir, fd.cFileName);
             size_t nl = wcslen(fd.cFileName);
+            if (nl > 7 && !wcscmp(fd.cFileName + nl - 7, L"_update")) continue;   // update.c's, not about how it ended
             if (nl > 5 && !wcscmp(fd.cFileName + nl - 5, L"_slow")) {
                 finalize_slow(d, log_of_session(L"eu4boost_prev.log", fd.cFileName) ? L"eu4boost_prev.log" : NULL, g_prev_mods);
                 attach_game_logs(d); continue;

@@ -13,10 +13,17 @@
 // A loaded DLL cannot be overwritten but can be renamed: eu4boost.dll becomes eu4boost.dll.old and the new
 // file takes its name, so the next launch loads it; the launch after that deletes the .old file. eu4boost.ini
 // is never touched. Development builds (a version with '-') do not update unless a test url is set.
+//
+// Update reports (with [report] upload=1, sent by report.c like the others, kind "update"): the updater
+// notes how an attempt that reached a newer release ended in crash_reports\update.txt (ok, or failed and
+// why). The next launch turns it into one short report: UPDATE_OK when this DLL replaced an older one,
+// UPDATE_FAILED <reason> once per failure (the same failure again is not reported again). A report holds
+// the versions, the result, the reason and the times, nothing about the PC (no PC specs, logs or mods).
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <wctype.h>
 #include <winhttp.h>
 #include <bcrypt.h>
 
@@ -183,6 +190,95 @@ static int is_dll64(const uint8_t* b, size_t n) {
     return fh->Machine == IMAGE_FILE_MACHINE_AMD64 && (fh->Characteristics & IMAGE_FILE_DLL);
 }
 
+// ---- the note for the update report (crash_reports\update.txt) ----
+typedef struct { char result[8], from[40], to[40], reason[80], detail[200], time[24]; int reported; } note_t;
+static void note_path(wchar_t* p) { _snwprintf(p, MAX_PATH, L"%lsupdate.txt", eb_rep_dir); }
+static void note_kv(const char* t, const char* key, char* out, size_t n) {    // "key=value" at a line start
+    size_t kl = strlen(key);
+    out[0] = 0;
+    for (const char* p = t; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL)
+        if (!strncmp(p, key, kl) && p[kl] == '=') {
+            size_t i = 0;
+            for (p += kl + 1; *p && *p != '\r' && *p != '\n' && i < n - 1; p++) out[i++] = *p;
+            out[i] = 0;
+            return;
+        }
+}
+static int note_parse(const char* t, note_t* u) {
+    char r[8];
+    memset(u, 0, sizeof *u);
+    note_kv(t, "result", u->result, sizeof u->result); note_kv(t, "from", u->from, sizeof u->from);
+    note_kv(t, "to", u->to, sizeof u->to); note_kv(t, "reason", u->reason, sizeof u->reason);
+    note_kv(t, "detail", u->detail, sizeof u->detail); note_kv(t, "time", u->time, sizeof u->time);
+    note_kv(t, "reported", r, sizeof r); u->reported = r[0] == '1';
+    return !strcmp(u->result, "ok") || !strcmp(u->result, "failed");
+}
+static int note_text(const note_t* u, char* out, size_t n) {
+    return snprintf(out, n, "result=%s\r\nfrom=%s\r\nto=%s\r\nreason=%s\r\ndetail=%s\r\ntime=%s\r\nreported=%d\r\n",
+                    u->result, u->from, u->to, u->reason, u->detail, u->time, u->reported);
+}
+static int note_read(note_t* u) {
+    wchar_t p[MAX_PATH]; note_path(p);
+    char t[1024] = {0};
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) { memset(u, 0, sizeof *u); return 0; }
+    DWORD rd = 0; ReadFile(h, t, sizeof t - 1, &rd, NULL); CloseHandle(h);
+    return note_parse(t, u);
+}
+static void note_save(const note_t* u) {
+    wchar_t p[MAX_PATH]; note_path(p);
+    char t[1024]; int n = note_text(u, t, sizeof t);
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, t, (DWORD)n, &w, NULL); CloseHandle(h); }
+}
+static void now_text(char* out, size_t n) {
+    SYSTEMTIME s; GetLocalTime(&s);
+    snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d", s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond);
+}
+// how this attempt ended; a failure noted and reported before (the same version, target and reason) stays reported
+static void note(const char* result, const char* to, const char* reason, const char* detail) {
+    note_t u, o;
+    memset(&u, 0, sizeof u);
+    snprintf(u.result, sizeof u.result, "%s", result); snprintf(u.from, sizeof u.from, "%s", EU4BOOST_VERSION);
+    snprintf(u.to, sizeof u.to, "%s", to); snprintf(u.reason, sizeof u.reason, "%s", reason);
+    snprintf(u.detail, sizeof u.detail, "%s", detail); now_text(u.time, sizeof u.time);
+    if (!strcmp(result, "failed") && note_read(&o) && o.reported && !strcmp(o.result, "failed") && !strcmp(o.from, u.from) &&
+        !strcmp(o.to, u.to) && !strcmp(o.reason, u.reason)) u.reported = 1;
+    note_save(&u);
+}
+// The report of this launch: 1 = UPDATE_OK (replaced: an older DLL was replaced by this one; from = the
+// note's version, else the previous session's), 2 = UPDATE_FAILED (a failure of this version not reported
+// yet), 0 = nothing. in_pf: the game folder is under Program Files (writing there needs rights).
+static int update_report(const note_t* u, int have, int replaced, const char* prev, int in_pf, char* out, size_t n) {
+    int ok = have && !strcmp(u->result, "ok");
+    if (replaced || (ok && !strcmp(u->to, EU4BOOST_VERSION))) {
+        const char* from = ok && u->from[0] ? u->from : prev && prev[0] && strcmp(prev, EU4BOOST_VERSION) ? prev : "unknown";
+        char now[24]; now_text(now, sizeof now);
+        snprintf(out, n, "eu4boost crash report\r\nkind: update\r\nsignature: UPDATE_OK\r\nplugin: %s\r\nresult: ok\r\nfrom: %s\r\nto: %s\r\n"
+                 "downloaded: %s\r\nfirst launch: %s\r\n", EU4BOOST_VERSION, from, EU4BOOST_VERSION, ok ? u->time : "(before update reports)", now);
+        return 1;
+    }
+    if (ok && !strcmp(u->from, EU4BOOST_VERSION)) {
+        snprintf(out, n, "eu4boost crash report\r\nkind: update\r\nsignature: UPDATE_FAILED not loaded\r\nplugin: %s\r\nresult: failed\r\n"
+                 "from: %s\r\nto: %s\r\nreason: not loaded\r\ndetail: %s was put in place at %s, but this launch runs %s again\r\n%s",
+                 EU4BOOST_VERSION, u->from, u->to, u->to, u->time, EU4BOOST_VERSION, in_pf ? "game folder: under Program Files\r\n" : "");
+        return 2;
+    }
+    if (have && !strcmp(u->result, "failed") && !u->reported && !strcmp(u->from, EU4BOOST_VERSION)) {
+        snprintf(out, n, "eu4boost crash report\r\nkind: update\r\nsignature: UPDATE_FAILED %s\r\nplugin: %s\r\nresult: failed\r\nfrom: %s\r\nto: %s\r\n"
+                 "reason: %s\r\ndetail: %s\r\nwhen: %s\r\n%s", u->reason, EU4BOOST_VERSION, u->from, u->to, u->reason, u->detail, u->time,
+                 in_pf ? "game folder: under Program Files\r\n" : "");
+        return 2;
+    }
+    return 0;
+}
+static int in_program_files(const wchar_t* dll) {
+    wchar_t lo[MAX_PATH]; size_t i = 0;
+    for (; dll[i] && i < MAX_PATH - 1; i++) lo[i] = (wchar_t)towlower(dll[i]);
+    lo[i] = 0;
+    return wcsstr(lo, L"\\program files") != NULL;
+}
+
 // ---- the update ----
 static void self_paths(wchar_t* dll, wchar_t* old, wchar_t* neu) {
     GetModuleFileNameW(g_self, dll, MAX_PATH);
@@ -202,14 +298,20 @@ static DWORD WINAPI updater(LPVOID unused) {
     snprintf(name, sizeof name, "eu4boost_v%s.zip", tag);
     int have = asset_url(j, name, zu, sizeof zu);
     free(j);
-    if (!have) { eb_log("update: %s has no %s - not updated", tag, name); return 0; }
+    if (!have) { eb_log("update: %s has no %s - not updated", tag, name); note("failed", tag, "no zip", "the release has no zip"); return 0; }
     wchar_t wz[1024]; MultiByteToWideChar(CP_UTF8, 0, zu, -1, wz, 1024);
     size_t zn; int zst;
     uint8_t* z = http_get(wz, 16u << 20, &zn, &zst);
-    if (!z) { eb_log("update: %s download failed (HTTP %d) - try again at the next launch", tag, zst); return 0; }
+    if (!z) {
+        eb_log("update: %s download failed (HTTP %d) - try again at the next launch", tag, zst);
+        char why[40]; snprintf(why, sizeof why, "download (HTTP %d)", zst);
+        note("failed", tag, why, "the zip did not download");
+        return 0;
+    }
     const uint8_t* d = NULL; size_t dn = 0; char sig[512];
     if (!zip_dll(z, zn, &d, &dn, sig, sizeof sig) || !is_dll64(d, dn) || !verify(d, dn, sig, tag, g_pub)) {
         eb_log("update: %s REJECTED - the zip, its signature or the DLL in it is not valid; nothing was changed", tag);
+        note("failed", tag, "rejected", "the zip, its signature or the DLL in it is not valid");
         free(z); return 0;
     }
     wchar_t dll[MAX_PATH], old[MAX_PATH], neu[MAX_PATH]; self_paths(dll, old, neu);
@@ -217,23 +319,45 @@ static DWORD WINAPI updater(LPVOID unused) {
     DWORD w = 0; int wrote = h != INVALID_HANDLE_VALUE && WriteFile(h, d, (DWORD)dn, &w, NULL) && w == dn;
     if (h != INVALID_HANDLE_VALUE) { FlushFileBuffers(h); CloseHandle(h); }
     free(z);
-    if (!wrote) { DeleteFileW(neu); eb_log("update: cannot write %ls (error %lu) - not updated", neu, GetLastError()); return 0; }
-    if (!MoveFileExW(dll, old, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(neu); eb_log("update: cannot rename the running DLL (error %lu) - not updated", GetLastError()); return 0; }
+    char why[40];
+    if (!wrote) {
+        DWORD e = GetLastError();
+        DeleteFileW(neu); eb_log("update: cannot write %ls (error %lu) - not updated", neu, e);
+        snprintf(why, sizeof why, "write (error %lu)", e); note("failed", tag, why, "cannot write eu4boost.dll.new");
+        return 0;
+    }
+    if (!MoveFileExW(dll, old, MOVEFILE_REPLACE_EXISTING)) {
+        DWORD e = GetLastError();
+        DeleteFileW(neu); eb_log("update: cannot rename the running DLL (error %lu) - not updated", e);
+        snprintf(why, sizeof why, "rename (error %lu)", e); note("failed", tag, why, "cannot rename the running eu4boost.dll");
+        return 0;
+    }
     if (!MoveFileExW(neu, dll, MOVEFILE_REPLACE_EXISTING)) {
         DWORD e = GetLastError();
         MoveFileExW(old, dll, MOVEFILE_REPLACE_EXISTING);        // put the running one back
         DeleteFileW(neu);
         eb_log("update: cannot put the new DLL in place (error %lu) - not updated", e);
+        snprintf(why, sizeof why, "place (error %lu)", e); note("failed", tag, why, "cannot put the new eu4boost.dll in place");
         return 0;
     }
+    note("ok", tag, "", "");
     eb_log("update: %s downloaded and verified - it is used from the next launch (the old DLL is kept as eu4boost.dll.old until then)", tag);
     return 0;
 }
 
 void eb_update_start(void) {
     wchar_t dll[MAX_PATH], old[MAX_PATH], neu[MAX_PATH]; self_paths(dll, old, neu);
-    if (GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES && DeleteFileW(old)) eb_log("update: running the updated DLL (%s); the previous one was removed", EU4BOOST_VERSION);
+    int replaced = GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES && DeleteFileW(old);
+    if (replaced) eb_log("update: running the updated DLL (%s); the previous one was removed", EU4BOOST_VERSION);
     DeleteFileW(neu);                                          // a download cut short
+    if (g_cfg.report_capture && g_cfg.report_upload != 0) {   // the update report (sent with [report] upload=1)
+        note_t u; int have = note_read(&u);
+        char r[1024]; int k = update_report(&u, have, replaced, eb_prev_version, in_program_files(dll), r, sizeof r);
+        if (k && eb_pending_report(L"update", r)) eb_log("update: %s report written for sending", k == 1 ? "an update" : "a failed-update");
+        wchar_t np[MAX_PATH]; note_path(np);
+        if (k == 2 && !strcmp(u.result, "failed")) { u.reported = 1; note_save(&u); }   // the same failure is not reported again
+        else if (have && (!strcmp(u.result, "ok") || strcmp(u.from, EU4BOOST_VERSION))) DeleteFileW(np);
+    }
     if (!g_cfg.update_auto) { eb_log("update: auto-update off ([update] auto=0)"); return; }
     if (strchr(EU4BOOST_VERSION, '-') && !g_cfg.update_url[0]) { eb_log("update: development build - no auto-update"); return; }
 #ifndef EB_TEST
@@ -293,6 +417,26 @@ __declspec(dllexport) int eb_test_update(void) {
     zb[co + 10] = 8; bad += zip_dll(zb, zp, &zd, &zn, zs, sizeof zs); zb[co + 10] = 0;     // deflated: not read
     bad += zip_dll(zb, zp - 30, &zd, &zn, zs, sizeof zs);       // cut short
     BCryptDestroyKey(k); BCryptCloseAlgorithmProvider(a, 0);
+    // the update report from the note
+    note_t u, w; char rt[1024], nt[1024];
+    memset(&u, 0, sizeof u);
+    strcpy(u.result, "failed"); strcpy(u.from, EU4BOOST_VERSION); strcpy(u.to, "9.9.9"); strcpy(u.reason, "rename (error 5)");
+    strcpy(u.detail, "cannot rename"); strcpy(u.time, "2026-10-26 12:00:00");
+    note_text(&u, nt, sizeof nt);
+    bad += !note_parse(nt, &w) || strcmp(w.reason, u.reason) || strcmp(w.to, "9.9.9") || w.reported;
+    bad += update_report(&w, 1, 0, "0.4.5", 1, rt, sizeof rt) != 2 || !strstr(rt, "\r\nsignature: UPDATE_FAILED rename (error 5)\r\n") ||
+           !strstr(rt, "\r\nplugin: " EU4BOOST_VERSION "\r\n") || !strstr(rt, "Program Files");
+    w.reported = 1; bad += update_report(&w, 1, 0, "0.4.5", 0, rt, sizeof rt) != 0;               // reported once
+    strcpy(w.from, "0.0.1"); w.reported = 0; bad += update_report(&w, 1, 0, "0.4.5", 0, rt, sizeof rt) != 0;   // another version's
+    bad += update_report(&w, 0, 1, "0.4.5", 0, rt, sizeof rt) != 1 || !strstr(rt, "\r\nfrom: 0.4.5\r\nto: " EU4BOOST_VERSION "\r\n");   // no note
+    bad += update_report(&w, 0, 1, "", 0, rt, sizeof rt) != 1 || !strstr(rt, "\r\nfrom: unknown\r\n");
+    strcpy(w.result, "ok"); strcpy(w.from, "0.4.1"); strcpy(w.to, EU4BOOST_VERSION);
+    bad += update_report(&w, 1, 1, "0.4.5", 0, rt, sizeof rt) != 1 || !strstr(rt, "\r\nfrom: 0.4.1\r\n") || !strstr(rt, "\r\nsignature: UPDATE_OK\r\n");
+    bad += update_report(&w, 1, 0, "0.4.5", 0, rt, sizeof rt) != 1;                               // .old already gone
+    strcpy(w.from, EU4BOOST_VERSION); strcpy(w.to, "9.9.9");
+    bad += update_report(&w, 1, 0, "0.4.5", 0, rt, sizeof rt) != 2 || !strstr(rt, "UPDATE_FAILED not loaded");   // still the old one
+    bad += update_report(&w, 0, 0, "0.4.5", 0, rt, sizeof rt) != 0;                               // nothing happened
+    bad += !in_program_files(L"C:\\Program Files (x86)\\Steam\\x\\eu4boost.dll") + in_program_files(L"E:\\Games\\x\\eu4boost.dll");
     eb_log("TEST update: %d wrong answers", bad);
     return bad;
 }
