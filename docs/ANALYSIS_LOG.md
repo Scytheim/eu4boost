@@ -934,3 +934,9 @@ el046`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1 + test.warv
 - **수정**(`[guard] ironman_name`, 기본 1, guard.c): EU4dll(공개 소스 escape_tool.cpp, file_save.cpp)은 일반 저장 이름을 escapedStrToUtf8(convertEscapedTextToWideText + UTF-8)로 바꾸는 패치를 세 곳(0x8d1383, 0x8d14e7, 0x117515c)에 넣고 게임의 파일 이름 정리 FUN_141705180을 건너뛰게 한다(0x1705180). 철인모드 저장 경로는 FUN_1405ca070(out, name, dir, p4) = "<dir>/<name>.eu4"(.tmp·백업도 이것)이 만들고 EU4dll이 바꾸지 않는다: PhysFS가 경로를 UTF-8로 받아 UTF-16으로 바꿀 때 특수 바이트가 깨져 Windows가 이름을 거부(ERROR_INVALID_NAME → "filename is illegal or insecure"). FUN_1405ca070을 후킹해 이름에 0x10~0x13이 있으면(그런 파일은 있을 수 없음) EU4dll과 똑같이(밖의 바이트는 부호 확장되는 CP1252ToUCS2 버릇까지) 풀어 UTF-8로 넘긴다. 그 외 이름(ASCII, 이미 UTF-8)은 그대로. plugin64.dll은 이 DLL 뒤에 로드되므로 조건 없이 설치(EU4dll이 없으면 바꿀 이름이 없음).
 - **시험**: 하네스 - EU4dll의 변환기(convertWideTextToEscapedText)를 옮겨 한글 음절 11,172자, 오스만 제국 1444·大和·あいう, 36번 보고의 바이트(= "오스만")가 모두 EU4dll 결과와 같음, ASCII·UTF-8 이름은 손대지 않음. 실제 게임(시험용 `[test] ironman_name=1`: eb_auto의 철인모드 저장 이름을 EU4dll식 "eb_시험"으로 바꿔 넣음, late 1874.07 → 1875.01): 수정 끔 = 불러온 직후 첫 철인모드 저장에서 36번과 같은 서명(CPP_EXCEPTION eu4.exe+0x1a38c5c, 스택 0x5c8b17 ← 0x5cbe3a)으로 크래시, 수정 켬 = 정상 종료, save games에 "eb_시험.eu4"(UTF-8 이름)가 생김.
 - Worker 확인(이슈를 만들지 않는 요청): 새 코드가 kind update를 받음("report" 단계에서만 거부), 모르는 kind는 여전히 "kind"로 거부.
+
+## 2026-10-25 0.4.7 배포
+
+- **배포**: 로컬 5afb3a2, 공개 커밋 af12c3c(478a76d 위, 트리 같음), 태그 0.4.7, GitHub 릴리스 0.4.7(설명 비움) = eu4boost_v0.4.7.zip 하나(affa3cf6…, 안의 DLL 33e3fa0e…, zip 주석 서명 확인 OK). 릴리스에서 다시 받은 zip 해시 같음.
+- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `benchutounsel047`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1): 모든 기능 설치(ironman_name 포함), 저장 10번 나라 검사 16,680번 실패 0, 정상 종료(state=exit), 보낼 보고 없음, 사용자 세이브 그대로.
+- 시험 뒤: 게임 폴더에 0.4.7 배포 DLL(33e3fa0e)·플레이 ini(0.4.7 배포 ini + report.upload=1, ab_test=0, auto=1).
