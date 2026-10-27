@@ -2,7 +2,7 @@
 //
 // The plugin POSTs a JSON report (src/report.c, schema 1) to /report. This Worker checks it, removes
 // Windows profile paths once more and files it as an issue in a private GitHub repository: a new
-// issue per signature and plugin version, a comment for every repeat. Update reports (kind "update",
+// issue per signature and plugin version, a comment for every repeat (also when GitHub's list lags behind). Update reports (kind "update",
 // auto-update done or failed) carry only the report text: their issue says how to count them (comments
 // + 1) and every repeat is a short comment. The GitHub token lives only
 // here, as the encrypted secret GITHUB_TOKEN (fine-grained token: Issues read and write on that one
@@ -37,14 +37,18 @@ export default {
     const title = `[${KINDS[r.kind]}] ${sig} · ${r.plugin_version}`;
     try {
       const gh = github(env);
-      const old = await findIssue(gh, env.REPO, title);
+      const old = recentIssue(title) || await findIssue(gh, env.REPO, title);
       const upd = r.kind === 'update';
       if (old) {
-        if (old.comments < (MAX_REPEATS[r.kind] || 200))
+        if (old.comments < (MAX_REPEATS[r.kind] || 200)) {
           await gh('POST', `/repos/${env.REPO}/issues/${old.number}/comments`, { body: upd ? updateRepeat(r) : repeatBody(r) });
+          old.comments++;
+        }
+        remember(title, old);
         return reply({ ok: true, issue: old.number, repeat: true });
       }
       const issue = await gh('POST', `/repos/${env.REPO}/issues`, { title, body: upd ? updateBody(r) : issueBody(r) });
+      remember(title, { number: issue.number, comments: 0 });
       if (!upd) for (const body of logComments(r)) await gh('POST', `/repos/${env.REPO}/issues/${issue.number}/comments`, { body });
       return reply({ ok: true, issue: issue.number, repeat: false });
     } catch (e) {
@@ -102,6 +106,18 @@ function github(env) {
     if (!res.ok) throw new Error(String(res.status));
     return res.status === 204 ? null : res.json();
   };
+}
+// Issues this instance created or found lately: right after a POST, GitHub's issue list may not show the
+// new issue yet, so the next report of a session (sent seconds later) would open a second one (reports 40, 41).
+const recent = new Map();
+function recentIssue(title) {
+  const e = recent.get(title);
+  if (!e || Date.now() - e.t > 10 * 60000) return null;
+  return e.issue;
+}
+function remember(title, issue) {
+  recent.set(title, { issue: { number: issue.number, comments: issue.comments | 0 }, t: Date.now() });
+  if (recent.size > 500) recent.delete(recent.keys().next().value);
 }
 async function findIssue(gh, repo, title) {     // the open issue with exactly this title (newest 300)
   for (let page = 1; page <= 3; page++) {

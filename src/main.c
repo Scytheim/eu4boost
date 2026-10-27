@@ -112,6 +112,7 @@ static void load_config(void) {
         c->autorun_minimize = ini_int(ini, L"test", L"autorun_minimize", 1);
         c->test_warview = ini_int(ini, L"test", L"warview", 0);
         c->test_ironman_name = ini_int(ini, L"test", L"ironman_name", 0);
+        c->test_loc_fiber = ini_int(ini, L"test", L"loc_fiber", 0);
         c->autorun_fastfail = ini_int(ini, L"test", L"autorun_fastfail", 0);
     }
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
@@ -119,6 +120,7 @@ static void load_config(void) {
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
     c->guard_great_project  = ini_int(ini, L"guard",     L"great_project", 1);
     c->guard_ironman_name   = ini_int(ini, L"guard",     L"ironman_name", 1);
+    c->guard_loc_duplicates = ini_int(ini, L"guard",     L"loc_duplicates", 1);
     c->ui_timing            = ini_int(ini, L"general",   L"ui_timing", 0);       // diagnostics
     c->mem_sites            = ini_int(ini, L"diag",      L"mem_sites", 0);
     c->mem_sites_s          = ini_int(ini, L"diag",      L"mem_sites_s", 60);

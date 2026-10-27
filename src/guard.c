@@ -64,6 +64,19 @@
 // save games/<name>.tmp, error: filename is illegal or insecure" - the game crashes at its first ironman
 // save of a game named in Korean. A name with escape bytes (no file can have one) is decoded the way
 // escapedStrToUtf8 decodes it and passed on in UTF-8; other names (ASCII, already UTF-8) unchanged.
+//
+// loc_duplicates ([guard] loc_duplicates, reports 40, 41): while the localisation is read, FUN_1416fd7a0
+// runs FUN_1416fb1c0 on each table; it walks the sorted keys (16-byte entries at +0x20..+0x28) and for
+// every run of equal keys takes three arrays of (8k + 8) bytes from the stack (alloca) before it logs the
+// duplicate ("Duplicate localization found", FUN_1414b36c0) - inside its loop, so none of it is given back
+// before it returns. With tens of thousands of duplicate keys (mods whose localisation repeats another's
+// under other file names, e.g. 짭짭죽 13.0.4 with 맵한글화 and 통신효율) the main thread's 4 MB stack runs
+// out: the game crashes at start-up with EXCEPTION_STACK_OVERFLOW in the OutputDebugStringA of the next
+// log line - without this plugin too (checked: a test mod repeating 짭짭죽's localisation crashes vanilla
+// the same way). The stack the call will take is counted from the keys first; only when it does not fit
+// in what is left of the thread's stack, the same call runs on a fiber of this thread with a stack that
+// fits (same thread, same code; the check only reads the table and logs, so the result is the same; the
+// fiber is deleted afterwards).
 #include "common.h"
 #include <stdlib.h>
 #include <string.h>
@@ -412,10 +425,68 @@ static void* hk_save_path(void* out, void* name, void* dir, void* p4) {
     return o_save_path(out, fake, dir, p4);
 }
 
+// ---- the duplicate localisation check on a stack that fits ----
+#define RVA_LOC_DUPS 0x16fb1c0u
+static const uint8_t sig_loc_dups[16] = { 0x48,0x89,0x54,0x24,0x10,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41 };
+typedef uint64_t (*loc_dups_t)(void* table, void* p2);
+static loc_dups_t o_loc_dups;
+static volatile LONG g_loc_fibers;
+// the stack FUN_1416fb1c0 takes with alloca: per run of k > 1 equal keys three arrays of
+// (8k + 8 + 15) & ~15 bytes (its loop: lea rcx,[k*8+8]; lea rax,[rcx+0xf]; and rax,-16; x3)
+static size_t loc_dups_need(const uint8_t* table) {
+    const uint64_t* b = *(const uint64_t* const*)(table + 0x20);
+    const uint64_t* e = *(const uint64_t* const*)(table + 0x28);
+    if (!b || e <= b) return 0;
+    size_t n = (size_t)(e - b) / 2, need = 0;
+    for (size_t i = 0; i + 1 < n;) {
+        size_t j = i + 1;
+        while (j < n && b[2 * j] == b[2 * i]) j++;
+        if (j - i > 1) need += 3 * ((8 * (j - i) + 8 + 15) & ~(size_t)15);
+        i = j;
+    }
+    return need;
+}
+typedef struct { void* table; void* p2; uint64_t r; LPVOID back; } locf_t;
+static void CALLBACK loc_dups_fiber(LPVOID p) {
+    locf_t* a = (locf_t*)p;
+    a->r = o_loc_dups(a->table, a->p2);
+    SwitchToFiber(a->back);                                     // a fiber's function must not return
+}
+static uint64_t loc_dups_logged(void* table, uint64_t r, int fiber) {
+    if (g_cfg.test_loc_fiber)
+        eb_log("guard: TEST duplicate localisation check of a table of %lld keys -> %d%s",
+               (long long)((*(uint8_t**)((uint8_t*)table + 0x28) - *(uint8_t**)((uint8_t*)table + 0x20)) / 16), (int)(r & 0xff),
+               fiber ? " (larger stack)" : "");
+    return r;
+}
+static uint64_t hk_loc_dups(void* table, void* p2) {
+    size_t need = loc_dups_need((const uint8_t*)table);
+    const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+    MEMORY_BASIC_INFORMATION mi;
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t lo = VirtualQuery((const uint8_t*)tib->StackBase - 1, &mi, sizeof mi) ? (uintptr_t)mi.AllocationBase : (uintptr_t)tib->StackLimit;
+    size_t left = sp > lo ? sp - lo : 0;
+    size_t room = (size_t)1 << 20;                              // the log line, its exception dispatch, guard pages
+    if (g_cfg.test_loc_fiber != 1 && need + room < left) return loc_dups_logged(table, o_loc_dups(table, p2), 0);
+    int was = IsThreadAFiber();
+    LPVOID me = was ? GetCurrentFiber() : ConvertThreadToFiber(NULL);
+    if (!me) return loc_dups_logged(table, o_loc_dups(table, p2), 0);
+    locf_t a = { table, p2, 0, me };
+    SIZE_T reserve = (need + room + (16u << 20)) & ~(SIZE_T)0xffff;
+    LPVOID f = CreateFiberEx(64 << 10, reserve, FIBER_FLAG_FLOAT_SWITCH, loc_dups_fiber, &a);
+    if (!f) { if (!was) ConvertFiberToThread(); return loc_dups_logged(table, o_loc_dups(table, p2), 0); }
+    if (InterlockedIncrement(&g_loc_fibers) <= 5)
+        eb_log("guard: duplicate localisation check needs %zu KB of stack, %zu KB left - run on a %zu MB stack", need >> 10, left >> 10, (size_t)(reserve >> 20));
+    SwitchToFiber(f);
+    DeleteFiber(f);
+    if (!was) ConvertFiberToThread();
+    return loc_dups_logged(table, a.r, 1);
+}
+
 int eb_guard_install(void) {
     int want_day_time = g_cfg.online_poll_ms > 0 && g_cfg.online_running_only;
     if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.guard_great_project && !g_cfg.guard_ironman_name && !g_cfg.test_ironman_name &&
-        !g_cfg.prov_text_cache && !want_day_time) return 1;
+        !g_cfg.guard_loc_duplicates && !g_cfg.prov_text_cache && !want_day_time) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
 #ifdef EB_TEST
@@ -476,6 +547,13 @@ int eb_guard_install(void) {
                                             g_cfg.guard_ironman_name ? "" : " (without the fix)");
     }
 #endif
+#ifndef EB_TEST
+    if ((g_cfg.guard_loc_duplicates || g_cfg.test_loc_fiber) &&
+        hook(b + RVA_LOC_DUPS, sig_loc_dups, sizeof sig_loc_dups, (void*)hk_loc_dups, (void**)&o_loc_dups, "duplicate localisation check")) {
+        ok++; eb_log("guard: the duplicate localisation check runs on a larger stack when the main thread's would overflow%s",
+                     g_cfg.test_loc_fiber == 1 ? " (TEST: always)" : "");
+    }
+#endif
     if (g_cfg.guard_great_project && g_gp_mgr && g_hc_vt && probe_init()) {
         InitializeCriticalSection(&g_gp_cs);
         // both or neither: the trigger reads are recorded only for the array moves
@@ -531,6 +609,13 @@ __declspec(dllexport) int eb_test_ironman_name(void) {
     if (m != (size_t)wn || memcmp(u, want, m)) { printf("ironman name: report 36 wrong\n"); bad++; }
     bad += iname_utf8((const uint8_t*)"Ottomans 1444", 13, u, sizeof u) != 0;
     bad += iname_utf8((const uint8_t*)"\xEC\x98\xA4\xEC\x8A\xA4", 6, u, sizeof u) != 0;          // UTF-8 already
+    // the stack the duplicate localisation check takes: keys 1 1 2 3 3 3 5 -> runs of 2 and 3
+    static uint64_t keys[7][2] = { {1,0}, {1,0}, {2,0}, {3,0}, {3,0}, {3,0}, {5,0} };
+    uint8_t table[0x30] = {0};
+    *(uint64_t**)(table + 0x20) = &keys[0][0]; *(uint64_t**)(table + 0x28) = &keys[7][0];
+    size_t want_need = 3 * ((8 * 2 + 8 + 15) & ~15) + 3 * ((8 * 3 + 8 + 15) & ~15);
+    if (loc_dups_need(table) != want_need) { printf("loc dups need %zu, want %zu\n", loc_dups_need(table), want_need); bad++; }
+    *(uint64_t**)(table + 0x28) = &keys[0][0]; bad += loc_dups_need(table) != 0;
     printf("ironman name %s (%d failures)\n", bad ? "FAILED" : "ALL TESTS PASSED", bad);
     return bad;
 }

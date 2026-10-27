@@ -202,12 +202,13 @@ static int frame_ok(const mod_t* m, const RUNTIME_FUNCTION* f, uint64_t pc, cons
     uint64_t v = (&c->Rax)[reg];                              // CONTEXT keeps rax..r15 in the unwind codes' order
     return v >= lo && v <= hi;
 }
-typedef struct { CONTEXT c; uint64_t lo, hi; const mods_t* mods; uint64_t* pcs; int max, n; } walk_t;
+typedef struct { CONTEXT c; uint64_t lo, hi; const mods_t* mods; uint64_t* pcs; uint64_t* sps; int max, n; } walk_t;
 static int walk_body(void* p) {
     walk_t* w = (walk_t*)p; CONTEXT* c = &w->c;
     while (w->n < w->max) {
         uint64_t pc = c->Rip, sp = c->Rsp;
         if (!pc) break;
+        if (w->sps) w->sps[w->n] = sp;
         w->pcs[w->n++] = pc;
         if (sp < w->lo || sp + 8 > w->hi || (sp & 7)) break;
         const mod_t* m = mods_find(w->mods, pc);
@@ -295,10 +296,10 @@ static int thread_stack(HANDLE th, uint64_t* lo, uint64_t* hi) {
     return q && q(th, 0 /* ThreadBasicInformation */, &tbi, sizeof tbi, NULL) == 0 && tbi.Teb && stack_of((const NT_TIB*)tbi.Teb, lo, hi);
 }
 // the call stack from a context whose stack does not change meanwhile (the crashing thread waits for us)
-static int walk_ctx(const CONTEXT* c, uint64_t lo, uint64_t hi, mods_t* mods, uint64_t* pcs, int max) {
+static int walk_ctx(const CONTEXT* c, uint64_t lo, uint64_t hi, mods_t* mods, uint64_t* pcs, uint64_t* sps, int max) {
     if (!g_guard_veh || max < 1) return 0;
     walk_t w; memset(&w, 0, sizeof w);
-    w.c = *c; w.lo = lo; w.hi = hi; w.mods = mods; w.pcs = pcs; w.max = max;
+    w.c = *c; w.lo = lo; w.hi = hi; w.mods = mods; w.pcs = pcs; w.sps = sps; w.max = max;
     if (guarded(mods_build, mods) < 0) mods->n = 0;
     guarded(walk_body, &w);
     if (!w.n) pcs[w.n++] = c->Rip;
@@ -350,9 +351,14 @@ static void s_scan(sb_t* b, uint64_t rsp, int max) {
 }
 typedef struct { sb_t* b; uint64_t rsp; } scan_t;
 static int scan_body(void* p) { scan_t* s = (scan_t*)p; s_scan(s->b, s->rsp, 48); return 0; }
-static void s_frames(sb_t* b, const uint64_t* pcs, int n, uint64_t rsp) {
+// sps (or NULL): each frame's stack pointer, shown as its distance from the first one
+static void s_frames(sb_t* b, const uint64_t* pcs, const uint64_t* sps, int n, uint64_t rsp) {
     s_put(b, "stack (unwound):\r\n");
-    for (int i = 0; i < n; i++) { s_put(b, "  "); s_dec(b, i); s_put(b, "  "); s_addr(b, pcs[i]); s_put(b, "\r\n"); }
+    for (int i = 0; i < n; i++) {
+        s_put(b, "  "); s_dec(b, i); s_put(b, "  "); s_addr(b, pcs[i]);
+        if (sps && sps[i] >= sps[0]) { s_put(b, "  (rsp+"); s_hex(b, sps[i] - sps[0], 1); s_put(b, ")"); }
+        s_put(b, "\r\n");
+    }
     s_put(b, "return addresses on the stack:\r\n");
     scan_t s = { b, rsp };
     if (g_guard_veh) guarded(scan_body, &s);                  // another thread's stack may change while it is read
@@ -456,13 +462,13 @@ static void copy_log(const wchar_t* dir, const wchar_t* src) {
 static char g_cbuf[96 * 1024];            // the report text (static: no heap, little stack)
 static EXCEPTION_POINTERS* g_cep;
 static DWORD g_ctid;
-static uint64_t g_c_lo, g_c_hi;           // the crashing thread's stack
+static uint64_t g_c_lo, g_c_hi, g_c_limit;   // the crashing thread's stack: reserved [lo, hi), committed from limit
 static DWORD WINAPI crash_writer(LPVOID unused) {
     (void)unused;
     EXCEPTION_RECORD* er = g_cep->ExceptionRecord; CONTEXT* c = g_cep->ContextRecord;
     sb_t b = { g_cbuf, 0, sizeof g_cbuf };
     s_put(&b, "eu4boost crash report\r\nkind: crash\r\nsignature: "); s_put(&b, exc_name(er->ExceptionCode)); s_put(&b, " ");
-    uint64_t pcs[64]; int n = walk_ctx(c, g_c_lo, g_c_hi, &g_cr_mods, pcs, 64), top = 0;
+    uint64_t pcs[64], sps[64]; int n = walk_ctx(c, g_c_lo, g_c_hi, &g_cr_mods, pcs, sps, 64), top = 0;
     while (top < n && !interesting(pcs[top])) top++;
     s_addr(&b, top < n ? pcs[top] : (uint64_t)(uintptr_t)er->ExceptionAddress);
     s_put(&b, "\r\nexception: "); s_hex(&b, er->ExceptionCode, 8); s_put(&b, " "); s_put(&b, exc_name(er->ExceptionCode));
@@ -472,12 +478,17 @@ static DWORD WINAPI crash_writer(LPVOID unused) {
         s_put(&b, "\r\naccess: "); s_put(&b, k == 0 ? "read" : k == 1 ? "write" : k == 8 ? "execute" : "?"); s_put(&b, " "); s_hex(&b, er->ExceptionInformation[1], 16);
     }
     s_put(&b, "\r\nthread: "); s_put(&b, g_ctid == g_main_tid ? "main" : "other"); s_put(&b, "\r\n");
+    if (g_c_hi > g_c_lo && c->Rsp > g_c_lo && c->Rsp <= g_c_hi) {   // report 40: how full the stack was (a stack overflow)
+        s_put(&b, "stack: "); s_dec(&b, (long long)((g_c_hi - c->Rsp) >> 10)); s_put(&b, " KB used of ");
+        s_dec(&b, (long long)((g_c_hi - g_c_lo) >> 10)); s_put(&b, " KB, committed to "); s_dec(&b, (long long)((g_c_hi - g_c_limit) >> 10));
+        s_put(&b, " KB (base "); s_hex(&b, g_c_hi, 16); s_put(&b, ")\r\n");
+    }
     s_state(&b);
     s_regs(&b, c);
-    s_frames(&b, pcs, n, c->Rsp);
+    s_frames(&b, pcs, sps, n, c->Rsp);
     if (g_ctid != g_main_tid && g_main_thread) {
         CONTEXT mc; int mn = sample_thread(g_main_thread, g_main_lo, g_main_hi, &g_cr_mods, &mc, pcs, 64);
-        if (mc.Rip) { s_put(&b, "main thread:\r\n  rip="); s_addr(&b, mc.Rip); s_put(&b, "\r\n"); s_frames(&b, pcs, mn, mc.Rsp); }
+        if (mc.Rip) { s_put(&b, "main thread:\r\n  rip="); s_addr(&b, mc.Rip); s_put(&b, "\r\n"); s_frames(&b, pcs, NULL, mn, mc.Rsp); }
     }
     s_put(&b, g_mods);
     s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
@@ -494,6 +505,7 @@ static LONG WINAPI eb_filter(EXCEPTION_POINTERS* ep) {
     if (InterlockedExchange(&g_crashed, 1) == 0) {
         g_cep = ep; g_ctid = GetCurrentThreadId();
         if (!stack_of((const NT_TIB*)NtCurrentTeb(), &g_c_lo, &g_c_hi)) g_c_lo = g_c_hi = 0;
+        g_c_limit = (uint64_t)(uintptr_t)((const NT_TIB*)NtCurrentTeb())->StackLimit;
         HANDLE h = CreateThread(NULL, 1 << 20, crash_writer, NULL, 0, NULL);
         if (h) { WaitForSingleObject(h, 20000); CloseHandle(h); }
         else crash_writer(NULL);
@@ -519,7 +531,7 @@ static void write_hang(int seconds) {
     if (top < n) s_addr(&b, pcs[top]); else s_put(&b, "unknown");
     s_put(&b, "\r\nno frame for: "); s_dec(&b, seconds); s_put(&b, " s\r\n");
     s_state(&b);
-    if (mc.Rip) { s_put(&b, "main thread:\r\n"); s_regs(&b, &mc); s_frames(&b, pcs, n, mc.Rsp); }
+    if (mc.Rip) { s_put(&b, "main thread:\r\n"); s_regs(&b, &mc); s_frames(&b, pcs, NULL, n, mc.Rsp); }
     s_put(&b, g_mods);
     s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
     s_put(&b, "before this session: "); s_put(&b, g_prev_saves[0] ? g_prev_saves : "no saves.txt\r\n");

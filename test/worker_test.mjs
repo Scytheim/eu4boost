@@ -5,13 +5,14 @@ import worker from '../worker/crash-report.js';
 
 const env = { GITHUB_TOKEN: 'test-token', REPO: 'owner/reports' };
 const issues = [];
+let lagging = 0, lagFrom = 0;                                 // lagging: the issue list leaves out issues from lagFrom on
 const calls = [];
 globalThis.fetch = async (url, init) => {
   const u = new URL(url), body = init.body ? JSON.parse(init.body) : null;
   calls.push({ method: init.method, path: u.pathname + u.search, body });
   if (init.headers.Authorization !== 'Bearer test-token') throw new Error('token missing');
   if (init.method === 'GET' && u.pathname === '/repos/owner/reports/issues')
-    return new Response(JSON.stringify(issues), { status: 200 });
+    return new Response(JSON.stringify(lagging ? issues.slice(0, lagFrom) : issues), { status: 200 });
   if (init.method === 'POST' && u.pathname === '/repos/owner/reports/issues') {
     const it = { number: issues.length + 1, title: body.title, body: body.body, comments: 0 };
     issues.push(it);
@@ -63,6 +64,13 @@ ok(j.ok && j.repeat && j.issue === updIssue.number && updIssue.comments === 1 &&
    updComment.body.body.includes('from: 0.4.5'), 'second update report -> one short comment');
 r = await post({ ...upd, signature: 'UPDATE_FAILED rename (error 5)', plugin_version: '0.4.6' }, '9.9.9.4'); j = await r.json();
 ok(j.ok && issues.find((i) => i.number === j.issue).title === '[업데이트] UPDATE_FAILED rename (error 5) · 0.4.6', 'failed update -> its own issue');
+lagging = 1;                                                  // GitHub's list does not show a new issue yet
+const nIssues = issues.length; lagFrom = nIssues;
+r = await post({ ...sample, signature: 'EXCEPTION_STACK_OVERFLOW eu4.exe+0x1563a71', plugin_version: '0.4.7' }, '7.7.7.1'); j = await r.json();
+const lagIssue = j.issue;
+r = await post({ ...sample, signature: 'EXCEPTION_STACK_OVERFLOW eu4.exe+0x1563a71', plugin_version: '0.4.7' }, '7.7.7.2'); j = await r.json();
+lagging = 0;
+ok(j.ok && j.repeat && j.issue === lagIssue && issues.length === nIssues + 1, 'the same report right after, while the list lags -> a comment, not a second issue');
 ok((await post('{bad', '2.2.2.2')).status === 400, 'bad JSON refused');
 ok((await post({ ...sample, schema: 2 }, '2.2.2.3')).status === 400, 'wrong schema refused');
 ok((await post({ ...sample, report: 'x' }, '2.2.2.4')).status === 400, 'report text without its header refused');

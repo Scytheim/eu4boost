@@ -65,7 +65,17 @@ static BOOL CALLBACK close_cb(HWND h, LPARAM l) {
     if (pid == GetCurrentProcessId() && IsWindowVisible(h) && !GetWindow(h, GW_OWNER)) { PostMessageW(h, WM_CLOSE, 0, 0); (*(int*)l)++; }
     return TRUE;
 }
+static volatile int g_deep_stop;
+static int __attribute__((noinline)) deep(volatile char* up) {   // testing: recursion until the stack overflows
+    volatile char pad[4096];
+    pad[0] = up ? up[0] : 1;
+    return g_deep_stop ? 0 : deep(pad) + pad[1];
+}
 static void close_game(const char* why) {
+    if (g_cfg.autorun_fastfail == 3) {                         // ... and a stack overflow on the main thread (report 40)
+        eb_log("autorun: %s - TEST stack overflow", why);
+        deep(NULL);
+    }
     if (g_cfg.autorun_fastfail == 1) {                         // testing the abnormal-exit report: as a heap check would
         eb_log("autorun: %s - TEST __fastfail", why);
         __fastfail(7);
