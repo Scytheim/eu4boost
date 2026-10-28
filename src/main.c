@@ -100,6 +100,8 @@ static void load_config(void) {
     c->country_parallel_refresh = ini_int(ini, L"country", L"parallel_refresh", 0); // experimental
     c->country_refresh_fixup = ini_int(ini, L"country", L"refresh_fixup", 1);
     c->country_parallel_war = ini_int(ini, L"country", L"parallel_war", 0);
+    c->country_parallel_annex = ini_int(ini, L"country", L"parallel_annex", 0);
+    c->country_test_annex = ini_int(ini, L"country", L"test_annex", 0);          // testing only, not in the ini files
     c->country_test_war_all = ini_int(ini, L"country", L"test_war_all", 0);       // testing only, not in the ini files
     c->country_test_truce_end = ini_int(ini, L"country", L"test_truce_end", 0);   // testing only, not in the ini files
     c->country_test_no_defer = ini_int(ini, L"country", L"test_no_defer", 0);
@@ -113,6 +115,7 @@ static void load_config(void) {
         c->test_warview = ini_int(ini, L"test", L"warview", 0);
         c->test_ironman_name = ini_int(ini, L"test", L"ironman_name", 0);
         c->test_loc_fiber = ini_int(ini, L"test", L"loc_fiber", 0);
+        c->test_diplo_freed = ini_int(ini, L"test", L"diplo_freed", 0);
         c->autorun_fastfail = ini_int(ini, L"test", L"autorun_fastfail", 0);
     }
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
@@ -121,6 +124,7 @@ static void load_config(void) {
     c->guard_great_project  = ini_int(ini, L"guard",     L"great_project", 1);
     c->guard_ironman_name   = ini_int(ini, L"guard",     L"ironman_name", 1);
     c->guard_loc_duplicates = ini_int(ini, L"guard",     L"loc_duplicates", 1);
+    c->guard_diplo_reset    = ini_int(ini, L"guard",     L"diplomacy_reset", 1);
     c->ui_timing            = ini_int(ini, L"general",   L"ui_timing", 0);       // diagnostics
     c->mem_sites            = ini_int(ini, L"diag",      L"mem_sites", 0);
     c->mem_sites_s          = ini_int(ini, L"diag",      L"mem_sites_s", 60);

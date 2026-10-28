@@ -24,6 +24,11 @@
 //     frame), so a load counts from that start until frames run smoothly - no gap over 500 ms for
 //     1 s - outside the start functions (a frame = one POPS_RunCallbacks call with the first handle
 //     seen; the game pumps it once per frame from CPopsWrapper::Update).
+//   * after the load screen's read the front end may wait for the player (the lobby of a save that is
+//     not ironman: pick a country, press Play) - reports 8, 20, 21 and 72 counted up to 320 s of it as
+//     loading. From the read's return until the game starts (savegame / new game init, or the front end
+//     frame with its start flag) the time is left out, except front end frames that took 50 ms or more
+//     (work, not waiting); another read meanwhile starts a new load.
 #include "common.h"
 #include <string.h>
 #include <stdio.h>
@@ -70,6 +75,11 @@ static LONGLONG g_load_t0;                // QPC at its start, 0 = no load
 static LONGLONG g_load_first, g_load_settle;   // first frame after its last step / start of the current smooth run
 static int g_load_done, g_load_depth;     // its last step ran / start functions still running
 static LONG64 g_load_n0[NU], g_load_tt0[NU];
+static LONGLONG g_wait_t, g_wait_busy;    // waiting for the player after the read: since (0 = not), long frames in it
+static LONGLONG g_waited;                 // waiting left out of the current load
+#ifdef EB_TEST
+static double g_last_ms, g_last_waited_ms;   // the latest load, for eb_test_load_wait
+#endif
 
 // ---- cloud sync watcher: the client's busy flag (+0x30) stays set until the whole sync is over ----
 static HANDLE g_sync_ev;
@@ -112,22 +122,33 @@ static int inner_text(char* out, int cap, int self, const LONG64* n0, const LONG
 }
 
 static void load_begin(const char* how) {
-    g_load_t0 = qpc(); g_load_done = 0; g_load_first = g_load_settle = 0;
+    g_load_t0 = qpc(); g_load_done = 0; g_load_first = g_load_settle = 0; g_wait_t = g_waited = 0;
     for (int j = 0; j < NU; j++) { g_load_n0[j] = g_n[j]; g_load_tt0[j] = g_t[j]; }
     eb_loading = 1;
     eb_load_samples_reset();
     if (g_diag) eb_log("ui: load started (%s)", how);
 }
+// the player is done in the front end: the waiting is left out by moving the start of the load
+static void wait_end(LONGLONG t) {
+    LONGLONG w = t - g_wait_t - g_wait_busy;
+    if (w > 0) { g_load_t0 += w; g_waited += w; }
+    g_wait_t = 0;
+    eb_loading = 1;
+}
 static void load_end(LONGLONG t) {
     double ms = (t - g_load_t0) * g_ms, first = (g_load_first - g_load_t0) * g_ms;
-    char in[768]; inner_text(in, sizeof in, -1, g_load_n0, g_load_tt0, 0, 0);
+    char in[768]; int k = inner_text(in, sizeof in, -1, g_load_n0, g_load_tt0, 0, 0);
+    if (g_waited) snprintf(in + k, sizeof in - k, " | waiting for the player %.1f s (left out)", g_waited * g_ms / 1000.0);
     eb_log("load: %.1f s from the start until frames run smoothly (first game frame after %.1f s)%s", ms / 1000.0, first / 1000.0, in);
+#ifdef EB_TEST
+    g_last_ms = ms; g_last_waited_ms = g_waited * g_ms;
+#endif
     if (g_cfg.report_slow && ms >= g_cfg.slow_load_s * 1000.0) {
         char d[4096]; int k = snprintf(d, sizeof d, "steps%s\r\nmain thread every 5 s (a load reads the save on other threads too):\r\n", in);
         eb_load_samples_take(d + k, sizeof d - k);
         eb_slow_event("load", ms, g_cfg.slow_load_s * 1000.0, d);
     }
-    g_load_t0 = 0; g_load_done = 0; g_load_first = g_load_settle = 0;
+    g_load_t0 = 0; g_load_done = 0; g_load_first = g_load_settle = 0; g_wait_t = g_waited = 0;
     eb_loading = 0;
     eb_autorun_loaded();
 }
@@ -143,7 +164,7 @@ static uintptr_t hk_rcb(void* a, void* b) {
                 if (!g_load_first) g_load_first = g_load_settle = t;
                 else if ((t - g_frame_last) * g_ms > 500.0) g_load_settle = t;
                 else if ((t - g_load_settle) * g_ms >= 1000.0) load_end(g_load_settle);
-            } else if (g_load_t0 && (t - g_load_t0) * g_ms > 30 * 60 * 1000.0) { g_load_t0 = 0; eb_loading = 0; }   // never finished
+            } else if (g_load_t0 && !g_wait_t && (t - g_load_t0) * g_ms > 30 * 60 * 1000.0) { g_load_t0 = 0; eb_loading = 0; }   // never finished
             if (g_diag) {
                 if (g_frames_left > 0) {
                     g_frame_len += snprintf(g_frame_line + g_frame_len, sizeof g_frame_line - g_frame_len, " %.1f", (t - g_frame_last) * g_ms);
@@ -167,16 +188,25 @@ static uintptr_t timed(int i, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d
     }
     int starter = main && (i == U_FRONT || i == U_FLOAD || i == U_GLOAD);
     if (starter) {
-        if (!g_load_t0 && (i != U_FRONT || *(volatile uint8_t*)(a + FRONT_START_FLAG)))
+        int go = i != U_FRONT || *(volatile uint8_t*)(a + FRONT_START_FLAG);
+        if (go && g_wait_t && i != U_FRONT) g_load_t0 = 0;        // another read while the player chose: a new load
+        if (!g_load_t0 && go)
             load_begin(i == U_FLOAD ? "load screen" : i == U_GLOAD ? "in-game load dialog" : "new game");
+        else if (go && g_wait_t) wait_end(qpc());                  // the front end starts the game
         g_load_depth++;
     }
+    if (main && g_wait_t && (i == U_INIT_SAVE || i == U_INIT_GAME)) wait_end(qpc());
     LONGLONG s = qpc();
     uintptr_t r = g_orig[i](a, b, c, d);
     LONGLONG e = qpc(), dt = e - s;
     InterlockedIncrement64(&g_n[i]); InterlockedAdd64(&g_t[i], dt);
     if (starter) g_load_depth--;
     if ((i == U_FIXES || i == U_INIT_GAME) && g_load_t0) g_load_done = 1;
+    if (main && g_wait_t && i == U_FRONT && dt * g_ms >= 50.0) g_wait_busy += dt;   // that frame worked, it did not wait
+    if (main && i == U_FLOAD && g_load_t0 && !g_load_done) {      // read: the front end may now wait for the player
+        g_wait_t = e; g_wait_busy = 0;
+        eb_loading = 0;                                            // no load samples, stalls count as usual meanwhile
+    }
     if (i == U_SYNC && g_diag && g_sync_ev && *(volatile int*)(a + 0x30)) {
         g_sync_client = a; g_sync_t0 = s; SetEvent(g_sync_ev);
     }
@@ -203,6 +233,63 @@ HK(0) HK(1) HK(2) HK(3) HK(4) HK(5) HK(6) HK(7) HK(8) HK(9) HK(10) HK(11) HK(12)
 static void* const g_hk[NU] = { (void*)hk_0, (void*)hk_1, (void*)hk_2, (void*)hk_3, (void*)hk_4, (void*)hk_5, (void*)hk_6, (void*)hk_7,
                                 (void*)hk_8, (void*)hk_9, (void*)hk_10, (void*)hk_11, (void*)hk_12, (void*)hk_13, (void*)hk_14 };
 _Static_assert(NU == 15, "one hook function per target");
+
+#ifdef EB_TEST
+#include <stdio.h>
+// the game's functions: each sleeps for its second argument (ms)
+static uintptr_t t_work(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d) { (void)a; (void)c; (void)d; if (b) Sleep((DWORD)b); return 0; }
+static uintptr_t t_rcb(void* a, void* b) { (void)a; (void)b; return 0; }
+static void t_frames(int n) { for (int k = 0; k < n; k++) { hk_rcb((void*)1, NULL); Sleep(15); } }
+// loads made of fake steps: the time the player spends in the front end after the read is left out
+__declspec(dllexport) int eb_test_load_wait(void) {
+    static uint8_t fe[0x800];
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ms = 1000.0 / (double)f.QuadPart;
+    DWORD tid = g_main_tid; g_main_tid = GetCurrentThreadId();
+    pops_rcb_t rcb = o_rcb; o_rcb = t_rcb; void* key = g_frame_key; g_frame_key = (void*)1;
+    fn4_t orig[NU]; memcpy(orig, g_orig, sizeof orig);
+    for (int i = 0; i < NU; i++) g_orig[i] = t_work;
+    int bad = 0;
+    // 1. the lobby: read 40 ms, the player waits (front end frames of 0 ms, one of 80 ms that works), Play
+    g_last_ms = -1;
+    timed(U_FLOAD, 0, 40, 0, 0);
+    for (int k = 0; k < 60; k++) { timed(U_FRONT, (uintptr_t)fe, 0, 0, 0); Sleep(10); }
+    timed(U_FRONT, (uintptr_t)fe, 80, 0, 0);
+    fe[FRONT_START_FLAG] = 1; timed(U_FRONT, (uintptr_t)fe, 0, 0, 0); fe[FRONT_START_FLAG] = 0;
+    timed(U_INIT_SAVE, 0, 20, 0, 0); timed(U_FIXES, 0, 20, 0, 0);
+    t_frames(80);
+    printf("load wait: lobby load %.0f ms, %.0f ms left out\n", g_last_ms, g_last_waited_ms);
+    if (g_last_ms < 160 || g_last_ms > 450 || g_last_waited_ms < 500) bad++;
+    // 2. no lobby (continue): read 40 ms, one front end frame of 60 ms, the game starts at once
+    g_last_ms = -1;
+    timed(U_FLOAD, 0, 40, 0, 0);
+    timed(U_FRONT, (uintptr_t)fe, 60, 0, 0);
+    timed(U_INIT_SAVE, 0, 20, 0, 0); timed(U_FIXES, 0, 20, 0, 0);
+    t_frames(80);
+    printf("load wait: direct load %.0f ms, %.0f ms left out\n", g_last_ms, g_last_waited_ms);
+    if (g_last_ms < 140 || g_last_ms > 400 || g_last_waited_ms > 40) bad++;
+    // 3. back out of the lobby and read another save: the load counts from the second read
+    g_last_ms = -1;
+    timed(U_FLOAD, 0, 30, 0, 0);
+    for (int k = 0; k < 40; k++) { timed(U_FRONT, (uintptr_t)fe, 0, 0, 0); Sleep(10); }
+    timed(U_FLOAD, 0, 30, 0, 0);
+    timed(U_INIT_SAVE, 0, 20, 0, 0); timed(U_FIXES, 0, 20, 0, 0);
+    t_frames(80);
+    printf("load wait: second read %.0f ms, %.0f ms left out\n", g_last_ms, g_last_waited_ms);
+    if (g_last_ms < 70 || g_last_ms > 300) bad++;
+    // 4. the in-game load dialog: nothing to leave out
+    g_last_ms = -1;
+    timed(U_GLOAD, 0, 50, 0, 0);
+    timed(U_INIT_SAVE, 0, 20, 0, 0); timed(U_FIXES, 0, 20, 0, 0);
+    t_frames(80);
+    printf("load wait: in-game load %.0f ms, %.0f ms left out\n", g_last_ms, g_last_waited_ms);
+    if (g_last_ms < 90 || g_last_ms > 350 || g_last_waited_ms != 0) bad++;
+    memcpy(g_orig, orig, sizeof orig);
+    o_rcb = rcb; g_frame_key = key; g_main_tid = tid;
+    g_load_t0 = 0; g_wait_t = 0; eb_loading = 0;
+    printf("load wait %s (%d failures)\n", bad ? "FAILED" : "ALL TESTS PASSED", bad);
+    return bad;
+}
+#endif
 
 int eb_uitime_install(void) {
     g_diag = g_cfg.ui_timing;

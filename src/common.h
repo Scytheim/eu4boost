@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.8"
+#define EU4BOOST_VERSION "0.4.9"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -76,6 +76,8 @@ typedef struct {
     int country_parallel_refresh; // EXPERIMENT: 1 = RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check
     int country_refresh_fixup;    // 1 = recompute the cached values of FUN_1402f1120 (+0xe1c..+0xe34) at the country's turn
     int country_parallel_war;     // 1 = the war refresh (all participants of a war joined or declared) on all cores, 2 = + verify
+    int country_parallel_annex;   // 1 = the opinions recomputed when a country disappears on all cores, 2 = + verify
+    int country_test_annex;       // testing only ([country] test_annex=D): every D country loops the same for a random country
     int country_test_war_all;     // testing only: every N country loops all countries that are not dirty go through the war refresh
     int country_test_truce_end;   // testing only: N precomputed countries a day get a truce with the player that has just ended
     int country_test_no_defer;    // testing only: 1 = workers run the message handler themselves (as 0.4.3 did)
@@ -92,6 +94,8 @@ typedef struct {
     int guard_great_project;      // 1 = has_construction triggers that name a great project follow the array when it moves
     int guard_ironman_name;       // 1 = an ironman save name in EU4dll's escapes gets the UTF-8 file name ordinary saves get
     int guard_loc_duplicates;     // 1 = the duplicate localisation check runs on a larger stack when the main thread's would overflow
+    int guard_diplo_reset;        // 1 = relations freed before a game is reset are skipped instead of called and freed again
+    int test_diplo_freed;         // testing only ([test] diplo_freed=1): the next diplomacy reset finds one relation freed
     int test_loc_fiber;           // testing only ([test] loc_fiber): 1 = that check always runs on the larger stack, 2 = as usual; both log each table and result
     int test_ironman_name;        // testing only ([test] ironman_name=1): the ironman save of eb_auto is named "eb_시험" in EU4dll's escapes
     // diagnostics (uitime.c)

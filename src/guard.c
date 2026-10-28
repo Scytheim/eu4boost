@@ -77,9 +77,24 @@
 // in what is left of the thread's stack, the same call runs on a fiber of this thread with a stack that
 // fits (same thread, same code; the check only reads the table and logs, so the result is the same; the
 // fiber is deleted afterwards).
+//
+// diplomacy_reset ([guard] diplomacy_reset, reports 51, 77, 78): CDiplomacy keeps the active relations
+// (alliances, marriages, subjects, ...) in one list per country at gamestate +0x1bb8 (AddActive
+// FUN_1404e12f0, RemActive FUN_1404e1570): lists of 0x18 bytes from +0x10, nodes { relation, prev, next,
+// removal pending }. Loading a game from inside a game destroys the old gamestate (FUN_141176020 -> ...
+// -> FUN_14074bf70 -> FUN_14074a260), and FUN_1404e0d90 calls virtual +0x60 and the deleting destructor of
+// every relation in the lists. In the reports one of them had been freed already: its first qword was the
+// next-free pointer mimalloc writes into a freed block - a heap address (executed: return address
+// eu4.exe+0x4e0e55) or 0 at the end of a free list (read of 0x60 at eu4.exe+0x4e0e52). Two PCs with
+// mods, players who load often, 0.4.1 and 0.4.8. A freed relation in that list is the game's bug; a heap
+// that leaves the old vtable in place only hides it (the game then calls into freed memory and frees it a
+// second time). Every relation is checked before the original runs: readable, vtable inside .rdata, its
+// slots 0 (deleting destructor), 9 (type) and 12 (the call before it) inside .text. One that fails is taken
+// out of its node - the original skips empty nodes - so the freed block is neither called nor freed again.
 #include "common.h"
 #include <stdlib.h>
 #include <string.h>
+#include <mimalloc.h>
 #include "MinHook.h"
 
 #define RVA_TIP 0x8e8ca0u    // modifier breakdown text (container, std::string* out, descriptor)
@@ -483,10 +498,58 @@ static uint64_t hk_loc_dups(void* table, void* p2) {
     return loc_dups_logged(table, a.r, 1);
 }
 
+// ---- the diplomacy reset skips relations that were freed already ----
+#define RVA_DIPLO_CLEAR 0x4e0d90u
+static const uint8_t sig_diplo_clear[16] = { 0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x57 };
+typedef void (*diplo_clear_t)(uint8_t* d);
+static diplo_clear_t o_diplo_clear;
+static uintptr_t g_text_lo, g_text_hi;
+static volatile LONG g_freed_relations;
+static int g_diplo_tested;
+static int in_text(uintptr_t p) { return p >= g_text_lo && p < g_text_hi; }
+static int relation_ok(uintptr_t o) {
+    if ((o & 7) || !readable(o, 0x40)) return 0;
+    uintptr_t vt = *(const uintptr_t*)o;
+    if ((vt & 7) || vt < g_rdata_lo || vt + 13 * 8 > g_rdata_hi) return 0;
+    const uintptr_t* v = (const uintptr_t*)vt;
+    return in_text(v[0]) && in_text(v[9]) && in_text(v[12]);
+}
+static void hk_diplo_clear(uint8_t* d) {
+    uint8_t* b = *(uint8_t**)(d + 0x10);
+    uint8_t* e = *(uint8_t**)(d + 0x18);
+    size_t lists = b && e > b ? (size_t)(e - b) / 0x18 : 0, n = 0, bad = 0;
+    if (lists && lists < (1u << 20) && readable((uintptr_t)b, (size_t)(e - b))) {
+        for (size_t i = 0; i < lists; i++)
+            for (uint8_t* nd = *(uint8_t**)(b + i * 0x18); nd && n < (1u << 24); nd = *(uint8_t**)(nd + 0x10)) {
+                if (!readable((uintptr_t)nd, 0x20)) break;
+                uintptr_t o = *(uintptr_t*)nd;
+                if (!o) continue;
+                n++;
+                if (g_cfg.test_diplo_freed == 1 && !g_diplo_tested) {      // what the reports found: a freed relation
+                    void* f = mi_malloc(0x60);
+                    mi_free(f);
+                    eb_log("guard: TEST relation %p in the list of country %zu replaced by a freed block %p (first qword %p)",
+                           (void*)o, i, f, *(void**)f);
+                    *(uintptr_t*)nd = o = (uintptr_t)f; g_diplo_tested = 1;
+                }
+                if (g_cfg.guard_diplo_reset && !relation_ok(o)) {
+                    uint64_t q = 0; int rd = eb_probe8((const void*)(o & ~(uintptr_t)7), &q);
+                    if (InterlockedIncrement(&g_freed_relations) <= 10)
+                        eb_log("guard: diplomacy reset skipped a freed relation %p in the list of country %zu (first qword %s%p, removal pending %d)",
+                               (void*)o, i, rd ? "" : "unreadable ", (void*)(uintptr_t)q, nd[0x18]);
+                    *(uintptr_t*)nd = 0;
+                    bad++;
+                }
+            }
+    }
+    if (bad || g_cfg.test_diplo_freed) eb_log("guard: diplomacy reset: %zu relations in %zu lists, %zu freed ones skipped", n, lists, bad);
+    o_diplo_clear(d);
+}
+
 int eb_guard_install(void) {
     int want_day_time = g_cfg.online_poll_ms > 0 && g_cfg.online_running_only;
     if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.guard_great_project && !g_cfg.guard_ironman_name && !g_cfg.test_ironman_name &&
-        !g_cfg.guard_loc_duplicates && !g_cfg.prov_text_cache && !want_day_time) return 1;
+        !g_cfg.guard_loc_duplicates && !g_cfg.guard_diplo_reset && !g_cfg.test_diplo_freed && !g_cfg.prov_text_cache && !want_day_time) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
 #ifdef EB_TEST
@@ -505,6 +568,7 @@ int eb_guard_install(void) {
     IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
         if (!memcmp(s[i].Name, ".rdata", 7)) { g_rdata_lo = (uintptr_t)b + s[i].VirtualAddress; g_rdata_hi = g_rdata_lo + s[i].Misc.VirtualSize; }
+        else if (!memcmp(s[i].Name, ".text", 6)) { g_text_lo = (uintptr_t)b + s[i].VirtualAddress; g_text_hi = g_text_lo + s[i].Misc.VirtualSize; }
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) { eb_log("guard: MinHook init failed"); return 0; }
     int ok = 0;
@@ -552,6 +616,11 @@ int eb_guard_install(void) {
         hook(b + RVA_LOC_DUPS, sig_loc_dups, sizeof sig_loc_dups, (void*)hk_loc_dups, (void**)&o_loc_dups, "duplicate localisation check")) {
         ok++; eb_log("guard: the duplicate localisation check runs on a larger stack when the main thread's would overflow%s",
                      g_cfg.test_loc_fiber == 1 ? " (TEST: always)" : "");
+    }
+    if ((g_cfg.guard_diplo_reset || g_cfg.test_diplo_freed) && g_rdata_lo && g_text_lo && probe_init() &&
+        hook(b + RVA_DIPLO_CLEAR, sig_diplo_clear, sizeof sig_diplo_clear, (void*)hk_diplo_clear, (void**)&o_diplo_clear, "diplomacy reset")) {
+        if (g_cfg.guard_diplo_reset) { ok++; eb_log("guard: relations freed before a game is reset are skipped instead of crashing"); }
+        if (g_cfg.test_diplo_freed) eb_log("guard: TEST the next diplomacy reset finds one relation freed%s", g_cfg.guard_diplo_reset ? "" : " (without the fix)");
     }
 #endif
     if (g_cfg.guard_great_project && g_gp_mgr && g_hc_vt && probe_init()) {
@@ -626,7 +695,7 @@ void eb_guard_report(void) {
     if (g_nhc || g_gp_moved)
         eb_log("guard: %d has_construction triggers name a great project, the array moved %d times, %d trigger addresses moved with it",
                g_nhc + g_hc_lost, g_gp_moves, g_gp_moved);
-    if (g_bad_containers || g_bad_sources || g_null_relations)
-        eb_log("guard: %ld invalid tooltip containers, %ld invalid tooltip sources, %ld missing relations",
-               (long)g_bad_containers, (long)g_bad_sources, (long)g_null_relations);
+    if (g_bad_containers || g_bad_sources || g_null_relations || g_freed_relations)
+        eb_log("guard: %ld invalid tooltip containers, %ld invalid tooltip sources, %ld missing relations, %ld freed relations skipped",
+               (long)g_bad_containers, (long)g_bad_sources, (long)g_null_relations, (long)g_freed_relations);
 }

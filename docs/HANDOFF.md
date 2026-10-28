@@ -202,6 +202,8 @@ sh build.sh && sh test/run_tests.sh            # 테스트는 Wine으로 실행
 | 0x93fe30 / 0x327dc0 / 0x4426f0 | RefreshKnowledge(국가, where) / CalculateModifier(국가, where, char) / UpdateCasusBellis 래퍼 |
 | 0x2f0876 / 0x2f0888 / 0x2f08a9 / 0x2f08b1 | 변경 표시 묶음의 호출 지점(RefreshKnowledge / CalculateModifier / UpdateCasusBellis / 0x3d00c0). 묶음 조건 country+0x2882 != 0 |
 | 0x38b340 | UpdateOpinionCache(국가, 관계 키, char): RefreshKnowledge가 다른 나라에 대해 부름, 0x38b1f0을 거쳐 병렬 for까지 감 |
+| 0x364f10 | 나라가 사라질 때(FUN_1403663b0에서): 모든 태그와의 의견 modifier를 지우고 UpdateOpinionCache 2번씩(반환 0x365fe7, 0x365ff9) → `[country] parallel_annex`가 모아서 병렬로 |
+| 0x4e0d90 | CDiplomacy 활성 관계 목록(gamestate+0x1bb8) 전부 지우기: 관계마다 vtable +0x60과 소멸자. 게임 안 불러오기의 ResetGamestate가 부름 → `[guard] diplomacy_reset` |
 | 0x751760 / 0x75179a | 세이브 국가 루프(gamestate+0x1ce8 목록, 개수 gamestate vt+0x40) / 그 안의 FUN_141707a20 호출 반환 주소 |
 | 0x1707a20 | FUN_141707a20(writer, std::string* 키, 객체): 키 = { 객체 } (객체 vt+8로 씀) |
 | 0x1708870 / 0x1709280 / 0x1708750 / 0x17087e0 | writer 토큰 쓰기 / 토큰 / 블록 열기 / 닫기. writer 0x20바이트 {vtable 0x1dbf7d8, 깊이 +8, 스트림 +0x10, 이진 +0x18, 스트림 소유 +0x19} |

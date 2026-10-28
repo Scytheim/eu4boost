@@ -44,6 +44,9 @@
 //   cached values (+0xe1c..+0xe34; +0xe34 = a clamped opinion/modifier sum). Its inputs change between
 //   the loop start and the country's turn (verify: ~95% of the remaining differences), so it runs
 //   again at the country's turn when the precomputed refresh is skipped.
+//
+// parallel_annex (see "opinions when a country disappears" below): the opinions the game recomputes for
+// every country when one disappears, at once on the worker threads.
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
@@ -133,6 +136,7 @@ static cm_t o_cm;
 static ucb_t o_ucb;
 static v1_t o_warref;
 static uint8_t** g_gsp;
+static uint8_t** g_tagtab;                     // DAT_14233d8d0: tag table object, +0x100 = tags, +0x118 = country by tag
 static LONG64 g_war_parts;                     // stats: participants refreshed by the war refresh
 static opc_t o_opcache;
 
@@ -187,9 +191,14 @@ static opcall_t* new_op(int j) {
     return o;
 }
 
+static int annex_call(void* c, uint64_t key, char flag, void* ret);
 static void hk_opcache(void* c, uint64_t key, char flag) {
     int j = t_job;
-    if (j < 0) { o_opcache(c, key, flag); return; }
+    if (j < 0) {
+        if (g_cfg.country_parallel_annex && annex_call(c, key, flag, __builtin_return_address(0))) return;
+        o_opcache(c, key, flag);
+        return;
+    }
     opcall_t* o = new_op(j);                    // worker: record, the main thread replays it later
     if (!o) { o_opcache(c, key, flag); return; }   // out of memory: run it here (best effort)
     o->country = c; o->key = key; o->flag = flag;
@@ -219,13 +228,17 @@ static void post_msg(opcall_t* o) {
     free(o->msg); free(o->fn);
 }
 
+static void (*volatile g_run_one)(LONG i);      // set: the batch runs this for 0..g_nbatch instead of RefreshKnowledge
 static void run_jobs(int deferred) {
     for (;;) {
         LONG i = InterlockedIncrement(&g_next) - 1;
         if (i >= g_nbatch) break;
-        if (deferred) t_job = (int)i;
-        o_rk(g_batch[i].c, g_batch[i].where);
-        t_job = -1;
+        if (g_run_one) g_run_one(i);
+        else {
+            if (deferred) t_job = (int)i;
+            o_rk(g_batch[i].c, g_batch[i].where);
+            t_job = -1;
+        }
         InterlockedIncrement(&g_done);
     }
 }
@@ -244,11 +257,11 @@ static int verify_rk(uint8_t* c, const char* w, LONG64* ver, LONG64* bad);
 
 // RefreshKnowledge of jobs[0..m) at once (workers and the main thread; serial = on the main thread in
 // order, the verify baseline), then the recorded UpdateOpinionCache calls and messages in job order
-static void run_batch(job_t* jobs, LONG m, int serial) {
-    g_in_batch = 1;
+// jobs 0..m at once: the workers and the main thread take the next index until none is left
+static void run_all(LONG m, int serial) {
     while (g_pending) YieldProcessor();                         // every worker of the last batch is back
     g_next = 0; g_done = 0;
-    g_batch = jobs; g_nbatch = m;
+    g_nbatch = m;
     MemoryBarrier();
     if (serial) run_jobs(0);
     else {
@@ -258,6 +271,11 @@ static void run_batch(job_t* jobs, LONG m, int serial) {
         run_jobs(1);
         while (g_done < m) YieldProcessor();
     }
+}
+static void run_batch(job_t* jobs, LONG m, int serial) {
+    g_in_batch = 1;
+    g_batch = jobs; g_run_one = NULL;
+    run_all(m, serial);
     for (LONG i = 0; i < m; i++)
         for (int k = 0; k < jobs[i].nops; k++) {
             opcall_t* o = &jobs[i].ops[k];
@@ -387,10 +405,176 @@ static int verify_rk(uint8_t* c, const char* w, LONG64* ver, LONG64* badn) {
     return bad;
 }
 
+// ---- opinions when a country disappears ([country] parallel_annex) ----------------------------------
+// A country that loses its last province (CProvince::Conquer -> SetOwner -> FUN_1403663b0) goes through
+// FUN_140364f10, which walks every tag (tag table +0x100): it removes the opinion modifiers between the
+// country and that tag both ways (FUN_14028c7a0) and calls UpdateOpinionCache for tag -> country and for
+// country -> tag (return addresses 0x140365fe7 and 0x140365ff9). Each call computes one opinion -
+// FUN_1403839b0(country, tag, NULL, 1) -> FUN_1403d32b0 - and stores it in the first country's cache
+// (+0x2380, a short per tag). With many countries and opinion modifiers that is 2-8 s on the main
+// thread (reports 26, 42, 59, 66, 68, 70: Anbennar, 짭짭죽).
+// Here the loop's calls are recorded and, inside its last one, run at once on the worker threads and the
+// main thread. The game runs FUN_1403839b0(.., NULL, 1) on its own job threads for many pairs at once
+// (its full cache rebuild FUN_14038b1f0 -> FUN_140424380 with the lambdas FUN_140432de0/FUN_140432e70,
+// and the AE sums of the AI). One opinion reads that pair's relation; what the loop changes between two
+// calls are the modifiers of other pairs, so all of them computed after the loop are the values the
+// game would store (mode 2 checks it: the calls run as in the game, and at the end they are computed
+// again on all cores and compared; a difference keeps the game's value). A call whose country has no
+// cache (the game would rebuild it through its own parallel for) runs on the main thread after the
+// others. Anything else that reaches UpdateOpinionCache first, or the next country loop, runs the
+// recorded calls before it. Multiplayer: as the game.
+// Testing only: [country] test_annex=D - every D country loops, the 2 x N calls for one existing country
+// are made one by one and then on all cores, the results compared, and the cache values put back.
+#define RET_ANNEX1 0x365fe7u
+#define RET_ANNEX2 0x365ff9u
+static const uint8_t sig_annex[8] = { 0x48,0x8b,0xd3,0x4c,0x8b,0xad,0xc0,0x01 };   // after the first call: mov rdx,rbx; mov r13,[rbp+0x1c0]
+typedef struct { uint8_t* c; uint64_t key; char flag; uint8_t main, has; int16_t v; } axcall_t;
+static axcall_t *g_ax, *g_ax2;                          // recorded calls; the flush's order (all cores first)
+static int g_ax_n, g_ax_cap, g_ax2_cap, g_ax_left;      // g_ax_left: the loop's second-site calls still to come
+static uint8_t *g_ax_ret1, *g_ax_ret2;
+static LONG64 g_ax_loops, g_ax_calls, g_ax_par, g_ax_main, g_ax_ver, g_ax_bad, g_ax_tests, g_ax_test_calls, g_ax_test_bad;
+static double g_ax_us, g_ax_ser_us, g_ax_test_ser_us, g_ax_test_par_us;
+
+static int16_t* opcache_at(uint8_t* c, uint64_t key) {   // the cache entry UpdateOpinionCache writes, or NULL
+    int16_t* b = *(int16_t**)(c + 0x2380); int16_t* e = *(int16_t**)(c + 0x2388);
+    uint32_t i = (uint32_t)(int)(int16_t)(key >> 32);
+    return b && e - b >= 2 && i < (uint32_t)(e - b) ? b + i : NULL;
+}
+static void ax_one(LONG i) { axcall_t* a = &g_ax[i]; o_opcache(a->c, a->key, a->flag); }
+static void ax_run(LONG m) {                             // the calls of g_ax[0..m) on all cores
+    g_in_batch = 1;
+    g_run_one = ax_one;
+    run_all(m, 0);
+    g_run_one = NULL;
+    g_in_batch = 0;
+}
+// the recorded calls: those with a cache at once, the others after them on this thread in order
+static void annex_flush(void) {
+    int n = g_ax_n;
+    g_ax_n = 0; g_ax_left = 0;
+    if (!n) return;
+    LONGLONG t0 = now();
+    int verify = g_cfg.country_parallel_annex == 2;
+    if (g_ax2_cap < n) {
+        axcall_t* p = (axcall_t*)realloc(g_ax2, (size_t)n * sizeof *p);
+        if (!p) { if (!verify) for (int i = 0; i < n; i++) ax_one(i); return; }   // out of memory: in order
+        g_ax2 = p; g_ax2_cap = n;
+    }
+    // the calls with a cache first (ax_one takes indexes), then those for the main thread, each in order
+    int k = 0, m = 0;
+    for (int i = 0; i < n; i++) {
+        g_ax[i].main = !opcache_at(g_ax[i].c, g_ax[i].key);
+        if (!g_ax[i].main && (!verify || g_ax[i].has)) g_ax2[k++] = g_ax[i];
+    }
+    m = k;
+    if (!verify) for (int i = 0; i < n; i++) if (g_ax[i].main) g_ax2[m++] = g_ax[i];
+    axcall_t* sw = g_ax; g_ax = g_ax2; g_ax2 = sw;
+    int cap = g_ax_cap; g_ax_cap = g_ax2_cap; g_ax2_cap = cap;
+    if (k >= 2) ax_run(k);
+    else for (int i = 0; i < k; i++) ax_one(i);
+    if (verify) {
+        for (int i = 0; i < k; i++) {
+            int16_t* e = opcache_at(g_ax[i].c, g_ax[i].key);
+            g_ax_ver++;
+            if (e && *e != g_ax[i].v) {
+                if (++g_ax_bad <= 10)
+                    eb_log("country: VERIFY MISMATCH annexation opinion %.3s -> tag %d: the game stored %d, all cores %d",
+                           (const char*)(g_ax[i].c + C_TAG), (int)(int16_t)(g_ax[i].key >> 32), (int)g_ax[i].v, (int)*e);
+                *e = g_ax[i].v;                            // keep the game's value
+            }
+        }
+    } else {
+        for (int i = k; i < m; i++) ax_one(i);
+        g_ax_par += k; g_ax_main += m - k;
+    }
+    g_ax_us += (double)(now() - t0) * g_qpf_us;
+}
+// UpdateOpinionCache from FUN_140364f10's loop: recorded (returns 1) or, verify, run and recorded
+static int annex_call(void* cv, uint64_t key, char flag, void* ret) {
+    if (ret != g_ax_ret1 && ret != g_ax_ret2) {
+        if (g_ax_n && GetCurrentThreadId() == g_main_tid) annex_flush();   // something else first: the loop's calls go before it
+        return 0;
+    }
+    uint8_t* gs = *g_gsp;
+    void** session = gs ? *(void***)(gs + GS_SESSION) : NULL;
+    if (GetCurrentThreadId() != g_main_tid || g_in_batch || !session || session[0x6c]) return 0;
+    if (!g_ax_n && !g_ax_left) { g_ax_left = *(int*)(*g_tagtab + 0x100); g_ax_loops++; }
+    if (g_ax_n == g_ax_cap) {
+        int m = g_ax_cap ? g_ax_cap * 2 : 4096;
+        axcall_t* p = (axcall_t*)realloc(g_ax, (size_t)m * sizeof *p);
+        if (!p) { annex_flush(); return 0; }
+        g_ax = p; g_ax_cap = m;
+    }
+    uint8_t* c = (uint8_t*)cv;
+    axcall_t* a = &g_ax[g_ax_n++];
+    a->c = c; a->key = key; a->flag = flag; a->main = 0; a->has = 0; a->v = 0;
+    g_ax_calls++;
+    if (g_cfg.country_parallel_annex == 2) {               // verify: as the game, and what it stored
+        LONGLONG t0 = now();
+        o_opcache(c, key, flag);
+        g_ax_ser_us += (double)(now() - t0) * g_qpf_us;
+        int16_t* e = opcache_at(c, key);
+        if (e) { a->v = *e; a->has = 1; }
+    }
+    if (ret == g_ax_ret2 && --g_ax_left <= 0) annex_flush();
+    return 1;
+}
+// test_annex: the loop's calls for one existing country, serial and on all cores, compared; the cache put back
+static void annex_test(uint8_t* gs) {
+    static int loops;
+    if (++loops % g_cfg.country_test_annex || g_ax_n) return;
+    uint8_t** list = *(uint8_t***)(gs + GS_COUNTRIES);
+    int nl = *(int*)(gs + GS_NCOUNTRIES);
+    uint8_t** tab = *(uint8_t***)(*g_tagtab + 0x118);
+    int ntag = *(int*)(*g_tagtab + 0x100);
+    if (nl < 2 || ntag < 2) return;
+    uint8_t* x = NULL;
+    for (int k = 0; k < nl && !x; k++) {
+        uint8_t* c = list[(loops / g_cfg.country_test_annex * 7 + k) % nl];
+        if (c && *(int*)(c + C_PROVINCES) > 0) x = c;
+    }
+    if (!x) return;
+    int n = 2 * ntag;
+    if (n > g_ax_cap) {
+        axcall_t* p = (axcall_t*)realloc(g_ax, (size_t)n * sizeof *p);
+        if (!p) return;
+        g_ax = p; g_ax_cap = n;
+    }
+    int16_t* old = (int16_t*)malloc((size_t)n * sizeof *old);
+    if (!old) return;
+    uint64_t xkey = *(uint64_t*)(x + C_TAG);
+    int m = 0;
+    for (int i = 0; i < ntag; i++) {
+        uint8_t* c = tab[i];
+        if (!c) continue;
+        axcall_t a1 = { c, xkey, 1, 0, 0, 0 }, a2 = { x, *(uint64_t*)(c + C_TAG), 1, 0, 0, 0 };
+        if (opcache_at(a1.c, a1.key)) g_ax[m++] = a1;
+        if (opcache_at(a2.c, a2.key)) g_ax[m++] = a2;
+    }
+    for (int i = 0; i < m; i++) old[i] = *opcache_at(g_ax[i].c, g_ax[i].key);
+    LONGLONG t0 = now();
+    for (int i = 0; i < m; i++) { ax_one(i); g_ax[i].v = *opcache_at(g_ax[i].c, g_ax[i].key); *opcache_at(g_ax[i].c, g_ax[i].key) = old[i]; }
+    LONGLONG t1 = now();
+    if (m >= 2) ax_run(m);
+    LONGLONG t2 = now();
+    for (int i = 0; i < m; i++) {
+        int16_t* e = opcache_at(g_ax[i].c, g_ax[i].key);
+        if (*e != g_ax[i].v && ++g_ax_test_bad <= 10)
+            eb_log("country: TEST annexation opinion %.3s -> tag %d: serial %d, all cores %d",
+                   (const char*)(g_ax[i].c + C_TAG), (int)(int16_t)(g_ax[i].key >> 32), (int)g_ax[i].v, (int)*e);
+        *e = old[i];
+    }
+    free(old);
+    g_ax_tests++; g_ax_test_calls += m;
+    g_ax_test_ser_us += (double)(t1 - t0) * g_qpf_us; g_ax_test_par_us += (double)(t2 - t1) * g_qpf_us;
+}
+
 // ---- hooks ------------------------------------------------------------------------------------------
 static void war_test(uint8_t* gs);
 static void hk_serial(void* gs) {
     LONGLONG t0 = g_cfg.country_stats ? now() : 0;
+    if (g_ax_n) annex_flush();                                  // a loop not seen to its end (should not happen)
+    if (g_cfg.country_test_annex > 0 && g_cfg.country_parallel_annex) annex_test((uint8_t*)gs);
     if (g_cfg.country_parallel_refresh) precompute((uint8_t*)gs);
     o_serial(gs);
     if (g_cfg.country_parallel_refresh) finish_loop();
@@ -450,7 +634,6 @@ static LONG64 g_war_calls, g_war_par, g_war_jobs, g_war_serial, g_war_ver, g_war
 static double g_war_us, g_war_ver_us, g_war_test_us, g_war_test_ser_us;
 static LONG64 g_war_test_jobs, g_war_test_serial, g_war_test_ver, g_war_test_bad;
 static const char* g_war_where[2];                     // the game's "where" texts of the two loops
-static uint8_t** g_tagtab;                              // DAT_14233d8d0: tag table object, +0x118 = country by tag
 static int16_t g_tagidx[65536];                         // participant index by tag (-1 = none; reset after use)
 
 // RefreshKnowledge of cs[0..n) as the game would in this order; returns the parallel count.
@@ -566,7 +749,7 @@ static void war_test(uint8_t* gs) {                    // test_war_all: a war of
 }
 
 int eb_country_install(void) {
-    if (!g_cfg.country_stats && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) return 0;
+    if (!g_cfg.country_stats && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war && !g_cfg.country_parallel_annex) return 0;
 #ifdef EB_TEST
     eb_log("country: hooks are not available in the test build");
     return 0;
@@ -614,7 +797,13 @@ int eb_country_install(void) {
         g_war_where[0] = NULL;
         if (g_cfg.country_parallel_war) eb_log("country: war refresh texts not found - parallel war refresh off");
     }
-    if (g_cfg.country_parallel_refresh || g_cfg.country_parallel_war) {
+    if (g_cfg.country_parallel_annex) {                 // the two calls of FUN_140364f10's loop
+        uint8_t* r1 = b + RET_ANNEX1; uint8_t* r2 = b + RET_ANNEX2;
+        if (r1[-5] == 0xe8 && r1 + *(int32_t*)(r1 - 4) == b + RVA_OPCACHE && r2[-5] == 0xe8 && r2 + *(int32_t*)(r2 - 4) == b + RVA_OPCACHE &&
+            !memcmp(r1, sig_annex, sizeof sig_annex)) { g_ax_ret1 = r1; g_ax_ret2 = r2; }
+        else { eb_log("country: annexation loop not found - parallel annexation opinions off"); g_cfg.country_parallel_annex = 0; }
+    }
+    if (g_cfg.country_parallel_refresh || g_cfg.country_parallel_war || g_cfg.country_parallel_annex) {
         SYSTEM_INFO si; GetSystemInfo(&si);
         int nw = (int)si.dwNumberOfProcessors - 1;
         if (nw > MAXWORKERS) nw = MAXWORKERS;
@@ -628,7 +817,8 @@ int eb_country_install(void) {
     MH_STATUS s = MH_Initialize();
     if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("country: MinHook init failed"); return 0; }
     for (int i = 0; i < nt_; i++) {
-        if ((t[i].rva == RVA_OPCACHE || t[i].rva == RVA_MSG) && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) continue;
+        if (t[i].rva == RVA_OPCACHE && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war && !g_cfg.country_parallel_annex) continue;
+        if (t[i].rva == RVA_MSG && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) continue;
         // timing-only hooks: not needed to play
         if ((t[i].rva == RVA_DAILY || t[i].rva == RVA_CM || t[i].rva == RVA_UCB) && !g_cfg.country_stats) continue;
         if (t[i].rva == RVA_WARREF && !g_cfg.country_stats && !g_cfg.country_parallel_war) continue;
@@ -648,6 +838,10 @@ int eb_country_install(void) {
         eb_log("country: war refresh (joining or declaring a war) on all cores, mode %d (%s), %d worker threads%s",
                g_cfg.country_parallel_war, g_cfg.country_parallel_war == 2 ? "on + verify" : "on", g_nworkers,
                g_cfg.country_test_war_all ? " | TEST: every country that is not dirty, as one war" : "");
+    if (g_cfg.country_parallel_annex)
+        eb_log("country: opinions recomputed when a country disappears on all cores, mode %d (%s), %d worker threads%s",
+               g_cfg.country_parallel_annex, g_cfg.country_parallel_annex == 2 ? "on + verify" : "on", g_nworkers,
+               g_cfg.country_test_annex ? " | TEST: the same for one country every few loops" : "");
     return 1;
 #endif
 }
@@ -667,6 +861,13 @@ void eb_country_report(void) {
         eb_log("country: war refresh: %lld calls, %lld in parallel (%lld participants on all cores, %lld after them in order), %.1f ms in total | verify %lld, mismatches %lld (serial redo %.1f ms)",
                (long long)g_war_calls, (long long)g_war_par, (long long)g_war_jobs, (long long)g_war_serial, g_war_us / 1000.0,
                (long long)g_war_ver, (long long)g_war_bad, g_war_ver_us / 1000.0);
+    if (g_cfg.country_parallel_annex)
+        eb_log("country: annexation opinions: %lld loops, %lld calls (%lld on all cores, %lld on the main thread after them), %.1f ms in total | verify %lld, mismatches %lld (the game's own calls %.1f ms)",
+               (long long)g_ax_loops, (long long)g_ax_calls, (long long)g_ax_par, (long long)g_ax_main, g_ax_us / 1000.0,
+               (long long)g_ax_ver, (long long)g_ax_bad, g_ax_ser_us / 1000.0);
+    if (g_ax_tests)
+        eb_log("country: TEST annexation opinions: %lld runs, %lld calls, serial %.1f ms, all cores %.1f ms, mismatches %lld",
+               (long long)g_ax_tests, (long long)g_ax_test_calls, g_ax_test_ser_us / 1000.0, g_ax_test_par_us / 1000.0, (long long)g_ax_test_bad);
     if (g_war_tests)
         eb_log("country: TEST war of all countries: %lld runs, %lld participants on all cores (%lld after them in order) in %.1f ms | verify %lld, mismatches %lld, serial redo %.1f ms",
                (long long)g_war_tests, (long long)g_war_test_jobs, (long long)g_war_test_serial, g_war_test_us / 1000.0,
