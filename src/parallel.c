@@ -173,11 +173,33 @@ static int cmp_cost(const void* a, const void* b) {
     return x - y;
 }
 
+// Who is still working (report 81): a stall report samples the main thread, and when that waits for a
+// loop (my_wait) the time goes into another thread's item. Every thread that runs items has a slot with
+// its id, a handle to sample it, and the item and start time of the chunk it runs; crash.c samples the
+// one that has been at its chunk the longest.
+eb_busy_t eb_busy[EB_NBUSY];
+volatile LONG eb_nbusy, eb_par_main_waiting;
+static __thread int t_busy = -1;                   // this thread's slot, -2 = none left
+static eb_busy_t* busy_slot(void) {
+    if (t_busy >= 0) return &eb_busy[t_busy];
+    if (t_busy == -2) return NULL;
+    LONG i = InterlockedIncrement(&eb_nbusy) - 1;
+    if (i >= EB_NBUSY) { InterlockedDecrement(&eb_nbusy); t_busy = -2; return NULL; }
+    eb_busy_t* b = &eb_busy[i];
+    b->h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
+    b->since = 0;
+    MemoryBarrier();
+    b->tid = GetCurrentThreadId();                 // last: crash.c reads slots with a tid
+    t_busy = (int)i;
+    return b;
+}
+
 static void participate(uint8_t* ctx) {
     const int start = *(int*)(ctx + 0x40), end = *(int*)(ctx + 0xa8);
     const int parts = *(int*)(ctx + 0xb8) + 1;
     ord_t* o = g_ord_any ? ord_ctx(ctx, start, end) : NULL;
     const int chunky = !o && (end - start) >= 32 * parts;
+    eb_busy_t* busy = busy_slot();
     for (;;) {
         int chunk = 1;
         if (chunky) {
@@ -190,6 +212,12 @@ static void participate(uint8_t* ctx) {
         if (idx >= end) { *(volatile char*)(ctx + 0x50) = 1; break; }
         int hi = idx + chunk; if (hi > end || hi < idx) hi = end;
         int done = 0, cancelled = 0;
+        if (busy) { busy->item = idx; busy->since = qpc(); }
+        if (g_cfg.test_slow_item_ms > 0 && busy && end - start >= 100 && GetCurrentThreadId() != g_main_tid) {
+            static volatile LONGLONG last;                 // testing only: a slow item the main thread waits for
+            LONGLONG now = busy->since, l = last;
+            if ((now - l) * g_us > 60e6 && InterlockedCompareExchange64(&last, now, l) == l) Sleep((DWORD)g_cfg.test_slow_item_ms);
+        }
         for (int i = idx; i < hi; i++) {
             void* fn = *(void**)(ctx + 0xa0);
             if (!fn) bad_function_call();
@@ -200,6 +228,7 @@ static void participate(uint8_t* ctx) {
             done++;
             if (**(volatile int**)(ctx + 0x60) != 0) { cancelled = 1; break; }
         }
+        if (busy) busy->since = 0;
         InterlockedExchangeAdd(*(volatile LONG**)(ctx + 0x48), done);
         if (cancelled) break;
     }
@@ -228,11 +257,14 @@ static void my_task(void** param) {
 static void my_wait(uint8_t* self) {
     char* lockp = *(char**)(self + 8);
     game_spinlock(lockp);
+    int main = GetCurrentThreadId() == g_main_tid;
+    if (main) eb_par_main_waiting = 1;
     for (;;) {
         uint8_t* ctx = *(uint8_t**)(self + 0x10);
         if ((*(void**)(ctx + 0x38) == NULL || **(volatile int**)(ctx + 0x58) != 0) &&
             **(volatile int**)(ctx + 0x48) >= *(int*)(ctx + 0xa8)) {
             *(volatile char*)lockp = 0;
+            if (main) eb_par_main_waiting = 0;
             return;
         }
         if (*(volatile char*)(ctx + 0x50) != 1) participate(ctx);

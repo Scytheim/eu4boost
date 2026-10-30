@@ -3,8 +3,10 @@
 python tools/analysis/memsites.py eu4boost_memsites.tsv [--from N] [--to M] [--top 30]
 
 Prints the process totals of every snapshot, then the call sites whose sampled live memory grew the most
-between snapshot N (default: the first one with a game date) and M (default: the last one). The numbers
-are estimates (samples x the sampling rate). Frames are eu4+RVA (add 0x140000000 for Ghidra).
+between snapshot N (default: the first one with a game date) and M (default: the last one). N and M count
+the snapshots of the file from 0 (the file gets the snapshots of every session; 'snap' restarts at 1 in
+each), and a site is its frames, so two sessions can be compared too. The numbers are estimates (samples
+x the sampling rate). Frames are eu4+RVA (add 0x140000000 for Ghidra).
 """
 import argparse, bisect, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 're'))
@@ -56,28 +58,28 @@ def main():
     snaps = load(o.tsv)
     if not snaps:
         print('no snapshots'); return
-    print('snap  time      date        private  ws     live(est)  blocks(est)')
-    for s in snaps:
+    print(' idx snap  time      date        private  ws     live(est)  blocks(est)')
+    for j, s in enumerate(snaps):
         k = s['kv']
-        print(f"{s['n']:4d}  {s['time']}  {s['date']:10s}  {k.get('private_mb', '?'):>7s}  {k.get('ws_mb', '?'):>5s}  {k.get('live_mb_est', '?'):>9s}  {k.get('live_blocks_est', '?'):>11s}")
+        print(f"{j:4d} {s['n']:4d}  {s['time']}  {s['date']:10s}  {k.get('private_mb', '?'):>7s}  {k.get('ws_mb', '?'):>5s}  {k.get('live_mb_est', '?'):>9s}  {k.get('live_blocks_est', '?'):>11s}")
     if any(s['mem'] for s in snaps):
         print('\nsnap  mimalloc  other_private  heaps_commit  heaps_alloc  mapped')
         for s in snaps:
             m = s['mem']
             if m:
                 print(f"{s['n']:4d}  {m['mimalloc_mb']:>8s}  {m['other_private_mb']:>13s}  {m['heaps_commit_mb']:>12s}  {m['heaps_alloc_mb']:>11s}  {m['mapped_mb']:>6s}")
-    by_n = {s['n']: s for s in snaps}
-    a = by_n.get(o.a) if o.a else next((s for s in snaps if s['date'] != '-'), snaps[0])
-    b = by_n.get(o.b) if o.b else snaps[-1]
+    a = snaps[o.a] if o.a is not None else next((s for s in snaps if s['date'] != '-'), snaps[0])
+    b = snaps[o.b] if o.b is not None else snaps[-1]
     print(f"\ngrowth from snapshot {a['n']} ({a['date']}) to {b['n']} ({b['date']}): private "
           f"{int(b['kv']['private_mb']) - int(a['kv']['private_mb']):+d} MB, sampled live {float(b['kv']['live_mb_est']) - float(a['kv']['live_mb_est']):+.0f} MB")
-    # a site missing from a snapshot's top list counts as 0 there (only the top 150 are written)
-    ids = set(a['sites']) | set(b['sites'])
+    # a site missing from a snapshot's top list counts as 0 there (only the top 300 are written, 150 before 10-30)
+    sa = {tuple(x['fr']): (i, x) for i, x in a['sites'].items()}
+    sb = {tuple(x['fr']): (i, x) for i, x in b['sites'].items()}
     rows = []
-    for i in ids:
-        x = a['sites'].get(i, {}).get('live', 0.0); y = b['sites'].get(i, {}).get('live', 0.0)
-        fr = (b['sites'].get(i) or a['sites'].get(i))['fr']
-        rows.append((y - x, x, y, i, fr, b['sites'].get(i, {}).get('n', 0.0)))
+    for fr in set(sa) | set(sb):
+        x = sa[fr][1]['live'] if fr in sa else 0.0; y = sb[fr][1]['live'] if fr in sb else 0.0
+        i = (sb.get(fr) or sa.get(fr))[0]
+        rows.append((y - x, x, y, i, list(fr), sb[fr][1]['n'] if fr in sb else 0.0))
     rows.sort(reverse=True)
     print(f"\n{'grow MB':>8s} {'from':>8s} {'to':>8s} {'blocks':>9s}  site  frames")
     for d, x, y, i, fr, n in rows[:o.top]:

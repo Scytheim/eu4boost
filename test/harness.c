@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <psapi.h>
 
 // Stand-ins for eu4.exe's CRT heap functions (process heap, like UCRT). Exported so the
 // EB_TEST build of the DLL can find and hook them. noinline + some body so MinHook can patch.
@@ -450,6 +451,18 @@ static DWORD WINAPI churn(LPVOID arg) {
 
 static DWORD WINAPI other_thread_pops(LPVOID h) { for (int i = 0; i < 50; i++) POPS_RunCallbacks(h); return 0; }
 
+// one save-compression worker: deflate's buffers and state, all freed again before the thread ends
+static DWORD WINAPI short_worker(LPVOID arg) {
+    (void)arg;
+    void* a[5] = { t_malloc(5952), t_malloc(65536), t_malloc(65536), t_malloc(131072), t_malloc(131072) };
+    for (int i = 0; i < 5; i++) { memset(a[i], 1, 4096); t_free(a[i]); }
+    return 0;
+}
+static double private_mb(void) {
+    PROCESS_MEMORY_COUNTERS_EX m; m.cb = sizeof m;
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&m, sizeof m) ? m.PrivateUsage / 1048576.0 : 0;
+}
+
 int main(int argc, char** argv) {
     // allocate a "foreign" block before the plugin is loaded
     void* early = t_malloc(100); memset(early, 1, 100);
@@ -644,6 +657,21 @@ int main(int argc, char** argv) {
             ok = sw(20000, 1, &us, &deep, &faults);
             printf("stackwalk after the resume (0.4.1): %d walked, %d with 3+ frames, %d faults caught by the guard\n", ok, deep, faults);
         }
+    }
+
+    // 3k. threads that end give their allocator memory back (mimalloc's own exit hook is MSVC-only, so DllMain does it):
+    //     before, every ended thread kept ~0.85 MB, ~15 MB per save with savezip.c's workers
+    if (argc > 3 && strcmp(argv[3], "threadexit") == 0) {
+        double before = private_mb();
+        for (int i = 0; i < 400; i++) {
+            HANDLE t = CreateThread(NULL, 256 << 10, short_worker, NULL, 0, NULL);
+            CHECK(t != NULL);
+            if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+        }
+        Sleep(600);
+        double grew = private_mb() - before;
+        printf("threadexit: 400 threads that allocated and ended, private memory %+.1f MB\n", grew);
+        CHECK(grew < 40);
     }
 
     // 4. multi-threaded churn (also gives the profiler something to sample)

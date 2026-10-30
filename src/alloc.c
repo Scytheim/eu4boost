@@ -291,9 +291,18 @@ int eb_alloc_install(void) {
 // uitime.c: mallocs zero-filled by mimalloc so far and their bytes (statistics, not exact across threads)
 void eb_alloc_zero_stats(LONG64* n, LONG64* bytes) { *n = g_zeroed; *bytes = g_zeroed_bytes; }
 
+// mimalloc's own thread-exit hook for a static library is MSVC-only (TLS callbacks placed with #pragma const_seg,
+// which clang ignores), so a thread that ended kept its heap: its pages stayed committed, emptied or not, and no
+// other thread could use them (~0.85 MB per thread). savezip.c starts its compression workers for every saved
+// entry: ~15 MB per save, +1.9 GB in 1645 -> 1676 with quarterly autosaves (2026-10-29). DllMain calls this on
+// DLL_THREAD_DETACH; mimalloc returns at once for a thread that never allocated.
+static volatile LONG64 g_threads_done;
+void eb_alloc_thread_done(void) { InterlockedIncrement64(&g_threads_done); mi_thread_done(); }
+
 void eb_alloc_report(void) {
-    eb_log("allocator: foreign frees %lld, foreign reallocs %lld, guard hits %lld, zero-filled mallocs %lld (+ %lld from the Windows heap)",
-           (long long)g_foreign_free, (long long)g_foreign_realloc, (long long)g_guard_hits, (long long)g_zeroed, (long long)g_zeroed_os);
+    eb_log("allocator: foreign frees %lld, foreign reallocs %lld, guard hits %lld, zero-filled mallocs %lld (+ %lld from the Windows heap), ended threads cleaned up %lld",
+           (long long)g_foreign_free, (long long)g_foreign_realloc, (long long)g_guard_hits, (long long)g_zeroed, (long long)g_zeroed_os,
+           (long long)g_threads_done);
     size_t elapsed, user, sys, rss, peak_rss, commit, peak_commit, faults;
     mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
     eb_log("process: peak working set %zu MB, peak commit %zu MB, cpu user %zu s, sys %zu s",

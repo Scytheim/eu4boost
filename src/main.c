@@ -63,6 +63,7 @@ static void load_config(void) {
     c->ai_prov_min          = ini_int(ini, L"parallel",  L"ai_prov_min", 50);
     c->ai_ae_cache          = ini_int(ini, L"parallel",  L"ai_ae_cache", 0);       // experimental
     c->ai_army_fast         = ini_int(ini, L"parallel",  L"ai_army_fast", 0);      // experimental
+    c->ai_land_memo         = ini_int(ini, L"parallel",  L"ai_land_memo", 0);      // experimental
     c->alloc_enabled        = ini_int(ini, L"allocator", L"enabled", 1);
     c->alloc_guard_foreign  = ini_int(ini, L"allocator", L"guard_foreign", 1);
     c->alloc_large_pages    = ini_int(ini, L"allocator", L"large_pages", 0);
@@ -97,7 +98,9 @@ static void load_config(void) {
     c->prov_text_cache      = ini_int(ini, L"modifiers", L"prov_text_cache", 0);   // experimental
     c->mod_stats            = ini_int(ini, L"modifiers", L"stats", 0);
     c->country_stats        = ini_int(ini, L"country",   L"stats", 0);
-    c->country_parallel_refresh = ini_int(ini, L"country", L"parallel_refresh", 0); // experimental
+    c->country_parallel_refresh = ini_int(ini, L"country", L"parallel_refresh", 0); // experimental, 2-4 = analysis modes
+    // 1 (on) is ignored since 0.4.10: the ini of 0.4.1-0.4.9 shipped it, and a worker crashed in it (report 105)
+    if (c->country_parallel_refresh == 1) { c->country_parallel_refresh = 0; c->country_refresh_ignored = 1; }
     c->country_refresh_fixup = ini_int(ini, L"country", L"refresh_fixup", 1);
     c->country_parallel_war = ini_int(ini, L"country", L"parallel_war", 0);
     c->country_parallel_annex = ini_int(ini, L"country", L"parallel_annex", 0);
@@ -112,10 +115,13 @@ static void load_config(void) {
         c->autorun_until = a[0] ? eb_autorun_date(a) : 0;
         c->autorun_stuck_s = ini_int(ini, L"test", L"autorun_stuck_s", 300);
         c->autorun_minimize = ini_int(ini, L"test", L"autorun_minimize", 1);
+        c->autorun_offscreen = ini_int(ini, L"test", L"autorun_offscreen", 0);
+        c->autorun_input = ini_int(ini, L"test", L"autorun_input", 0);
         c->test_warview = ini_int(ini, L"test", L"warview", 0);
         c->test_ironman_name = ini_int(ini, L"test", L"ironman_name", 0);
         c->test_loc_fiber = ini_int(ini, L"test", L"loc_fiber", 0);
         c->test_diplo_freed = ini_int(ini, L"test", L"diplo_freed", 0);
+        c->test_slow_item_ms = ini_int(ini, L"test", L"slow_item_ms", 0);
         c->autorun_fastfail = ini_int(ini, L"test", L"autorun_fastfail", 0);
     }
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
@@ -125,7 +131,15 @@ static void load_config(void) {
     c->guard_ironman_name   = ini_int(ini, L"guard",     L"ironman_name", 1);
     c->guard_loc_duplicates = ini_int(ini, L"guard",     L"loc_duplicates", 1);
     c->guard_diplo_reset    = ini_int(ini, L"guard",     L"diplomacy_reset", 1);
+    c->leak_subject_modifiers = ini_int(ini, L"leaks",   L"subject_modifiers", 1);
+    c->leak_ai_actions      = ini_int(ini, L"leaks",     L"ai_actions", 1);
+    c->leak_province_items  = ini_int(ini, L"leaks",     L"province_items", 0);
+    c->leak_diplo_actions   = ini_int(ini, L"leaks",     L"diplo_actions", 0);
+    c->leak_message_popups  = ini_int(ini, L"leaks",     L"message_popups", 0);
     c->ui_timing            = ini_int(ini, L"general",   L"ui_timing", 0);       // diagnostics
+    c->play_monitor         = ini_int(ini, L"diag",      L"play_monitor", 0);
+    c->play_monitor_s       = ini_int(ini, L"diag",      L"play_monitor_s", 30);
+    c->play_monitor_census_s = ini_int(ini, L"diag",     L"play_monitor_census_s", 600);
     c->mem_sites            = ini_int(ini, L"diag",      L"mem_sites", 0);
     c->mem_sites_s          = ini_int(ini, L"diag",      L"mem_sites_s", 60);
     c->report_capture       = ini_int(ini, L"report",    L"capture", 1);
@@ -184,6 +198,8 @@ static void init(void) {
     eb_log("config: allocator=%d guard=%d large_pages=%d reserve_mb=%d purge_delay_ms=%d | profiler=%d autostart=%d interval_us=%d max_seconds=%d | main_thread=%d background_full_speed=%d | speed5_midtick_frame_ms=%d | online_poll_ms=%d zero_fill=%d/%d",
            g_cfg.alloc_enabled, g_cfg.alloc_guard_foreign, g_cfg.alloc_large_pages, g_cfg.alloc_reserve_mb, g_cfg.alloc_purge_delay_ms,
            g_cfg.prof_enabled, g_cfg.prof_autostart, g_cfg.prof_interval_us, g_cfg.prof_max_seconds, g_cfg.main_affinity, g_cfg.bg_full_speed, g_cfg.speed5_midtick_ms, g_cfg.online_poll_ms, g_cfg.alloc_zero_fill, g_cfg.zero_min_bytes);
+    if (g_cfg.country_refresh_ignored)
+        eb_log("config: [country] parallel_refresh=1 is ignored since 0.4.10 (a worker crashed in the parallel RefreshKnowledge, report 105)");
     if (g_cfg.par_ab) {
         // Alternate between "experiments off" (A) and "as configured" (B) on every launch, so two
         // runs in a row give an A/B pair without editing the ini in between.
@@ -225,10 +241,12 @@ static void init(void) {
     eb_country_install();
     eb_console_install();
     eb_guard_install();
+    eb_leakfix_install();
     eb_aiprof_install();
     eb_uitime_install();
     eb_autorun_install();
     eb_crash_install();          // last: its frame counter chains to the other POPS hooks
+    eb_playmon_install();
     eb_report_start();
     eb_update_start();
     if (g_cfg.prof_enabled) {
@@ -241,6 +259,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = h;
         init();
+    } else if (reason == DLL_THREAD_DETACH) {
+        eb_alloc_thread_done();
     } else if (reason == DLL_PROCESS_DETACH) {
         // reserved != NULL means the process is exiting: other threads are already gone.
         if (g_cfg.prof_enabled) eb_prof_shutdown();
@@ -255,6 +275,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         eb_modifier_report();
         eb_country_report();
         eb_guard_report();
+        eb_leakfix_report();
+        eb_playmon_report();
         eb_crash_exit();
         eb_log("process exit");
     }

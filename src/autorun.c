@@ -9,7 +9,8 @@
 // Started that way, the front end's continue FUN_1410ee950(front end, continue callback) asks "achievements
 // will be disabled" (mods, no launcher) and waits for a click; here it runs the callback (vtable +0x18)
 // at once, which is what its Agree button does. The game window is minimized as soon as it shows
-// ([test] autorun_minimize, default 1) and again if it comes back without being the foreground window.
+// ([test] autorun_minimize, default 1) and again if it comes back without being the foreground window,
+// or kept drawn off the desktop with a simulated player ([test] autorun_offscreen=1, autorun_input=seed).
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
@@ -100,6 +101,198 @@ static void hk_continue(void* fe, void** cb) {
     ((void (*)(void*))(*(void***)cb)[0x18 / 8])(cb);
 }
 
+
+// ---- the off-screen window and the simulated player ([test] autorun_offscreen, autorun_input) ----
+// To measure frames and input delay as in play while the PC is used for other work: the game window is
+// shown (so it draws) but outside the desktop and never activated, and a simulated player posts input
+// messages to it after the load: the pointer wanders and hovers over the map, the wheel zooms in and
+// out, arrow keys pan, left clicks open provinces, F1..F8 open a view and close it again, now and then a
+// pause. Never Esc, never the menu corner. Inside the game process only, the input and focus queries
+// answer for the simulated player: GetCursorPos (its pointer), GetAsyncKeyState/GetKeyState (its keys
+// and buttons), GetFocus/GetActiveWindow (the game window), WindowFromPoint (the game window over its
+// own rect); ClipCursor, SetCursorPos and TrackMouseEvent do nothing, so the user's pointer is never
+// confined, moved or tracked. CreateWindowExW/SetWindowPos/ShowWindow keep the game's top-level windows
+// off the desktop and unactivated from the start.
+#define OFF_X 20000
+static HWND g_win;
+static volatile LONG g_ox, g_oy, g_cw = 1280, g_ch = 720;  // client origin (screen) and size
+static volatile LONG g_px = 640, g_py = 360;               // the simulated pointer (client)
+static volatile uint8_t g_keys[256];
+static int g_off;
+typedef HWND (WINAPI *cwe_t)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+typedef BOOL (WINAPI *swp_t)(HWND, HWND, int, int, int, int, UINT);
+typedef BOOL (WINAPI *sw_t)(HWND, int);
+typedef BOOL (WINAPI *gcp_t)(LPPOINT);
+typedef BOOL (WINAPI *scp_t)(int, int);
+typedef BOOL (WINAPI *cc_t)(const RECT*);
+typedef SHORT (WINAPI *gks_t)(int);
+typedef HWND (WINAPI *gw_t)(void);
+typedef HWND (WINAPI *wfp_t)(POINT);
+typedef BOOL (WINAPI *tme_t)(LPTRACKMOUSEEVENT);
+static cwe_t o_cwe; static swp_t o_swp; static sw_t o_sw; static gcp_t o_gcp; static scp_t o_scp; static cc_t o_cc;
+static gks_t o_gaks, o_gks; static gw_t o_gf, o_gaw; static wfp_t o_wfp; static tme_t o_tme;
+static int ours(HWND h) {                                  // a top-level window of this process
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    return h && pid == GetCurrentProcessId() && !GetParent(h) && !GetWindow(h, GW_OWNER);
+}
+static HWND WINAPI hk_cwe(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD st, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID p) {
+    if (!parent && !(st & WS_CHILD)) { x = OFF_X; y = 0; ex &= ~(DWORD)WS_EX_TOPMOST; }
+    return o_cwe(ex, cls, name, st, x, y, w, h, parent, menu, inst, p);
+}
+static BOOL WINAPI hk_swp(HWND h, HWND after, int x, int y, int cx, int cy, UINT f) {
+    if (ours(h)) {
+        if (!(f & SWP_NOMOVE) && x < OFF_X - 1000) x = OFF_X;
+        if (after == HWND_TOPMOST || after == HWND_TOP) f |= SWP_NOZORDER;
+        f |= SWP_NOACTIVATE;
+    }
+    return o_swp(h, after, x, y, cx, cy, f);
+}
+static BOOL WINAPI hk_sw(HWND h, int cmd) {
+    if (ours(h) && (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_RESTORE || cmd == SW_SHOWDEFAULT || cmd == SW_SHOWMAXIMIZED))
+        cmd = SW_SHOWNOACTIVATE;
+    return o_sw(h, cmd);
+}
+static BOOL WINAPI hk_gcp(LPPOINT p) { if (!p) return FALSE; p->x = g_ox + g_px; p->y = g_oy + g_py; return TRUE; }
+static BOOL WINAPI hk_scp(int x, int y) { g_px = x - g_ox; g_py = y - g_oy; return TRUE; }
+static BOOL WINAPI hk_cc(const RECT* r) { (void)r; return TRUE; }
+static SHORT WINAPI hk_gaks(int vk) { return (vk >= 0 && vk < 256 && g_keys[vk]) ? (SHORT)0x8000 : 0; }
+static SHORT WINAPI hk_gks(int vk) { return (vk >= 0 && vk < 256 && g_keys[vk]) ? (SHORT)0x8000 : 0; }
+static HWND WINAPI hk_gf(void) { return g_win ? g_win : o_gf(); }
+static HWND WINAPI hk_gaw(void) { return g_win ? g_win : o_gaw(); }
+static HWND WINAPI hk_wfp(POINT pt) {
+    if (g_win && pt.x >= g_ox && pt.x < g_ox + g_cw && pt.y >= g_oy && pt.y < g_oy + g_ch) return g_win;
+    return o_wfp(pt);
+}
+static BOOL WINAPI hk_tme(LPTRACKMOUSEEVENT t) { (void)t; return TRUE; }
+static int hook_api(const char* name, void* fn, void* orig) {
+    void* t = (void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), name);
+    if (!t || MH_CreateHook(t, fn, (void**)orig) != MH_OK || MH_EnableHook(t) != MH_OK) { eb_log("autorun: %s hook failed", name); return 0; }
+    return 1;
+}
+static int offscreen_install(void) {
+    MH_STATUS st = MH_Initialize();
+    if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return 0;
+    int ok = hook_api("CreateWindowExW", (void*)hk_cwe, &o_cwe) & hook_api("SetWindowPos", (void*)hk_swp, &o_swp) &
+             hook_api("ShowWindow", (void*)hk_sw, &o_sw) & hook_api("GetCursorPos", (void*)hk_gcp, &o_gcp) &
+             hook_api("SetCursorPos", (void*)hk_scp, &o_scp) & hook_api("ClipCursor", (void*)hk_cc, &o_cc) &
+             hook_api("GetAsyncKeyState", (void*)hk_gaks, &o_gaks) & hook_api("GetKeyState", (void*)hk_gks, &o_gks) &
+             hook_api("GetFocus", (void*)hk_gf, &o_gf) & hook_api("GetActiveWindow", (void*)hk_gaw, &o_gaw) &
+             hook_api("WindowFromPoint", (void*)hk_wfp, &o_wfp) & hook_api("TrackMouseEvent", (void*)hk_tme, &o_tme);
+    return ok;
+}
+static BOOL CALLBACK find_cb(HWND h, LPARAM l) {
+    RECT r;
+    if (ours(h) && IsWindowVisible(h) && GetWindowRect(h, &r) && r.right - r.left >= 640) { *(HWND*)l = h; return FALSE; }
+    return TRUE;
+}
+static DWORD WINAPI off_thread(LPVOID p) {                 // keeps the game window drawn but off the desktop
+    (void)p;
+    int told = 0, activated = 0;
+    while (!g_closed) {
+        HWND h = NULL; EnumWindows(find_cb, (LPARAM)&h);
+        if (h) {
+            g_win = h;
+            if (IsIconic(h)) {                              // started minimized: restore straight to the off-screen place
+                WINDOWPLACEMENT wp; wp.length = sizeof wp;
+                if (GetWindowPlacement(h, &wp)) {
+                    LONG w = wp.rcNormalPosition.right - wp.rcNormalPosition.left, hh = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+                    wp.rcNormalPosition.left = OFF_X; wp.rcNormalPosition.top = 0;
+                    wp.rcNormalPosition.right = OFF_X + w; wp.rcNormalPosition.bottom = hh;
+                    wp.showCmd = SW_SHOWNOACTIVATE; wp.flags = 0;
+                    SetWindowPlacement(h, &wp);
+                }
+            }
+            RECT r; GetWindowRect(h, &r);
+            if (r.left < OFF_X - 1000) o_swp(h, NULL, OFF_X, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            RECT c; POINT o = { 0, 0 };
+            if (GetClientRect(h, &c) && ClientToScreen(h, &o)) { g_ox = o.x; g_oy = o.y; g_cw = c.right; g_ch = c.bottom; }
+            if (!told++) eb_log("autorun: game window kept off the desktop at x %d (client %ldx%ld)", OFF_X, (long)g_cw, (long)g_ch);
+            if (g_loaded && !activated) { activated = 1; PostMessageW(h, WM_ACTIVATE, WA_ACTIVE, 0); PostMessageW(h, WM_SETFOCUS, 0, 0); }
+        }
+        Sleep(200);
+    }
+    return 0;
+}
+
+// the simulated player: its input messages and when each key, button or wheel message was posted (playmon's input delay)
+typedef struct { UINT msg; LONGLONG t; } posted_t;
+static posted_t g_q[512];
+static volatile LONG g_qh, g_qt;                           // the main thread takes at g_qh, the player puts at g_qt
+static SRWLOCK g_ql = SRWLOCK_INIT;
+static LONGLONG qnow(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static void post_in(UINT msg, WPARAM w, LPARAM l) {
+    AcquireSRWLockExclusive(&g_ql);
+    if (g_qt - g_qh < 512) { g_q[g_qt & 511].msg = msg; g_q[g_qt & 511].t = qnow(); g_qt++; }
+    ReleaseSRWLockExclusive(&g_ql);
+    PostMessageW(g_win, msg, w, l);
+}
+LONGLONG eb_autorun_input_made(UINT msg) {
+    if (!g_off) return 0;
+    LONGLONG t = 0;
+    AcquireSRWLockExclusive(&g_ql);
+    while (g_qh < g_qt) { posted_t q = g_q[g_qh & 511]; g_qh++; if (q.msg == msg) { t = q.t; break; } }
+    ReleaseSRWLockExclusive(&g_ql);
+    return t;
+}
+static uint64_t g_rng;
+static uint32_t rnd(uint32_t n) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return n ? (uint32_t)(g_rng % n) : 0; }
+static WPARAM mk(void) { return (g_keys[VK_LBUTTON] ? MK_LBUTTON : 0) | (g_keys[VK_RBUTTON] ? MK_RBUTTON : 0); }
+static void move_to(int x, int y, int steps, int ms) {
+    int x0 = g_px, y0 = g_py;
+    for (int i = 1; i <= steps && !g_closed; i++) {
+        g_px = x0 + (x - x0) * i / steps; g_py = y0 + (y - y0) * i / steps;
+        PostMessageW(g_win, WM_MOUSEMOVE, mk(), MAKELPARAM(g_px, g_py));
+        Sleep((DWORD)(ms / steps));
+    }
+}
+static void key(int vk, int down) {
+    UINT sc = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+    int ext = vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN;
+    LPARAM l = 1 | ((LPARAM)sc << 16) | (ext ? (1 << 24) : 0) | (down ? 0 : ((LPARAM)3 << 30));
+    g_keys[vk] = (uint8_t)down;
+    if (down) post_in(WM_KEYDOWN, (WPARAM)vk, l); else PostMessageW(g_win, WM_KEYUP, (WPARAM)vk, l);
+}
+static void click(int right) {
+    int vk = right ? VK_RBUTTON : VK_LBUTTON;
+    g_keys[vk] = 1; post_in(right ? WM_RBUTTONDOWN : WM_LBUTTONDOWN, mk(), MAKELPARAM(g_px, g_py));
+    Sleep(60 + rnd(80));
+    g_keys[vk] = 0; PostMessageW(g_win, right ? WM_RBUTTONUP : WM_LBUTTONUP, mk(), MAKELPARAM(g_px, g_py));
+}
+static void wheel(int notches) {
+    for (int i = 0; i < (notches < 0 ? -notches : notches) && !g_closed; i++) {
+        post_in(WM_MOUSEWHEEL, MAKEWPARAM(mk(), notches < 0 ? -WHEEL_DELTA : WHEEL_DELTA), MAKELPARAM(g_ox + g_px, g_oy + g_py));
+        Sleep(40 + rnd(60));
+    }
+}
+static DWORD WINAPI player(LPVOID p) {
+    (void)p;
+    while (!g_closed && (!g_started || !g_win)) Sleep(200);
+    Sleep(3000);
+    eb_log("autorun: simulated player starts (seed %d)", g_cfg.autorun_input);
+    long n[8] = { 0 }; int open_f = 0; ULONGLONG close_at = 0, next_log = GetTickCount64() + 600000;
+    while (!g_closed) {
+        int W = g_cw, H = g_ch;
+        int mx = W / 4 + (int)rnd((uint32_t)(W / 2)), my = H * 15 / 100 + (int)rnd((uint32_t)(H * 60 / 100));
+        uint32_t a = rnd(100);
+        if (open_f && GetTickCount64() >= close_at) { key(VK_F1 + open_f - 1, 1); Sleep(50); key(VK_F1 + open_f - 1, 0); open_f = 0; n[5]++; }
+        else if (a < 28) { move_to(mx, my, 8 + (int)rnd(12), 250 + (int)rnd(600)); n[0]++; }             // hover over the map
+        else if (a < 48) { move_to(mx, my, 4, 120); wheel((rnd(2) ? 1 : -1) * (3 + (int)rnd(6))); n[1]++; }   // zoom in or out there
+        else if (a < 66) { int vk = VK_LEFT + (int)rnd(4); key(vk, 1); Sleep(300 + rnd(1200)); key(vk, 0); n[2]++; }   // pan
+        else if (a < 80) { move_to(mx, my, 6, 200); click(0); n[3]++; }                                 // open a province
+        else if (a < 85) { move_to(mx, my, 6, 200); click(1); n[4]++; }                                 // right click
+        else if (a < 93 && !open_f) { open_f = 1 + (int)rnd(8); key(VK_F1 + open_f - 1, 1); Sleep(50); key(VK_F1 + open_f - 1, 0); close_at = GetTickCount64() + 2000 + rnd(5000); n[5]++; }   // a view
+        else if (a < 96) { key(VK_SPACE, 1); Sleep(50); key(VK_SPACE, 0); Sleep(1000 + rnd(2000)); key(VK_SPACE, 1); Sleep(50); key(VK_SPACE, 0); n[6]++; }   // pause a moment
+        else { Sleep(500 + rnd(1500)); n[7]++; }                                                       // just look
+        Sleep(150 + rnd(700));
+        if (GetTickCount64() >= next_log) {
+            next_log += 600000;
+            eb_log("autorun: player so far: hover %ld, zoom %ld, pan %ld, left %ld, right %ld, views %ld, pauses %ld, idle %ld", n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
+        }
+    }
+    eb_log("autorun: player: hover %ld, zoom %ld, pan %ld, left %ld, right %ld, views %ld, pauses %ld, idle %ld", n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
+    return 0;
+}
+
 static BOOL CALLBACK min_cb(HWND h, LPARAM l) {
     DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
     if (pid == GetCurrentProcessId() && IsWindowVisible(h) && !GetWindow(h, GW_OWNER) && !IsIconic(h) &&
@@ -157,7 +350,19 @@ int eb_autorun_install(void) {
     if (memcmp(b + RVA_CONTINUE, sig_continue, 16) || (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) ||
         MH_CreateHook(b + RVA_CONTINUE, (void*)hk_continue, (void**)&o_continue) != MH_OK || MH_EnableHook(b + RVA_CONTINUE) != MH_OK)
         eb_log("autorun: the continue hook failed - the save warning would wait for a click");
-    if (g_cfg.autorun_minimize) { HANDLE h = CreateThread(NULL, 0, min_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
+    if (g_cfg.autorun_offscreen) {
+        if (!offscreen_install()) eb_log("autorun: off-screen hooks failed - minimized instead");
+        else {
+            g_off = 1;
+            HANDLE h = CreateThread(NULL, 0, off_thread, NULL, 0, NULL); if (h) CloseHandle(h);
+            if (g_cfg.autorun_input) {
+                g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(unsigned)g_cfg.autorun_input;
+                h = CreateThread(NULL, 0, player, NULL, 0, NULL); if (h) CloseHandle(h);
+            }
+            eb_log("autorun: TEST off-screen window%s", g_cfg.autorun_input ? " with a simulated player" : "");
+        }
+    }
+    if (!g_off && g_cfg.autorun_minimize) { HANDLE h = CreateThread(NULL, 0, min_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
     char a[16]; fmt_date(g_cfg.autorun_until, a, sizeof a);
     eb_log("autorun: TEST after the load: speed 5 until %s, then close the game (stuck after %d s)", a, g_cfg.autorun_stuck_s);
     return 1;

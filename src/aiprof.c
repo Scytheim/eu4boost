@@ -650,6 +650,7 @@ static volatile LONG g_ae_maxn;
 // as in the AI loop; without a map the entries are computed with the real value, as the game does.
 static __thread atab_t t_ut;
 static __thread uint32_t t_ugen;
+static __thread uint32_t t_lpscope;               // the land search memo's generation: one per top-level call (main or AI)
 static __thread int t_ui, t_ui_block;             // depth inside such a call; t_ui_block: the game's code (A/B test)
 static __thread uintptr_t t_ui_frame;             // the top-level hook's frame: a call from above it is not inside
 static inline int ui_in(void) {                   // (a call left without its hook returning, e.g. an exception)
@@ -1026,6 +1027,7 @@ static int ui_enter(uintptr_t frame) {
         *(volatile uint8_t*)((uint8_t*)g_exe + RVA_FIXED_SEED_FLAG)) return 0;
     t_ut.ui = 1;
     if (++t_ugen == 0) t_ugen = 1;
+    if (++t_lpscope == 0) t_lpscope = 1;
     if (!ae_reset(&t_ut, (LONG)t_ugen)) return 0;
     t_ui = 1; t_ui_frame = frame;
     return 1;
@@ -1039,6 +1041,14 @@ static void ui_leave(int k, LONG64 t0) {
 // (a visited set per call) that the cede-province items' value and checks ask for every candidate in
 // every round. It reads only the country, the war's sides, the province and the map, none of which change
 // during one top-level call, so inside t_ut's generation the answer is kept.
+// EXPERIMENT [parallel] ai_land_memo=1 (2 = + verify, 3 = A/B, default off; needs ai_ae_cache): the same
+// inside the AI loop. The foreign minister's peace deals (FUN_140132c40 -> FUN_14098c0e0, and its
+// acceptance checks FUN_1401bf150) run on the AI threads; the multi-second AI loops measured in the late
+// game were such deals (10-21: up to 2.6 s; report 81 waited 2 s for the AI loop, task unknown). While the AI loop
+// runs no task changes wars, provinces or countries (the game itself reads them from all its AI threads
+// at once), so one top-level call on an AI thread is one generation of the memo there too (t_lpscope).
+// A/B: the top-level calls alternate on each thread between the game's searches and the memo, and their
+// times are added up per side.
 #define RVA_LANDPATH 0x36eb10u
 static const uint8_t sig_landpath[16] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7c,0x24,0x20,0x55 };
 typedef uint64_t (*landpath_t)(uint8_t* c, uint8_t* w, uint8_t* p);
@@ -1067,21 +1077,54 @@ static int lp_grow(void) {
     free(t_lp); t_lp = e; t_lp_mask = cap - 1;
     return 1;
 }
+static int g_alm;                                 // [parallel] ai_land_memo
+static __thread int t_ad, t_ad_side;              // depth inside a deal fill / acceptance check in the AI loop; A/B side
+static __thread uintptr_t t_ad_frame;
+static __thread unsigned t_ad_flip;
+static __thread LONG64 t_alp_calls, t_alp_hit, t_alp_ver, t_alp_bad;   // this thread's counts, added up at the end of a call
+static volatile LONG64 g_alp_calls, g_alp_hit, g_alp_ver, g_alp_bad, g_ad_n[2], g_ad_t[2], g_ad_max[2];
+static inline int ad_in(void) {
+    if (!t_ad) return 0;
+    if ((uintptr_t)__builtin_frame_address(0) < t_ad_frame) return 1;
+    t_ad = 0;
+    return 0;
+}
+// a top-level deal fill or acceptance check on a thread of the AI loop starts a new generation of the memo
+static int ad_enter(uintptr_t frame) {
+    if (t_ad && frame < t_ad_frame) { t_ad++; return 1; }
+    t_ad = 0;
+    if (!g_alm || !g_ai_loop_active) return 0;
+    if (++t_lpscope == 0) t_lpscope = 1;
+    t_ad_side = g_alm == 3 ? (int)(++t_ad_flip & 1) : 1;
+    t_ad = 1; t_ad_frame = frame;
+    return 1;
+}
+static void ad_leave(LONG64 t0) {
+    if (t_ad > 0 && --t_ad) return;
+    t_ad = 0;
+    LONG64 d = qpc() - t0;
+    int s = t_ad_side;
+    InterlockedIncrement64(&g_ad_n[s]); InterlockedAdd64(&g_ad_t[s], d);
+    for (LONG64 m = g_ad_max[s]; d > m && InterlockedCompareExchange64(&g_ad_max[s], d, m) != m; m = g_ad_max[s]) {}
+    if (t_alp_calls) { InterlockedAdd64(&g_alp_calls, t_alp_calls); InterlockedAdd64(&g_alp_hit, t_alp_hit); t_alp_calls = t_alp_hit = 0; }
+    if (t_alp_ver) { InterlockedAdd64(&g_alp_ver, t_alp_ver); InterlockedAdd64(&g_alp_bad, t_alp_bad); t_alp_ver = t_alp_bad = 0; }
+}
 static uint64_t hk_landpath(uint8_t* c, uint8_t* w, uint8_t* p) {
-    if (!ui_in()) return o_landpath(c, w, p);
-    g_lp_calls++;
-    if (t_lp_gen != t_ugen) { t_lp_gen = t_ugen; t_lp_n = 0; }
+    int ui = ui_in();
+    if (!ui && !(ad_in() && t_ad_side)) return o_landpath(c, w, p);
+    if (ui) g_lp_calls++; else t_alp_calls++;
+    if (t_lp_gen != t_lpscope) { t_lp_gen = t_lpscope; t_lp_n = 0; }
     if (!t_lp && !lp_grow()) return o_landpath(c, w, p);
     uint32_t i = lp_hash(c, w, p) & t_lp_mask;
     for (; t_lp[i].gen == t_lp_gen; i = (i + 1) & t_lp_mask) {
         lpent_t* e = &t_lp[i];
         if (e->c != c || e->w != w || e->p != p) continue;
-        g_lp_hit++;
-        if (g_aec == 2) {
+        if (ui) g_lp_hit++; else t_alp_hit++;
+        if (ui ? g_aec == 2 : g_alm == 2) {
             uint8_t g = (uint8_t)o_landpath(c, w, p);
-            g_lp_ver++;
+            if (ui) g_lp_ver++; else t_alp_ver++;
             if (g != e->r) {
-                g_lp_bad++;
+                if (ui) g_lp_bad++; else t_alp_bad++;
                 if (InterlockedIncrement64(&g_ae_badlog) <= 20)
                     eb_log("ai ae: VERIFY MISMATCH land search %.3s province %d: kept %d, the game says %d",
                            (char*)(c + 0x20), (int)(uint16_t)*(uint32_t*)(p + 0x20), e->r, g);
@@ -1098,17 +1141,33 @@ static uint64_t hk_landpath(uint8_t* c, uint8_t* w, uint8_t* p) {
     return r;
 }
 static uint64_t hk_fill(void* offer, uint64_t budget, void* list, uint64_t p4) {
-    if (!ui_enter((uintptr_t)__builtin_frame_address(0))) return o_fill(offer, budget, list, p4);
-    LONG64 t0 = qpc();
+    uintptr_t f = (uintptr_t)__builtin_frame_address(0);
+    LONG64 t0;
+    if (ui_enter(f)) {
+        t0 = qpc();
+        uint64_t r = o_fill(offer, budget, list, p4);
+        ui_leave(0, t0);
+        return r;
+    }
+    if (!ad_enter(f)) return o_fill(offer, budget, list, p4);
+    t0 = qpc();
     uint64_t r = o_fill(offer, budget, list, p4);
-    ui_leave(0, t0);
+    ad_leave(t0);
     return r;
 }
 static int hk_accept(uint8_t* c, void* reasons, uint64_t p3, uint64_t tag, void* offer, uint64_t p6, uint64_t p7, uint64_t p8, uint64_t p9, uint64_t p10) {
-    if (!ui_enter((uintptr_t)__builtin_frame_address(0))) return o_accept(c, reasons, p3, tag, offer, p6, p7, p8, p9, p10);
-    LONG64 t0 = qpc();
+    uintptr_t f = (uintptr_t)__builtin_frame_address(0);
+    LONG64 t0;
+    if (ui_enter(f)) {
+        t0 = qpc();
+        int r = o_accept(c, reasons, p3, tag, offer, p6, p7, p8, p9, p10);
+        ui_leave(1, t0);
+        return r;
+    }
+    if (!ad_enter(f)) return o_accept(c, reasons, p3, tag, offer, p6, p7, p8, p9, p10);
+    t0 = qpc();
     int r = o_accept(c, reasons, p3, tag, offer, p6, p7, p8, p9, p10);
-    ui_leave(1, t0);
+    ad_leave(t0);
     return r;
 }
 
@@ -1483,6 +1542,15 @@ static void hk_loop(uint8_t* items, void* ctx) {
                    (long long)g_lp_calls, (long long)g_lp_hit, (long long)g_ui_ver, (long long)g_ui_bad, (long long)g_lp_ver, (long long)g_lp_bad,
                    (long long)g_dm_new, (long long)g_dm_reuse);
         }
+        if (g_alm) {
+            eb_log("ai land: in the AI loop %lld deal fills and acceptance checks (%.1f ms, longest %.1f ms), land searches %lld (kept %lld) | verify %lld, mismatches %lld",
+                   (long long)(g_ad_n[0] + g_ad_n[1]), (g_ad_t[0] + g_ad_t[1]) * g_ms, (g_ad_max[0] > g_ad_max[1] ? g_ad_max[0] : g_ad_max[1]) * g_ms,
+                   (long long)g_alp_calls, (long long)g_alp_hit, (long long)g_alp_ver, (long long)g_alp_bad);
+            if (g_alm == 3)
+                for (int s = 0; s < 2; s++)
+                    eb_log("ai land A/B %s: %lld top-level calls, avg %.3f ms, total %.1f ms, longest %.1f ms", s ? "B (memo)    " : "A (the game)",
+                           (long long)g_ad_n[s], g_ad_n[s] ? g_ad_t[s] * g_ms / g_ad_n[s] : 0.0, g_ad_t[s] * g_ms, g_ad_max[s] * g_ms);
+        }
         if (g_aec == 3)
             for (int s = 0; s < 2; s++)
                 eb_log("ai ae A/B %s: %lld AE sums, avg %.2f us, total %.1f ms, max %.3f ms",
@@ -1497,6 +1565,7 @@ static void hk_loop(uint8_t* items, void* ctx) {
 
 int eb_aiprof_install(void) {
     g_stats = g_cfg.ai_item_stats; g_split = g_cfg.ai_split == 1; g_prov = g_cfg.ai_prov_split; g_aec = g_cfg.ai_ae_cache;
+    g_alm = g_aec ? g_cfg.ai_land_memo : 0;
     g_army = g_cfg.ai_army_fast;
     if (!g_stats && !g_split && !g_prov && !g_aec && !g_army) return 1;
     uint8_t* b = (uint8_t*)g_exe;
@@ -1557,9 +1626,11 @@ int eb_aiprof_install(void) {
                       MH_EnableHook(b + RVA_OFFER_FILL) == MH_OK && MH_EnableHook(b + RVA_ACCEPT) == MH_OK;
             if (g_ui_on && (memcmp(b + RVA_LANDPATH, sig_landpath, 16) ||
                             MH_CreateHook(b + RVA_LANDPATH, (void*)hk_landpath, (void**)&o_landpath) != MH_OK ||
-                            MH_EnableHook(b + RVA_LANDPATH) != MH_OK))
+                            MH_EnableHook(b + RVA_LANDPATH) != MH_OK)) {
                 eb_log("ai ae: land search signature mismatch or hook failed - not kept");
-            if (!g_ui_on) eb_log("ai ae: deal fill / acceptance signature mismatch or hook failed - only the AI loop uses the tables");
+                g_alm = 0;
+            }
+            if (!g_ui_on) { eb_log("ai ae: deal fill / acceptance signature mismatch or hook failed - only the AI loop uses the tables"); g_alm = 0; }
         }
     }
     if (g_stats) {
@@ -1603,6 +1674,10 @@ int eb_aiprof_install(void) {
         eb_log("ai ae: EXPERIMENT on%s - AE sums in C and the AI loop's AE cache lookups in per-thread tables%s",
                g_aec == 2 ? " with VERIFY" : g_aec == 3 ? " as A/B (AE sums alternate between the game's code and ae_sum)" : "",
                g_ui_on ? "; also deal fills and acceptance checks on the main thread outside the AI loop (war view, peace windows)" : "");
+    if (g_alm)
+        eb_log("ai land: EXPERIMENT on%s - the land searches of a peace deal in the AI loop are kept for that deal",
+               g_alm == 2 ? " with VERIFY" : g_alm == 3 ? " as A/B (deals alternate between the game's searches and the memo)" : "");
+    else if (g_cfg.ai_land_memo) eb_log("ai land: off - needs [parallel] ai_ae_cache and its deal hooks");
     if (g_stats) eb_log("ai items: timing every country of the AI loop and every AI task run (reports every 100 / 500 loops)");
     return 1;
 }

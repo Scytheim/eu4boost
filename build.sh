@@ -14,7 +14,7 @@ CFLAGS="-O2 -DNDEBUG -D__USE_MINGW_ANSI_STDIO=1 -D_WIN32_WINNT=0x0A00 -Wall -Wno
 $CC -O3 -DNDEBUG -DMI_STAT=0 -DMI_SECURE=0 -I$MI/include -c $MI/src/static.c -o $OUT/mimalloc.o
 for f in hook buffer trampoline; do $CC $CFLAGS -w -I$MH/include -c $MH/src/$f.c -o $OUT/mh_$f.o; done
 $CC $CFLAGS -w -c $MH/src/hde/hde64.c -o $OUT/mh_hde64.o
-for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report memdiag update savelist script autorun; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $OUT/$f.o; done
-$CC -shared -static -fuse-ld=lld -s -o $OUT/eu4boost.dll $OUT/main.o $OUT/alloc.o $OUT/profiler.o $OUT/threads.o $OUT/online.o $OUT/speed.o $OUT/parallel.o $OUT/savezip.o $OUT/savepar.o $OUT/modifier.o $OUT/country.o $OUT/console.o $OUT/guard.o $OUT/aiprof.o $OUT/uitime.o $OUT/crash.o $OUT/report.o $OUT/memdiag.o $OUT/update.o $OUT/savelist.o $OUT/script.o $OUT/autorun.o $OUT/mimalloc.o $OUT/mh_*.o \
+for f in main alloc profiler threads online speed parallel savezip savepar modifier country console guard aiprof uitime crash report memdiag update savelist script autorun playmon leakfix; do $CC $CFLAGS -I$MI/include -I$MH/include -c src/$f.c -o $OUT/$f.o; done
+$CC -shared -static -fuse-ld=lld -s -o $OUT/eu4boost.dll $OUT/main.o $OUT/alloc.o $OUT/profiler.o $OUT/threads.o $OUT/online.o $OUT/speed.o $OUT/parallel.o $OUT/savezip.o $OUT/savepar.o $OUT/modifier.o $OUT/country.o $OUT/console.o $OUT/guard.o $OUT/aiprof.o $OUT/uitime.o $OUT/crash.o $OUT/report.o $OUT/memdiag.o $OUT/update.o $OUT/savelist.o $OUT/script.o $OUT/autorun.o $OUT/playmon.o $OUT/leakfix.o $OUT/mimalloc.o $OUT/mh_*.o \
     -Wl,--exclude-all-symbols -lpsapi -lwinmm -ladvapi32 -lwinhttp -lbcrypt -luser32 -lkernel32
 ls -la $OUT/eu4boost.dll

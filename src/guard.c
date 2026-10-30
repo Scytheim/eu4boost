@@ -146,8 +146,10 @@ volatile ULONGLONG eb_day_ms;         // online.c throttles only while days are 
 int eb_day_hooked;
 static uint64_t hk_day(void* gs) {
     eb_day_ms = GetTickCount64();
+    LARGE_INTEGER t0; if (eb_pm_on) QueryPerformanceCounter(&t0);
     g_sim++; g_day_n++; eb_in_day++; uint64_t r = o_day(gs); eb_in_day--; g_sim--;
     eb_day_ms = GetTickCount64();
+    if (eb_pm_on) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); eb_pm_day(t1.QuadPart - t0.QuadPart); }
     return r;
 }
 static uint64_t hk_midtick(void* gs, char a, void* b, uint32_t c) {

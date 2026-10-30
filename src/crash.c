@@ -141,6 +141,12 @@ static int interesting(uint64_t a) {
     if (!mod_of(a, name, sizeof name, &base)) return 0;
     return !_stricmp(name, "eu4.exe") || !_stricmp(name, "eu4boost.dll") || !_stricmp(name, "plugin64.dll");
 }
+// the main thread waiting for a parallel loop (parallel.c my_wait): its own frames say nothing - the
+// signature is the game's frame that waits, and the thread at its items the longest is sampled too
+static int our_frame(uint64_t a) {
+    char name[MAX_PATH]; uint64_t base;
+    return mod_of(a, name, sizeof name, &base) && !_stricmp(name, "eu4boost.dll");
+}
 
 // ---- call stacks ----
 // A stack is walked with the modules' own unwind data (.pdata, RtlVirtualUnwind) from a table of the
@@ -280,6 +286,7 @@ static int guarded(int (*fn)(void*), void* arg) {
     g_gslot[s].rsp = 0; g_gslot[s].tid = 0;
     return r;
 }
+int eb_guarded(int (*fn)(void*), void* arg) { guard_init(); return guarded(fn, arg); }
 
 // the stack of a thread: [allocation base of the stack, stack base)
 typedef LONG (NTAPI *ntqit_t)(HANDLE, int, PVOID, ULONG, PULONG);
@@ -521,17 +528,20 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hk_set_uef(LPTOP_LEVEL_EXCEPTION_FILT
 }
 
 // ---- hang watchdog ----
+static int sample_busy(char* out, int cap);
 static void write_hang(int seconds) {
-    static char t[64 * 1024];
+    static char t[64 * 1024], w[1024];
     sb_t b = { t, 0, sizeof t };
     CONTEXT mc; uint64_t pcs[64];
+    int waiting = eb_par_main_waiting;
     int n = sample_thread(g_main_thread, g_main_lo, g_main_hi, &g_wd_mods, &mc, pcs, 64), top = 0;
-    while (top < n && !interesting(pcs[top])) top++;
+    while (top < n && (!interesting(pcs[top]) || (waiting && our_frame(pcs[top])))) top++;
     s_put(&b, "eu4boost crash report\r\nkind: hang\r\nsignature: HANG ");
     if (top < n) s_addr(&b, pcs[top]); else s_put(&b, "unknown");
     s_put(&b, "\r\nno frame for: "); s_dec(&b, seconds); s_put(&b, " s\r\n");
     s_state(&b);
     if (mc.Rip) { s_put(&b, "main thread:\r\n"); s_regs(&b, &mc); s_frames(&b, pcs, NULL, n, mc.Rsp); }
+    if (sample_busy(w, sizeof w)) { s_put(&b, "the main thread waits for a parallel loop; longest at its items: "); s_put(&b, w); s_put(&b, "\r\n"); }
     s_put(&b, g_mods);
     s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
     s_put(&b, "before this session: "); s_put(&b, g_prev_saves[0] ? g_prev_saves : "no saves.txt\r\n");
@@ -576,6 +586,7 @@ void eb_slow_event(const char* what, double ms, double limit, const char* detail
         g_slow_n++;
         if (ms / limit > g_slow_ratio) { g_slow_ratio = ms / limit; write_file(g_slow_dir, L"top.txt", what, (int)strlen(what)); }
         eb_log("report: slow %s: %.0f ms (limit %.0f) - kept for the slow report", what, ms, limit);
+        eb_pm_event("slow report: %s - %.0f ms", what, ms);
     }
     LeaveCriticalSection(&g_slow_cs);
 }
@@ -601,6 +612,13 @@ static void finalize_slow(const wchar_t* dir, const wchar_t* log, const char* mo
     else write_file(dir, L"eu4boost.log", g_nolog, (int)strlen(g_nolog));
     DeleteFileW(u);
 }
+// playmon.c's frame hitch samples: the main thread's return addresses (its own module list: the watchdog may walk at once)
+static mods_t g_pm_mods;
+int eb_sample_main_pcs(uint64_t* pcs, int max) {
+    if (!g_main_thread || !g_main_hi) return 0;
+    CONTEXT mc;
+    return sample_thread(g_main_thread, g_main_lo, g_main_hi, &g_pm_mods, &mc, pcs, max);
+}
 // one sample of the main thread's stack (the thread is suspended while it is walked)
 static int sample_main(char* out, int cap, char* top, int tcap) {
     CONTEXT mc; uint64_t pcs[32];
@@ -609,8 +627,32 @@ static int sample_main(char* out, int cap, char* top, int tcap) {
     if (!n) return 0;
     sb_t b = { out, 0, cap };
     for (int i = 0; i < n && i < 16; i++) { if (i) s_put(&b, " < "); s_addr(&b, pcs[i]); }
-    for (int i = 0; i < n && first < 0; i++) if (interesting(pcs[i])) first = i;
+    int waiting = eb_par_main_waiting;
+    for (int i = 0; i < n && first < 0; i++) if (interesting(pcs[i]) && !(waiting && our_frame(pcs[i]))) first = i;
     if (top) { sb_t t = { top, 0, tcap }; if (first >= 0) s_addr(&t, pcs[first]); else s_put(&t, "unknown"); }
+    return b.n;
+}
+// while the main thread waits for a parallel loop: the thread that has been at its chunk the longest
+static int sample_busy(char* out, int cap) {
+    out[0] = 0;
+    if (!eb_par_main_waiting) return 0;
+    LONGLONG oldest = 0; int k = -1;
+    LONG n = eb_nbusy; if (n > EB_NBUSY) n = EB_NBUSY;
+    for (int i = 0; i < n; i++) {
+        LONGLONG s = eb_busy[i].since;
+        if (eb_busy[i].tid && eb_busy[i].tid != g_main_tid && eb_busy[i].h && s && (k < 0 || s < oldest)) { oldest = s; k = i; }
+    }
+    if (k < 0) return 0;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    uint64_t lo, hi; CONTEXT c; uint64_t pcs[32];
+    if (!thread_stack(eb_busy[k].h, &lo, &hi)) return 0;
+    int item = eb_busy[k].item;
+    int m = sample_thread(eb_busy[k].h, lo, hi, &g_wd_mods, &c, pcs, 32);
+    if (!m) return 0;
+    sb_t b = { out, 0, cap };
+    s_put(&b, "thread "); s_dec(&b, (long long)eb_busy[k].tid); s_put(&b, " at item "); s_dec(&b, item);
+    s_put(&b, " for "); s_dec(&b, (long long)((now.QuadPart - oldest) * g_ms)); s_put(&b, " ms: ");
+    for (int i = 0; i < m && i < 16; i++) { if (i) s_put(&b, " < "); s_addr(&b, pcs[i]); }
     return b.n;
 }
 void eb_load_samples_reset(void) { EnterCriticalSection(&g_slow_cs); g_lsamp_n = 0; g_lsamp[0] = 0; LeaveCriticalSection(&g_slow_cs); }
@@ -637,7 +679,7 @@ static void heartbeat(void) {
 static DWORD WINAPI watchdog(LPVOID unused) {
     (void)unused;
     LONG64 seen = -1; ULONGLONG since = 0, load_t0 = 0, load_next = 0, beat = 0; int reported = 0, ns = 0, in_load = 0;
-    static char samp[4][1024], tops[4][160], tmp[1024];
+    static char samp[4][1024], tops[4][160], tmp[1024], wsamp[4][1024];
     int samp_s[4];
     for (;;) {
         Sleep(250);
@@ -668,8 +710,11 @@ static DWORD WINAPI watchdog(LPVOID unused) {
             if (reported) { drop_unconfirmed(g_start); eb_log("report: the main thread is running again"); }
             ULONGLONG gap = g_max_gap; g_max_gap = 0;
             if (ns && !in_load && f > 300 && gap >= (ULONGLONG)g_cfg.slow_stall_ms && !g_crashed) {
-                static char d[6 * 1024]; int k = snprintf(d, sizeof d, "no frame for %llu ms; main thread at", (unsigned long long)gap);
-                for (int i = 0; i < ns; i++) k += snprintf(d + k, sizeof d - k, "\r\n  %d s: %s", samp_s[i], samp[i]);
+                static char d[10 * 1024]; int k = snprintf(d, sizeof d, "no frame for %llu ms; main thread at", (unsigned long long)gap);
+                for (int i = 0; i < ns && k < (int)sizeof d - 2200; i++) {      // a line of each at most ~1 KB
+                    k += snprintf(d + k, sizeof d - k, "\r\n  %d s: %s", samp_s[i], samp[i]);
+                    if (wsamp[i][0]) k += snprintf(d + k, sizeof d - k, "\r\n    waiting for %s", wsamp[i]);
+                }
                 char what[200]; snprintf(what, sizeof what, "stall %s", tops[0]);
                 eb_slow_event(what, (double)gap, g_cfg.slow_stall_ms, d);
             }
@@ -679,11 +724,14 @@ static DWORD WINAPI watchdog(LPVOID unused) {
         ULONGLONG gap = now - g_frame_ms;
         if (eb_loading) in_load = 1;
         if (g_cfg.report_slow && !in_load && ns < 4 && gap >= (1000ull << ns) && g_main_thread) {
-            sample_main(samp[ns], sizeof samp[0], tops[ns], sizeof tops[0]); samp_s[ns] = (int)(gap / 1000); ns++;
+            sample_main(samp[ns], sizeof samp[0], tops[ns], sizeof tops[0]); samp_s[ns] = (int)(gap / 1000);
+            sample_busy(wsamp[ns], sizeof wsamp[0]);
+            ns++;
         }
         if (g_cfg.report_hang_s > 0 && !reported && now - since >= (ULONGLONG)g_cfg.report_hang_s * 1000) {
             reported = 1;
             eb_log("report: no frame for %d s - main thread stack written (dropped if the game recovers)", (int)((now - since) / 1000));
+            eb_pm_event("hang report: no frame for %d s", (int)((now - since) / 1000));
             write_hang((int)((now - since) / 1000));
         }
     }
@@ -700,6 +748,7 @@ static uintptr_t hk_rcb(void* a, void* b) {
         if (a == g_frame_key) {
             ULONGLONG now = unbiased_ms();
             if (g_frame_ms && now - g_frame_ms > g_max_gap) g_max_gap = now - g_frame_ms;
+            if (eb_pm_on && g_frame_ms) eb_pm_frame(now - g_frame_ms);
             g_frames++; g_frame_ms = now;
             if (g_cfg.report_test_keys && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000) &&
                 (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {

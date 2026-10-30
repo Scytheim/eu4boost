@@ -274,6 +274,7 @@ static void journal_add(double ms) {
              st.wHour, st.wMinute, st.wSecond, date, g_cur_n, (long long)(g_cur_in >> 10), (long long)(g_cur_out >> 10), g_cur_par,
              eb_savepar_status(), ms);
     g_jn++;
+    eb_pm_event("save: %.0f ms, %d entries %lld KB -> %lld KB, %s", ms, g_cur_n, (long long)(g_cur_in >> 10), (long long)(g_cur_out >> 10), eb_savepar_status());
     int k = snprintf(g_journal, sizeof g_journal, "saves of the session (newest last):\r\n");
     for (int i = g_jn > NJOURNAL ? g_jn - NJOURNAL : 0; i < g_jn && k < (int)sizeof g_journal - 1; i++)
         k += snprintf(g_journal + k, sizeof g_journal - (size_t)k, "%s", g_jl[i % NJOURNAL]);

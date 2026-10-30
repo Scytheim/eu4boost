@@ -8,7 +8,10 @@
 // run from event options. Modded 1543 GER save, 500 days at speed 5: the loop takes 13.1 ms a day
 // (280 countries); 11.6 countries a day run the bundle, RefreshKnowledge 151 us a call on average.
 //
-// parallel_refresh (EXPERIMENT - changes the order in which the game sees results):
+// parallel_refresh (EXPERIMENT - changes the order in which the game sees results; since 0.4.10 only the analysis
+// modes 2-4 run it: report 105 (0.4.9, a new game on day 2) crashed on a worker in RefreshKnowledge ->
+// FUN_1403d00c0 -> FUN_140a69f90, which read a null pointer in another country's relation array (+0x1510)
+// while the other workers refreshed other countries; the gain was 1.7%):
 //   At the start of the loop, RefreshKnowledge runs for every dirty country at once on worker
 //   threads (and the main thread). RefreshKnowledge resets and rebuilds the country's knowledge
 //   caches from provinces and relations; it uses no random numbers. Then the dirty flag is set to 2:

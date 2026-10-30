@@ -2,11 +2,11 @@
 // memory that keeps growing over a long session.
 //
 // Every block the hooked CRT functions (alloc.c) hand out whose address falls in 1 of N hash buckets
-// is a sample: its call stack (up to 6 frames outside this DLL) and size go into a table, and its
+// is a sample: its call stack (up to 16 frames outside this DLL) and size go into a table, and its
 // free takes it out again. Choosing samples by address keeps the free side cheap: one multiply
 // decides, and only sampled frees look into the table. Every mem_sites_s seconds a snapshot is
 // appended to plugins\eu4boost_memsites.tsv: the process totals and the call sites that hold the
-// most sampled live bytes (estimates = sampled x N). A site whose live bytes keep rising from one
+// most sampled live bytes (the top 300, estimates = sampled x N). A site whose live bytes keep rising from one
 // snapshot to the next is where the memory piles up; tools/analysis/memsites.py compares snapshots.
 #include "common.h"
 #include <stdio.h>
@@ -17,8 +17,8 @@
 
 #define NSH     64                         // shards of the table of sampled live blocks
 #define SH_CAP  (1u << 15)                 // blocks per shard (2M in all)
-#define NSITE   (1u << 16)                 // call sites
-#define NFR     6                          // frames per call site
+#define NSITE   (1u << 17)                 // call sites
+#define NFR     16                         // frames per call site (6 until 10-30: too few to see which screen made a window)
 
 typedef struct { uintptr_t p; uint32_t site, size; } blk_t;
 typedef struct { SRWLOCK lock; blk_t* e; uint32_t n; } shard_t;
@@ -199,7 +199,7 @@ static void snapshot(int snap) {
             snap, st.wHour, st.wMinute, st.wSecond, date, (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(pm.WorkingSetSize >> 20),
             live * rate / 1048576.0, live_n * rate, ns, (long long)g_samples, (long long)g_full, (long long)g_nosite);
     regions(f);
-    for (int r = 0; r < ns && r < 150; r++) {
+    for (int r = 0; r < ns && r < 300; r++) {
         const site_t* s = &g_site[idx[r]];
         fprintf(f, "%u\t%.2f\t%.0f\t%.0f\t%.1f", idx[r], s->live * rate / 1048576.0, s->live_n * rate, s->allocs * rate, s->bytes * rate / 1048576.0);
         for (int k = 0; k < NFR; k++) { char t[96]; fmt_frame(t, sizeof t, s->fr[k]); fprintf(f, "\t%s", t); }

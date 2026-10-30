@@ -140,6 +140,7 @@ static void load_end(LONGLONG t) {
     char in[768]; int k = inner_text(in, sizeof in, -1, g_load_n0, g_load_tt0, 0, 0);
     if (g_waited) snprintf(in + k, sizeof in - k, " | waiting for the player %.1f s (left out)", g_waited * g_ms / 1000.0);
     eb_log("load: %.1f s from the start until frames run smoothly (first game frame after %.1f s)%s", ms / 1000.0, first / 1000.0, in);
+    eb_pm_event("load: %.1f s (first game frame after %.1f s)", ms / 1000.0, first / 1000.0);
 #ifdef EB_TEST
     g_last_ms = ms; g_last_waited_ms = g_waited * g_ms;
 #endif
@@ -233,6 +234,8 @@ HK(0) HK(1) HK(2) HK(3) HK(4) HK(5) HK(6) HK(7) HK(8) HK(9) HK(10) HK(11) HK(12)
 static void* const g_hk[NU] = { (void*)hk_0, (void*)hk_1, (void*)hk_2, (void*)hk_3, (void*)hk_4, (void*)hk_5, (void*)hk_6, (void*)hk_7,
                                 (void*)hk_8, (void*)hk_9, (void*)hk_10, (void*)hk_11, (void*)hk_12, (void*)hk_13, (void*)hk_14 };
 _Static_assert(NU == 15, "one hook function per target");
+
+LONG64 eb_ui_front_frames(void) { return g_n[U_FRONT]; }
 
 #ifdef EB_TEST
 #include <stdio.h>

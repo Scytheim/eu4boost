@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.9"
+#define EU4BOOST_VERSION "0.4.10"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -30,6 +30,7 @@ typedef struct {
     int ai_prov_min;              // ... only for countries with at least this many provinces
     int ai_ae_cache;              // aiprof.c: EXPERIMENT 1 = per-thread lock-free table for the AI loop's AE cache, 2 = + verify, 3 = A/B
     int ai_army_fast;             // aiprof.c: EXPERIMENT 1 = the army move check tests its cheap conditions first, 2 = + verify, 3 = A/B
+    int ai_land_memo;             // aiprof.c: EXPERIMENT 1 = the land searches of a deal fill in the AI loop are kept for that fill (needs ai_ae_cache), 2 = + verify, 3 = A/B
     // allocator
     int alloc_enabled;
     int alloc_guard_foreign;      // also catch mimalloc pointers freed through the Windows heap API
@@ -73,7 +74,8 @@ typedef struct {
     int prov_text_cache;          // guard.c: EXPERIMENT 1 = the monthly province text of a country's modifier 0x98 is built once a day, 2 = + verify, 3 = A/B
     // country update (country.c)
     int country_stats;            // 1 = diagnostics: time the country loop and its dirty-bundle functions
-    int country_parallel_refresh; // EXPERIMENT: 1 = RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check
+    int country_parallel_refresh; // EXPERIMENT: RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check (1 = on is ignored since 0.4.10)
+    int country_refresh_ignored;  // the ini said parallel_refresh=1 (logged)
     int country_refresh_fixup;    // 1 = recompute the cached values of FUN_1402f1120 (+0xe1c..+0xe34) at the country's turn
     int country_parallel_war;     // 1 = the war refresh (all participants of a war joined or declared) on all cores, 2 = + verify
     int country_parallel_annex;   // 1 = the opinions recomputed when a country disappears on all cores, 2 = + verify
@@ -86,6 +88,8 @@ typedef struct {
     int autorun_fastfail;         // testing only: end the autorun with 1 = __fastfail, 2 = TerminateProcess instead of closing the window
     int test_warview;             // testing only ([test] warview=N): the war view's peace computations every N country loops (aiprof.c)
     int autorun_minimize;         // testing only: 1 = keep the game window minimized during an autorun
+    int autorun_offscreen;        // testing only: 1 = keep it drawn off the desktop instead (never activated)
+    int autorun_input;            // testing only: with autorun_offscreen, a simulated player with this seed (0 = none)
     // console (console.c)
     int console_hotkey;           // 1 = Ctrl+Alt+C unlocks console commands in single-player ironman until the next game start
     // crash guards (guard.c)
@@ -95,11 +99,21 @@ typedef struct {
     int guard_ironman_name;       // 1 = an ironman save name in EU4dll's escapes gets the UTF-8 file name ordinary saves get
     int guard_loc_duplicates;     // 1 = the duplicate localisation check runs on a larger stack when the main thread's would overflow
     int guard_diplo_reset;        // 1 = relations freed before a game is reset are skipped instead of called and freed again
+    // game memory leaks (leakfix.c)
+    int leak_subject_modifiers;   // 1 = the modifier copies a country keeps from related countries are deleted after its next recalculation
+    int leak_ai_actions;          // 1 = the foreign minister's diplomatic action candidates that are not chosen are deleted
+    int leak_province_items;      // 1 = the province view's modifier lines made only for its change check are not made
+    int leak_diplo_actions;       // 1 = the country view's diplomatic action entries of closed categories are deleted when the list is made again
+    int leak_message_popups;      // 1 = the popups of message list items that were never opened are deleted
     int test_diplo_freed;         // testing only ([test] diplo_freed=1): the next diplomacy reset finds one relation freed
+    int test_slow_item_ms;        // testing only ([test] slow_item_ms=N): at most once a minute a worker's chunk of a big parallel loop sleeps N ms
     int test_loc_fiber;           // testing only ([test] loc_fiber): 1 = that check always runs on the larger stack, 2 = as usual; both log each table and result
     int test_ironman_name;        // testing only ([test] ironman_name=1): the ironman save of eb_auto is named "eb_시험" in EU4dll's escapes
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
+    int play_monitor;             // playmon.c: 1 = rows of memory, frames, days and handles while playing (diagnostics)
+    int play_monitor_s;           // ... a row every this many seconds
+    int play_monitor_census_s;    // ... the GUI's windows by type every this many seconds (and a minute after a load)
     int mem_sites;                // memdiag.c: keep the call sites of 1 in N allocations (0 = off; needs the allocator)
     int mem_sites_s;              // ... and write a snapshot every this many seconds
     // crash reports (crash.c writes them, report.c sends them)
@@ -129,6 +143,7 @@ void eb_log(const char* fmt, ...);
 int  eb_alloc_install(void);
 void eb_alloc_report(void);
 void eb_alloc_zero_stats(LONG64* n, LONG64* bytes);
+void eb_alloc_thread_done(void);                 // DLL_THREAD_DETACH: hand the ending thread's mimalloc heap back
 
 // threads.c
 int  eb_threads_install(void);
@@ -170,6 +185,11 @@ void eb_savelist_report(void);
 int  eb_script_install(void);
 void eb_script_report(void);
 
+// leakfix.c
+int  eb_leakfix_install(void);
+void eb_leakfix_report(void);
+void eb_leakfix_counts(LONG64* copies, LONG64* actions, LONG64* items, LONG64* entries, LONG64* popups);   // deleted so far (playmon.c)
+
 // console.c
 int  eb_console_install(void);
 
@@ -179,6 +199,23 @@ void eb_warview_test(uint8_t* gs);
 // parallel.c: set by aiprof.c when ai_split is on
 extern int (*eb_par_help)(void);
 extern int (*eb_par_linger)(uint8_t* ctx);
+// parallel.c, for crash.c's stall reports: the threads running items of the game's parallel loops
+// (since = QPC at the start of the chunk they run, 0 = none) and whether the main thread waits for a loop
+#define EB_NBUSY 64
+typedef struct { volatile DWORD tid; HANDLE h; volatile LONGLONG since; volatile int item; } eb_busy_t;
+extern eb_busy_t eb_busy[EB_NBUSY];
+extern volatile LONG eb_nbusy, eb_par_main_waiting;
+
+// playmon.c ([diag] play_monitor): the hooks report frames, days and events while it is on
+extern int eb_pm_on;
+int  eb_playmon_install(void);
+void eb_playmon_report(void);
+void eb_pm_frame(ULONGLONG gap_ms);
+void eb_pm_day(LONGLONG qpc_ticks);
+void eb_pm_event(const char* fmt, ...);
+int  eb_sample_main_pcs(uint64_t* pcs, int max);   // crash.c: the main thread's call stack now (0 = no sample)
+int  eb_guarded(int (*fn)(void*), void* arg);   // crash.c: fn(arg), or -1 when it faults (main thread code that reads game objects)
+LONG64 eb_ui_front_frames(void);           // uitime.c: front end frames so far (the menu)
 
 // guard.c
 int  eb_guard_install(void);
@@ -195,6 +232,7 @@ int  eb_autorun_install(void);       // autorun.c: test autopilot, driven from u
 int  eb_autorun_date(const char* s);
 void eb_autorun_loaded(void);
 void eb_autorun_frame(void);
+LONGLONG eb_autorun_input_made(UINT msg);  // autorun.c: when the simulated player posted this input (QPC), 0 = not a test
 
 // memdiag.c (called by alloc.c's hooks while eb_md_on)
 extern int eb_md_on;
