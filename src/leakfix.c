@@ -292,7 +292,16 @@ static void* hk_msg_new(void* item, void* queue, void* popup, void* message) {
 }
 
 static int hook(uint8_t* t, void* fn, void* orig, const char* what) {
-    if (MH_CreateHook(t, fn, (void**)orig) != MH_OK || MH_EnableHook(t) != MH_OK) { eb_log("leaks: %s hook failed - off", what); return 0; }
+    eb_hookset hs; eb_hs_init(&hs, what);
+    if (!eb_hs_add(&hs, t, fn, (void**)orig) || !eb_hs_enable(&hs)) { eb_log("leaks: %s hook failed - off", what); return 0; }
+    return 1;
+}
+// the two hooks of a fix work only together (one records, the other acts on what was recorded): both or none
+static int hook2(const char* what, uint8_t* t1, void* f1, void* o1, uint8_t* t2, void* f2, void* o2) {
+    eb_hookset hs; eb_hs_init(&hs, what);
+    if (!eb_hs_add(&hs, t1, f1, (void**)o1) || !eb_hs_add(&hs, t2, f2, (void**)o2) || !eb_hs_enable(&hs)) {
+        eb_log("leaks: %s hooks failed - off", what); return 0;
+    }
     return 1;
 }
 
@@ -315,6 +324,7 @@ int eb_leakfix_install(void) {
             eb_log("leaks: the modifier copies a country keeps from related countries are deleted %d ms after its next recalculation", DELAY_MS);
             n++;
         }
+        if (!o_cont_dtor) g_cfg.leak_subject_modifiers = 0;
     }
     if (g_cfg.leak_ai_actions) {
         if (memcmp(b + RVA_FM_CHECKS, sig_fm, sizeof sig_fm)) eb_log("leaks: ai_actions signature mismatch - off");
@@ -322,36 +332,40 @@ int eb_leakfix_install(void) {
             eb_log("leaks: the foreign minister's diplomatic action candidates that are not chosen are deleted");
             n++;
         }
+        if (!eb_lf_fm_tramp) g_cfg.leak_ai_actions = 0;
     }
     if (g_cfg.leak_province_items) {
         if (memcmp(b + RVA_PROV_LIST, sig_prov_list, sizeof sig_prov_list) || memcmp(b + RVA_PROV_ITEM, sig_prov_item, sizeof sig_prov_item) ||
             memcmp(b + RVA_FREE, sig_free, sizeof sig_free))
             eb_log("leaks: province_items signature mismatch - off");
-        else if ((game_free = (void (*)(void*, size_t))(b + RVA_FREE)), hook(b + RVA_PROV_ITEM, (void*)hk_prov_item, &o_prov_item, "province_items") &&
-                 hook(b + RVA_PROV_LIST, (void*)hk_prov_list, &o_prov_list, "province_items")) {
+        else if ((game_free = (void (*)(void*, size_t))(b + RVA_FREE)),
+                 hook2("province_items", b + RVA_PROV_ITEM, (void*)hk_prov_item, &o_prov_item, b + RVA_PROV_LIST, (void*)hk_prov_list, &o_prov_list)) {
             eb_log("leaks: the province view's change check no longer makes modifier lines it drops");
             n++;
         }
+        if (!o_prov_list) g_cfg.leak_province_items = 0;
     }
     if (g_cfg.leak_diplo_actions) {
         if (memcmp(b + RVA_DIPLO_LIST, sig_diplo_list, sizeof sig_diplo_list) || memcmp(b + RVA_DIPLO_DEL, sig_diplo_del, sizeof sig_diplo_del) ||
             *(void**)(b + RVA_DIPLO_VT) != (void*)(b + RVA_DIPLO_DEL))
             eb_log("leaks: diplo_actions signature mismatch - off");
-        else if ((g_diplo_vt = b + RVA_DIPLO_VT), hook(b + RVA_DIPLO_DEL, (void*)hk_diplo_del, &o_diplo_del, "diplo_actions") &&
-                 hook(b + RVA_DIPLO_LIST, (void*)hk_diplo_list, &o_diplo_list, "diplo_actions")) {
+        else if ((g_diplo_vt = b + RVA_DIPLO_VT),
+                 hook2("diplo_actions", b + RVA_DIPLO_DEL, (void*)hk_diplo_del, &o_diplo_del, b + RVA_DIPLO_LIST, (void*)hk_diplo_list, &o_diplo_list)) {
             eb_log("leaks: the diplomatic action entries of closed categories are deleted when the country view makes its list again");
             n++;
         }
+        if (!o_diplo_list) g_cfg.leak_diplo_actions = 0;
     }
     if (g_cfg.leak_message_popups) {
         if (memcmp(b + RVA_MSG_NEW, sig_msg_new, sizeof sig_msg_new) || memcmp(b + RVA_MSG_DEL, sig_msg_del, sizeof sig_msg_del) ||
             *(void**)(b + RVA_MSG_VT) != (void*)(b + RVA_MSG_DEL) || *(void**)(b + RVA_POPUP_VT) != (void*)(b + RVA_POPUP_DEL))
             eb_log("leaks: message_popups signature mismatch - off");
-        else if ((g_popup_vt = b + RVA_POPUP_VT), (g_gs_slot = b + RVA_GS), hook(b + RVA_MSG_DEL, (void*)hk_msg_del, &o_msg_del, "message_popups") &&
-                 hook(b + RVA_MSG_NEW, (void*)hk_msg_new, &o_msg_new, "message_popups")) {
+        else if ((g_popup_vt = b + RVA_POPUP_VT), (g_gs_slot = b + RVA_GS),
+                 hook2("message_popups", b + RVA_MSG_DEL, (void*)hk_msg_del, &o_msg_del, b + RVA_MSG_NEW, (void*)hk_msg_new, &o_msg_new)) {
             eb_log("leaks: the popups of message list items that were not opened are deleted");
             n++;
         }
+        if (!o_msg_new) g_cfg.leak_message_popups = 0;
     }
     return n;
 #endif

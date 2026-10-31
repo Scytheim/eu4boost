@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.10"
+#define EU4BOOST_VERSION "0.4.11"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -75,7 +75,7 @@ typedef struct {
     // country update (country.c)
     int country_stats;            // 1 = diagnostics: time the country loop and its dirty-bundle functions
     int country_parallel_refresh; // EXPERIMENT: RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check (1 = on is ignored since 0.4.10)
-    int country_refresh_ignored;  // the ini said parallel_refresh=1 (logged)
+    int country_refresh_ignored;  // the ini's parallel_refresh value when it was not used (1 since 0.4.10, or out of range), logged
     int country_refresh_fixup;    // 1 = recompute the cached values of FUN_1402f1120 (+0xe1c..+0xe34) at the country's turn
     int country_parallel_war;     // 1 = the war refresh (all participants of a war joined or declared) on all cores, 2 = + verify
     int country_parallel_annex;   // 1 = the opinions recomputed when a country disappears on all cores, 2 = + verify
@@ -106,9 +106,17 @@ typedef struct {
     int leak_diplo_actions;       // 1 = the country view's diplomatic action entries of closed categories are deleted when the list is made again
     int leak_message_popups;      // 1 = the popups of message list items that were never opened are deleted
     int test_diplo_freed;         // testing only ([test] diplo_freed=1): the next diplomacy reset finds one relation freed
+    int test_diplo_removed;       // testing only ([test] diplo_removed=1): in the next diplomacy reset a relation removes and deletes the next one
     int test_slow_item_ms;        // testing only ([test] slow_item_ms=N): at most once a minute a worker's chunk of a big parallel loop sleeps N ms
     int test_loc_fiber;           // testing only ([test] loc_fiber): 1 = that check always runs on the larger stack, 2 = as usual; both log each table and result
     int test_ironman_name;        // testing only ([test] ironman_name=1): the ironman save of eb_auto is named "eb_시험" in EU4dll's escapes
+    char test_hook_fail_set[32];  // testing only ([test] hook_fail_set=name, hook_fail_at=K): operation K of that hook set fails
+    int test_hook_fail_at;        // ... (operations 1..n create the set's hooks, n+1..2n enable them)
+    int test_queue_fail;          // testing only ([test] queue_fail=N): a worker's queue cannot grow after N entries (country.c)
+    int test_msg_fail;            // testing only ([test] msg_fail=N): every Nth message copy of a worker fails (country.c)
+    int test_rng_count;           // testing only ([test] rng_count=N): the seed sync command of a load restores N draws instead (rng.c)
+    // loading (rng.c)
+    int load_fast_rng;            // 1 = a load restores the random generator with its state updates only (no draws), 2 = + verify against the game's draws
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
     int play_monitor;             // playmon.c: 1 = rows of memory, frames, days and handles while playing (diagnostics)
@@ -138,6 +146,25 @@ extern DWORD g_main_tid;
 extern wchar_t g_dir[MAX_PATH];   // directory of this DLL (with trailing backslash)
 
 void eb_log(const char* fmt, ...);
+
+// A set of hooks that only work together (main.c): all of them are made and enabled, or none stays in the
+// game's code. On a failure the set's hooks come out again (MH_RemoveHook restores the bytes, which is
+// checked), and the trampolines it handed out are set to NULL.
+#define EB_HS_MAX 16
+typedef struct {
+    const char* name;
+    int n, ops, failed;
+    void* t[EB_HS_MAX];
+    void** orig[EB_HS_MAX];
+    uint8_t before[EB_HS_MAX][16];
+} eb_hookset;
+void eb_hs_init(eb_hookset* s, const char* name);
+int  eb_hs_add(eb_hookset* s, void* target, void* detour, void** orig);   // MH_CreateHook; 0 = the set is undone
+int  eb_hs_enable(eb_hookset* s);                                          // enables all; 0 = the set is undone
+void eb_hs_undo(eb_hookset* s, const char* why);
+// What each feature was asked for in the ini and what actually runs (main.c prints one "features:" line
+// after the install, so a report's log shows the features of that session).
+void eb_feature(const char* name, int requested, int active, const char* why_off);
 
 // alloc.c
 int  eb_alloc_install(void);
@@ -229,6 +256,8 @@ extern volatile int eb_in_day;         // crash.c: inside the daily tick (set by
 // uitime.c
 int  eb_uitime_install(void);
 int  eb_autorun_install(void);       // autorun.c: test autopilot, driven from uitime.c
+int  eb_rng_install(void);           // rng.c: the random generator restore of a load ([load] fast_rng_replay)
+void eb_rng_report(void);
 int  eb_autorun_date(const char* s);
 void eb_autorun_loaded(void);
 void eb_autorun_frame(void);

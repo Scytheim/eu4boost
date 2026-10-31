@@ -52,6 +52,8 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 - 10-30 낮(커밋 전): 네 번째 플레이 측정(JAP 1639 → 1722, 1.65시간): GUI 창 27.5k → 79.1k(다시 켜면 15.7k), 껐다 켜면 +22%. 늘어난 창의 대부분 = 알림 목록 항목(message_item, FUN_14123f800)이 들고 있다 지울 때 안 지우는 DefaultPopup(누르지 않은 알림, 끝에 2,332개). 누수 5 `[leaks] message_popups`(코드 기본 0, 배포 ini 1): 다음 알림 때 지움, 자동 시험 창 증가 +2,553 → +1,822. 게임 폴더 = 1030b + ini 1030b. 실제 플레이 확인(13:32~14:50, 1720 → 1774): 팝업 1,694개 지움, 창 18k → 34k(전 27k → 79k), 껐다 켜기 차이 +22% → +13%, 튕김 없음. 남은 큰 멈춤 = 불러오기 중 난수 되감기 4~6초.
 - 10-30 오후: 입력 지연·프레임 측정(playmon.c: 하루 계산 있는/없는 프레임 히스토그램 fr/fd, PeekMessageW 후킹 입력 지연 in, 100ms 넘는 프레임의 메인 스레드 위치 "hitches:")과 시험 전용 화면 밖 가짜 플레이(autorun.c `[test] autorun_offscreen=1`, `autorun_input=씨앗`: 창을 x 20000에 그리고 활성화 안 함, PostMessageW로 확대·축소·이동·클릭·F1~F8). KOR 1581 → 1680 1.8시간: 처음과 끝 성능 같음, 재시작 이득 없음(30초당 날짜 218 → 216) → 오래 켜서 느려지는 현상 재현 안 됨. 입력 지연 p50 57~80ms = 5배속 하루 계산 프레임 길이를 따름. 가장 큰 끊김 = 철인모드 분기 저장 1회 약 0.34초(나라 병렬 49ms 뒤 나머지 약 285ms가 메인 스레드), 다음 매월 1일, AI 루프 대기(0x77d9f3). 게임 폴더 = pm_1030c + ini 1030b.
 - 10-30 저녁: 보고 83~110번 검토 → 플러그인 원인은 105번 하나(실험 `parallel_refresh`의 작업 스레드가 다른 나라 관계 배열에서 null을 읽음, 효과 1.7%) → 0.4.10에서 `parallel_refresh=1` 무시(2~4 분석용만). 나머지는 게임·모드·드라이버·PC. 다음 성능 후보: 스크립트 효과 안 FUN_1402d0b30 멈칫 2~16초(5건), 불러오기 난수 되감기. **0.4.10 배포**(저장 스레드 메모리 + `[leaks]` 다섯 + 멈칫 보고 보강 + ai_land_memo + parallel_refresh 끔, 공개 7ee2e27, 릴리스 자산 zip 하나, 설명 비움, 배포 DLL 확인은 자동 시험 2가지: 짭짭죽 1543 → 1546, 기본 1600 → 1603 + 옛 설정 무시). 자동 업데이트는 DLL만 바꾸므로 기존 사용자는 `[leaks]` (3)~(5)·ai_land_memo가 꺼진 채(코드 기본 0). 게임 폴더 = 배포 DLL + ini 1030b(측정 계속).
+- 10-31(커밋 전): 코덱스 검토·실행 지시서(사용자 PC의 코덱스 폴더 notes) 첫 묶음. 안전한 게임 시험 도구 `<작업 폴더>\bench\auto\safe_run.py`(잠금, 백업·명세·복구 확인, 화면 밖 + 바깥 격리 감시, PID로만 종료; 앞으로 run.sh 대신). A: 훅 묶음 `eb_hookset`(실패하면 그 묶음 전체를 빼고 바이트 확인, 시험용 `[test] hook_fail_set/at`), 작업 스레드 큐 메모리 부족 때 비상 큐·정적 칸(작업 스레드에서 게임 함수를 부르지 않음, `queue_fail`/`msg_fail`), parallel_refresh 범위 검사, 설치 끝 `features:` 줄. B: `[load] fast_rng_replay`(src/rng.c, 실험 기본 0, 2 = 검증) - 같은 프로세스에서 플레이 뒤 다시 불러올 때의 난수 되감기 446,868,485번 3.9초 → 0.08초, 검증·고정 시드 400일 동일(시험용 `[test] rng_count`). 단위 시험 25개. DLL cl1031b(a828a085) 게임 시험 20개 중 19 PASS + 1 예상된 FAIL(화면 밖 훅 실패 시험: 최소화 대체 경로에서 창이 0.2초 보임). 새 보고 125·132번 = 다시 불러오기 크래시가 0.4.10 막이로도 남음(목록을 도는 중 해제) → 다음 후보. 게임 폴더는 시험 전과 같음(배포 DLL + ini 1030b).
+- 10-31 오후(커밋 전): 보고 123·125·132번 = 다시 불러오기 크래시가 0.4.9 막이로도 남음. 원인은 FUN_1404e0d90이 목록의 "도는 중"(+0x14)을 켜지 않아, 한 관계가 끝나며 다음 관계를 RemActive로 빼면 미리 읽은 다음 칸이 해제되는 것. 수정: 훅이 표시를 켜고 직접 돈다(지움 대기 칸 건너뜀·비움, 관계마다 직전 검사, 디버그 로그 비트 게임처럼), 나머지는 게임 함수. 시험용 `[test] diplo_removed=1`(수정 끄면 125번과 같은 서명 재현), 단위 시험 diplo_test. 시험 실행의 크래시는 게임 보고 창 없이 끝냄(crash.c). DLL cl1031c(5a7a287a) 시험 7개 예상대로.
 - 다음 일: HANDOFF.md §9(0번: 커밋·기본값은 사용자 결정 대기).
 
 ## 사용자
@@ -61,7 +63,7 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 ## 명령
 ```sh
 sh build.sh                   # → build/eu4boost.dll. Windows(Git Bash): <도구 폴더>\llvm-mingw-* 자동 사용, WSL/Linux: clang + lld + mingw-w64
-sh test/run_tests.sh          # 스모크 테스트 16개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 16 cases passed"
+sh test/run_tests.sh          # 스모크 테스트 25개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 25 cases passed"
 node test/worker_test.mjs     # 크래시 보고 중간 서버(worker/crash-report.js)를 가짜 GitHub로 시험
 sh tools/release.sh           # 릴리스 파일(zip, eu4boost.dll, .sha256) → build/release/v버전/ (버전에 -dev가 없어야 함)
 powershell -File build_windows.ps1   # PowerShell 빌드 (build.sh와 같은 코드)

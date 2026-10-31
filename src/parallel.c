@@ -397,11 +397,11 @@ static int hk_cndwait(void* cv, void* mtx) {
     return o_cndwait(cv, mtx);
 }
 
+static eb_hookset g_hs;                            // the dispatcher, wait, task and state hooks work only together
 static int hook(uint32_t rva, const uint8_t* sig, size_t n, void* fn, void** orig, const char* name) {
     uint8_t* t = g_base + rva;
-    if (memcmp(t, sig, n) != 0) { eb_log("parallel: %s signature mismatch - off", name); return 0; }
-    if (MH_CreateHook(t, fn, orig) != MH_OK || MH_EnableHook(t) != MH_OK) { eb_log("parallel: %s hook failed", name); return 0; }
-    return 1;
+    if (memcmp(t, sig, n) != 0) { eb_log("parallel: %s signature mismatch - off", name); eb_hs_undo(&g_hs, "a signature differs"); return 0; }
+    return eb_hs_add(&g_hs, t, fn, orig);
 }
 
 int eb_parallel_install(void) {
@@ -419,6 +419,7 @@ int eb_parallel_install(void) {
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return 0;
     int ok = 1;
+    eb_hs_init(&g_hs, "parallel");
     if (g_cfg.par_chunked) {
         if (memcmp(g_base + RVA_SPINLOCK, sig_spinlock, 8) == 0) {
             game_spinlock = (spinlock_t)(g_base + RVA_SPINLOCK);
@@ -435,11 +436,16 @@ int eb_parallel_install(void) {
         if (memcmp(g_base + RVA_MTX_LOCK, sig_mtxlock, 8) == 0 && memcmp(g_base + RVA_MTX_UNLOCK, sig_mtxunlock, 8) == 0) {
             mtx_lock = (mtx_t)(g_base + RVA_MTX_LOCK); mtx_unlock = (mtx_t)(g_base + RVA_MTX_UNLOCK);
             ok &= hook(RVA_CNDWAIT, sig_cndwait, 16, (void*)hk_cndwait, (void**)&o_cndwait, "cnd_wait");
-        } else { eb_log("parallel: mutex signature mismatch - spin off"); ok = 0; }
+        } else { eb_log("parallel: mutex signature mismatch - spin off"); g_cfg.par_spin_us = 0; }
     }
-    eb_log("parallel: stats=%d chunked=%d small_loop_caps=%d longest_first=%d min_items_per_task=%d worker_spin_us=%d spin_workers=%d -> %s",
-           g_cfg.par_stats, g_cfg.par_chunked, g_cfg.par_caps, g_cfg.par_lpt, g_cfg.par_min_items, g_cfg.par_spin_us, g_cfg.par_spin_workers, ok ? "installed" : "partly installed");
-    return ok;
+    if (!ok || !eb_hs_enable(&g_hs)) {                // none of them stays (the chunked task body needs its wait, and so on)
+        eb_log("parallel: hooks failed - the game's parallel loops run unchanged");
+        g_cfg.par_stats = g_cfg.par_chunked = g_cfg.par_caps = g_cfg.par_lpt = g_cfg.par_min_items = g_cfg.par_spin_us = 0;
+        return 0;
+    }
+    eb_log("parallel: stats=%d chunked=%d small_loop_caps=%d longest_first=%d min_items_per_task=%d worker_spin_us=%d spin_workers=%d -> installed",
+           g_cfg.par_stats, g_cfg.par_chunked, g_cfg.par_caps, g_cfg.par_lpt, g_cfg.par_min_items, g_cfg.par_spin_us, g_cfg.par_spin_workers);
+    return 1;
 #endif
 }
 

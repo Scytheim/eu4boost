@@ -516,6 +516,10 @@ static LONG WINAPI eb_filter(EXCEPTION_POINTERS* ep) {
         HANDLE h = CreateThread(NULL, 1 << 20, crash_writer, NULL, 0, NULL);
         if (h) { WaitForSingleObject(h, 20000); CloseHandle(h); }
         else crash_writer(NULL);
+        if (g_cfg.autorun_until) {                              // a test run: no crash reporter window on the user's screen
+            eb_log("crash: TEST run - the game ends here, without its own crash reporter");
+            TerminateProcess(GetCurrentProcess(), ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 1);
+        }
     }
     return g_next_filter ? g_next_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }

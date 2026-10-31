@@ -160,8 +160,9 @@ static void record(int f, LONGLONG t0, void* ret) {
 #define MAXJOBS 4096
 #define MAXWORKERS 15
 // a recorded UpdateOpinionCache call, or (msg set) a message for the handler in .country
-typedef struct { void* country; uint64_t key; char flag; uint8_t* msg; uint8_t* fn; } opcall_t;
-typedef struct { uint8_t* c; const char* where; opcall_t* ops; int nops, capops; uint8_t pre[C_KCACHE_N]; } job_t;
+typedef struct { void* country; uint64_t key; char flag, emerg; uint8_t* msg; uint8_t* fn; } opcall_t;   // emerg: msg/fn in g_emsg
+// ops: the job's recorded calls in order; once its buffer cannot grow, the rest follow in the emergency queue from ehead
+typedef struct { uint8_t* c; const char* where; opcall_t* ops; int nops, capops, ehead, etail; uint8_t pre[C_KCACHE_N]; } job_t;
 static job_t g_jobs[MAXJOBS];                  // the loop start's refresh (finish_loop reads it until the loop ends)
 static job_t g_wjobs[MAXJOBS];                 // a war refresh's participants
 static volatile LONG g_njobs, g_next, g_done, g_pending;   // g_pending: woken workers not yet back to waiting
@@ -172,7 +173,8 @@ static HANDLE g_wake[MAXWORKERS];
 static int g_nworkers;
 static __thread int t_job = -1;                 // job running on this thread (workers), -1 = none
 static LONG64 g_pr_loops, g_pr_jobs, g_pr_skipped, g_pr_redirty, g_pr_leftover, g_pr_deferred, g_pr_ver, g_pr_ver_bad;
-static LONG64 g_pr_msgs, g_pr_msg_oom;          // messages posted from the replay; posted on a worker (out of memory)
+static LONG64 g_pr_msgs, g_pr_msg_oom;          // messages posted from the replay; message copies kept in g_emsg (out of memory)
+static LONG64 g_pr_spill;                       // recorded calls kept in the emergency queue (a job's buffer could not grow)
 static LONG64 g_pr_test;                        // test_truce_end: relations set to a truce that has just ended
 static double g_pr_us;                          // main-thread time of the parallel phase
 static LONG64 g_pr_dep;                         // left out: the group leader is refreshed in the same phase
@@ -181,16 +183,39 @@ static LONG64 g_fix_calls, g_fix_changed, g_kc_checked, g_kc_post_diff;
 static double g_fix_us;
 static const char g_where[] = "eu4boost parallel_refresh";
 
+// Out of memory on a worker. A recorded call or message may never run on the worker instead: UpdateOpinionCache
+// writes other countries' caches and the message handler is GUI code (report 24). So a job whose buffer cannot
+// grow goes on in a static emergency queue (its order kept), a message copy in static slots; when those are used
+// up too, the worker ends the game as the game's own allocation would (an unhandled STATUS_NO_MEMORY, reported).
+#define EOPS 8192
+#define EMSG 64
+static opcall_t g_eops[EOPS];
+static int g_enext[EOPS];
+static volatile LONG g_eops_n, g_emsg_n, g_msg_seq;
+static uint8_t g_emsg[EMSG][MSG_SIZE], g_efn[EMSG][FN_SIZE];
+static void out_of_memory(const char* what) {
+    eb_log("country: out of memory for %s on a worker and the emergency queue is full - ending as the game does without memory", what);
+    RaiseException(0xC0000017u /* STATUS_NO_MEMORY */, EXCEPTION_NONCONTINUABLE, 0, NULL);
+}
 static opcall_t* new_op(int j) {
     job_t* jb = &g_batch[j];
-    if (jb->nops == jb->capops) {
+    if (jb->ehead < 0 && jb->nops == jb->capops) {
         int n = jb->capops ? jb->capops * 2 : 8;
-        opcall_t* p = (opcall_t*)realloc(jb->ops, (size_t)n * sizeof *p);
-        if (!p) return NULL;
-        jb->ops = p; jb->capops = n;
+        opcall_t* p = (g_cfg.test_queue_fail && n > g_cfg.test_queue_fail) ? NULL : (opcall_t*)realloc(jb->ops, (size_t)n * sizeof *p);
+        if (p) { jb->ops = p; jb->capops = n; }
     }
-    opcall_t* o = &jb->ops[jb->nops++];
-    o->msg = NULL; o->fn = NULL;
+    opcall_t* o;
+    if (jb->ehead < 0 && jb->nops < jb->capops) o = &jb->ops[jb->nops++];
+    else {                                      // this job's calls from here on: the emergency queue, in order
+        LONG k = InterlockedIncrement(&g_eops_n) - 1;
+        if (k >= EOPS) out_of_memory("a recorded call");
+        g_enext[k] = -1;
+        if (jb->ehead < 0) jb->ehead = (int)k; else g_enext[jb->etail] = (int)k;
+        jb->etail = (int)k;
+        InterlockedIncrement64(&g_pr_spill);
+        o = &g_eops[k];
+    }
+    o->msg = NULL; o->fn = NULL; o->emerg = 0;
     return o;
 }
 
@@ -203,7 +228,6 @@ static void hk_opcache(void* c, uint64_t key, char flag) {
         return;
     }
     opcall_t* o = new_op(j);                    // worker: record, the main thread replays it later
-    if (!o) { o_opcache(c, key, flag); return; }   // out of memory: run it here (best effort)
     o->country = c; o->key = key; o->flag = flag;
 }
 
@@ -212,23 +236,31 @@ static void hk_msg(void* h, void* msg, void* fn) {
     if (j < 0 || g_cfg.country_test_no_defer) { o_msg(h, msg, fn); return; }
     // worker: keep the message for the main thread. The handler owns msg (by value): move it out with
     // the game's move constructor and free what is left, as the handler does when it drops a message.
-    uint8_t* m = (uint8_t*)malloc(MSG_SIZE);
-    uint8_t* f = (uint8_t*)malloc(FN_SIZE);
-    opcall_t* o = (m && f) ? new_op(j) : NULL;
-    if (!o) { free(m); free(f); InterlockedIncrement64(&g_pr_msg_oom); o_msg(h, msg, fn); return; }
+    int fail = g_cfg.test_msg_fail > 0 && InterlockedIncrement(&g_msg_seq) % g_cfg.test_msg_fail == 0;   // testing
+    uint8_t* m = fail ? NULL : (uint8_t*)malloc(MSG_SIZE);
+    uint8_t* f = fail ? NULL : (uint8_t*)malloc(FN_SIZE);
+    int emerg = 0;
+    if (!m || !f) {                             // out of memory: a static slot (see new_op)
+        free(m); free(f);
+        LONG k = InterlockedIncrement(&g_emsg_n) - 1;
+        if (k >= EMSG) out_of_memory("a message");
+        m = g_emsg[k]; f = g_efn[k]; emerg = 1;
+        InterlockedIncrement64(&g_pr_msg_oom);
+    }
+    opcall_t* o = new_op(j);
     g_msgmove(m, msg);
     g_strfree((uint8_t*)msg + 0x60);
     g_lstfree((uint8_t*)msg + 0x10);
     void* impl = *(void**)((uint8_t*)fn + 0x38);   // the caller keeps (and destroys) its std::function
     *(void**)(f + 0x38) = impl ? ((fcopy_t)(*(void***)impl)[0])(impl, f) : NULL;
-    o->country = h; o->msg = m; o->fn = f;
+    o->country = h; o->msg = m; o->fn = f; o->emerg = (char)emerg;
 }
 
 static void post_msg(opcall_t* o) {
     o_msg(o->country, o->msg, o->fn);           // the handler frees the message's contents
     void* impl = *(void**)(o->fn + 0x38);
     if (impl) ((fdel_t)(*(void***)impl)[4])(impl, impl != (void*)o->fn);
-    free(o->msg); free(o->fn);
+    if (!o->emerg) { free(o->msg); free(o->fn); }
 }
 
 static void (*volatile g_run_one)(LONG i);      // set: the batch runs this for 0..g_nbatch instead of RefreshKnowledge
@@ -275,17 +307,21 @@ static void run_all(LONG m, int serial) {
         while (g_done < m) YieldProcessor();
     }
 }
+static void replay(opcall_t* o) {
+    if (o->msg) { post_msg(o); g_pr_msgs++; return; }
+    o_opcache(o->country, o->key, o->flag);
+    g_pr_deferred++;
+}
 static void run_batch(job_t* jobs, LONG m, int serial) {
     g_in_batch = 1;
     g_batch = jobs; g_run_one = NULL;
+    g_eops_n = 0; g_emsg_n = 0;                 // the emergency queue and slots are free again (the last replay is done)
+    for (LONG i = 0; i < m; i++) jobs[i].ehead = jobs[i].etail = -1;
     run_all(m, serial);
-    for (LONG i = 0; i < m; i++)
-        for (int k = 0; k < jobs[i].nops; k++) {
-            opcall_t* o = &jobs[i].ops[k];
-            if (o->msg) { post_msg(o); g_pr_msgs++; continue; }
-            o_opcache(o->country, o->key, o->flag);
-            g_pr_deferred++;
-        }
+    for (LONG i = 0; i < m; i++) {              // in job order, each job's calls in the order it made them
+        for (int k = 0; k < jobs[i].nops; k++) replay(&jobs[i].ops[k]);
+        for (int k = jobs[i].ehead; k >= 0; k = g_enext[k]) replay(&g_eops[k]);
+    }
     g_in_batch = 0;
 }
 
@@ -751,6 +787,44 @@ static void war_test(uint8_t* gs) {                    // test_war_all: a war of
     g_war_jobs = j0; g_war_serial = s0; g_war_ver = v0; g_war_bad = b0;
 }
 
+#ifdef EB_TEST
+// a worker's recorded calls when its buffer cannot grow ([test] queue_fail): the buffer, then the emergency
+// queue, each job in the order it recorded them; eight workers at once; then again with the buffers kept
+static job_t g_tjobs[8];
+static DWORD WINAPI tq_worker(LPVOID p) {
+    int j = (int)(intptr_t)p;
+    for (int k = 0; k < 500; k++) { opcall_t* o = new_op(j); o->key = (uint64_t)k; o->country = (void*)(intptr_t)(j + 1); }
+    return 0;
+}
+__declspec(dllexport) int eb_test_queue(void) {
+    int bad = 0;
+    for (int round = 0; round < 2; round++) {
+        g_cfg.test_queue_fail = round ? 0 : 64;
+        g_batch = g_tjobs; g_eops_n = 0;
+        for (int j = 0; j < 8; j++) { g_tjobs[j].nops = 0; g_tjobs[j].ehead = g_tjobs[j].etail = -1; }
+        HANDLE th[8];
+        for (int j = 0; j < 8; j++) th[j] = CreateThread(NULL, 0, tq_worker, (LPVOID)(intptr_t)j, 0, NULL);
+        WaitForMultipleObjects(8, th, TRUE, INFINITE);
+        for (int j = 0; j < 8; j++) CloseHandle(th[j]);
+        int spilled = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t want = 0; int n = 0;
+            for (int k = 0; k < g_tjobs[j].nops; k++, n++)
+                if (g_tjobs[j].ops[k].key != want++ || g_tjobs[j].ops[k].country != (void*)(intptr_t)(j + 1)) bad++;
+            for (int k = g_tjobs[j].ehead; k >= 0; k = g_enext[k], n++, spilled++)
+                if (g_eops[k].key != want++ || g_eops[k].country != (void*)(intptr_t)(j + 1)) bad++;
+            if (n != 500) bad++;
+            if (round == 0 && g_tjobs[j].capops > 64) bad++;
+        }
+        if (round == 0 ? spilled != 8 * (500 - 64) : spilled != 0) bad++;
+        printf("worker queue round %d: %d of 4000 calls in the emergency queue (%ld used), %d wrong so far\n", round, spilled, (long)g_eops_n, bad);
+    }
+    g_cfg.test_queue_fail = 0;
+    g_batch = g_jobs;
+    return bad;
+}
+#endif
+
 int eb_country_install(void) {
     if (!g_cfg.country_stats && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war && !g_cfg.country_parallel_annex) return 0;
 #ifdef EB_TEST
@@ -806,6 +880,23 @@ int eb_country_install(void) {
             !memcmp(r1, sig_annex, sizeof sig_annex)) { g_ax_ret1 = r1; g_ax_ret2 = r2; }
         else { eb_log("country: annexation loop not found - parallel annexation opinions off"); g_cfg.country_parallel_annex = 0; }
     }
+    MH_STATUS s = MH_Initialize();
+    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("country: MinHook init failed"); return 0; }
+    // all hooks or none (a partly hooked country loop could defer work nobody replays), then the workers
+    eb_hookset hs; eb_hs_init(&hs, "country");
+    for (int i = 0; i < nt_; i++) {
+        if (t[i].rva == RVA_OPCACHE && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war && !g_cfg.country_parallel_annex) continue;
+        if (t[i].rva == RVA_MSG && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) continue;
+        // timing-only hooks: not needed to play
+        if ((t[i].rva == RVA_DAILY || t[i].rva == RVA_CM || t[i].rva == RVA_UCB) && !g_cfg.country_stats) continue;
+        if (t[i].rva == RVA_WARREF && !g_cfg.country_stats && !g_cfg.country_parallel_war) continue;
+        if (!eb_hs_add(&hs, b + t[i].rva, t[i].hook, t[i].orig)) break;
+    }
+    if (!eb_hs_enable(&hs)) {
+        eb_log("country: hooks failed - statistics and the parallel refresh, war and annexation work off");
+        g_cfg.country_stats = g_cfg.country_parallel_refresh = g_cfg.country_parallel_war = g_cfg.country_parallel_annex = 0;
+        return 0;
+    }
     if (g_cfg.country_parallel_refresh || g_cfg.country_parallel_war || g_cfg.country_parallel_annex) {
         SYSTEM_INFO si; GetSystemInfo(&si);
         int nw = (int)si.dwNumberOfProcessors - 1;
@@ -813,21 +904,8 @@ int eb_country_install(void) {
         for (int i = 0; i < nw; i++) {
             g_wake[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
             HANDLE h = g_wake[i] ? CreateThread(NULL, 256 << 10, worker, g_wake[i], 0, NULL) : NULL;
-            if (!h) break;
+            if (!h) { if (g_wake[i]) CloseHandle(g_wake[i]); g_wake[i] = NULL; break; }   // fewer workers: the main thread takes the rest
             CloseHandle(h); g_nworkers++;
-        }
-    }
-    MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("country: MinHook init failed"); return 0; }
-    for (int i = 0; i < nt_; i++) {
-        if (t[i].rva == RVA_OPCACHE && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war && !g_cfg.country_parallel_annex) continue;
-        if (t[i].rva == RVA_MSG && !g_cfg.country_parallel_refresh && !g_cfg.country_parallel_war) continue;
-        // timing-only hooks: not needed to play
-        if ((t[i].rva == RVA_DAILY || t[i].rva == RVA_CM || t[i].rva == RVA_UCB) && !g_cfg.country_stats) continue;
-        if (t[i].rva == RVA_WARREF && !g_cfg.country_stats && !g_cfg.country_parallel_war) continue;
-        if (MH_CreateHook(b + t[i].rva, t[i].hook, t[i].orig) != MH_OK || MH_EnableHook(b + t[i].rva) != MH_OK) {
-            eb_log("country: hook %s failed", t[i].name);
-            return 0;
         }
     }
     if (g_cfg.country_stats) eb_log("country: statistics hooks on (country loop, daily update, RefreshKnowledge, CalculateModifier, UpdateCasusBellis)");
@@ -852,11 +930,14 @@ int eb_country_install(void) {
 void eb_country_report(void) {
     if (!o_serial) return;
     if (g_cfg.country_parallel_refresh)
-        eb_log("country: parallel refresh: %lld loops, %lld precomputed (%.1f per loop, %.0f us per loop on the main thread), %lld skipped at the bundle, %lld marked again, %lld not reached, %lld opinion-cache calls replayed, %lld messages posted on the main thread (%lld on a worker: out of memory), %lld left out (group leader also dirty) | verify %lld, mismatches %lld",
+        eb_log("country: parallel refresh: %lld loops, %lld precomputed (%.1f per loop, %.0f us per loop on the main thread), %lld skipped at the bundle, %lld marked again, %lld not reached, %lld opinion-cache calls replayed, %lld messages posted on the main thread (%lld copies in static slots: out of memory), %lld left out (group leader also dirty) | verify %lld, mismatches %lld",
                (long long)g_pr_loops, (long long)g_pr_jobs, g_pr_loops ? (double)g_pr_jobs / (double)g_pr_loops : 0.0,
                g_pr_loops ? g_pr_us / (double)g_pr_loops : 0.0, (long long)g_pr_skipped, (long long)g_pr_redirty,
                (long long)g_pr_leftover, (long long)g_pr_deferred, (long long)g_pr_msgs, (long long)g_pr_msg_oom,
                (long long)g_pr_dep, (long long)g_pr_ver, (long long)g_pr_ver_bad);
+    if (g_pr_spill || g_pr_msg_oom || g_cfg.test_queue_fail || g_cfg.test_msg_fail)
+        eb_log("country: out of memory on the workers%s: %lld recorded calls went to the emergency queue, %lld message copies to static slots - all replayed on the main thread in order",
+               g_cfg.test_queue_fail || g_cfg.test_msg_fail ? " (TEST)" : "", (long long)g_pr_spill, (long long)g_pr_msg_oom);
     if (g_cfg.country_test_truce_end || g_cfg.country_test_no_defer)
         eb_log("country: TEST truce_end %d no_defer %d: %lld relations set to a truce that has just ended",
                g_cfg.country_test_truce_end, g_cfg.country_test_no_defer, (long long)g_pr_test);

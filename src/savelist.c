@@ -593,18 +593,17 @@ int eb_savelist_install(void) {
     g_len_ret = (uintptr_t)(lcall + 5);
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) { eb_log("save: MinHook init failed"); return 0; }
-    if (MH_CreateHook(len, (void*)hk_len, (void**)&o_len) != MH_OK || MH_CreateHook(b + RVA_META, (void*)hk_meta, (void**)&o_meta) != MH_OK ||
-        MH_CreateHook(b + RVA_STREAM_OPEN, (void*)hk_open, (void**)&o_open) != MH_OK ||
-        MH_EnableHook(len) != MH_OK || MH_EnableHook(b + RVA_META) != MH_OK || MH_EnableHook(b + RVA_STREAM_OPEN) != MH_OK) {
-        MH_DisableHook(b + RVA_STREAM_OPEN); MH_DisableHook(b + RVA_META); MH_DisableHook(len);
-        eb_log("save: save list cache: hook failed - off"); return 0;
+    eb_hookset hs; eb_hs_init(&hs, "save list");
+    if (!eb_hs_add(&hs, len, (void*)hk_len, (void**)&o_len) || !eb_hs_add(&hs, b + RVA_META, (void*)hk_meta, (void**)&o_meta) ||
+        !eb_hs_add(&hs, b + RVA_STREAM_OPEN, (void*)hk_open, (void**)&o_open) || !eb_hs_enable(&hs)) {
+        eb_log("save: save list cache: hook failed - off"); g_cfg.save_list_cache = 0; return 0;
     }
     void* ord = (void*)GetProcAddress(g_exe, "PHYSFS_openRead");
     void* cls = (void*)GetProcAddress(g_exe, "PHYSFS_close");
+    eb_hs_init(&hs, "save list diagnostics");
     if (g_cfg.save_list_cache == 2 && ord && cls && !memcmp(b + RVA_ITEM, sig_item, sizeof sig_item) &&
-        MH_CreateHook(b + RVA_ITEM, (void*)hk_item, (void**)&o_item) == MH_OK && MH_EnableHook(b + RVA_ITEM) == MH_OK &&
-        MH_CreateHook(ord, (void*)hk_openread, (void**)&o_openread) == MH_OK && MH_EnableHook(ord) == MH_OK &&
-        MH_CreateHook(cls, (void*)hk_close, (void**)&o_close) == MH_OK && MH_EnableHook(cls) == MH_OK) g_diag = 1;
+        eb_hs_add(&hs, b + RVA_ITEM, (void*)hk_item, (void**)&o_item) && eb_hs_add(&hs, ord, (void*)hk_openread, (void**)&o_openread) &&
+        eb_hs_add(&hs, cls, (void*)hk_close, (void**)&o_close) && eb_hs_enable(&hs)) g_diag = 1;
     cache_read();
     eb_log("save: save list cache on - unchanged saves are listed from %d cached entries without reading them%s", g_ne,
            g_diag ? " (DIAGNOSTICS: every item logged)" : "");

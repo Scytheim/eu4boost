@@ -300,6 +300,91 @@ static void tip_tick_valid(void* c) { tick_total = tip_run((unsigned char*)c, &t
 static void tip_tick_reused(void* c) { tick_total = tip_run((unsigned char*)c, &tick_visited); }
 static void tick_then_mid(void* c) { tick_body = (tick_fn_t)(void*)tip_tick_reused; t_midtick(c, 0, NULL, 0); }
 static void gp_test(void);
+// ---- the diplomacy reset (guard.c hk_diplo_clear): FUN_1404e0d90 and RemActive as the game has them ----
+typedef struct dnode { struct drel* rel; struct dnode *prev, *next; unsigned char pending, freed, pad[6]; } dnode;
+typedef struct { dnode *head, *tail; int count; unsigned char walking, pad[3]; } dlist;
+typedef struct drel { const void* const* vt; unsigned long long pad; unsigned long long tags; int id, ended, deleted, pad2; unsigned long long pad3[3]; } drel;
+typedef struct { unsigned long long pad[2]; dlist *b, *e, *cap; } ddiplo;
+static ddiplo t_d;
+static dlist t_lists[3];
+static int t_order[16], t_norder, t_uaf;
+static unsigned int t_logflags = 0xd;           // bit 0 (debug log) must be off during the walk
+static int t_logbit_in_walk;
+static unsigned char* t_logset(void) { static unsigned char s[0x40]; *(unsigned int*)(s + 0x38) = t_logflags; return s; }
+static unsigned char t_logs[0x40];
+static unsigned char* t_logset2(void) { return t_logs; }
+static void t_flush(unsigned char* s) { (void)s; }
+static char t_remactive(ddiplo* d, drel* r) {     // CDiplomacy::RemActive: unlink and free, or only mark while walked
+    dlist* L = &d->b[(short)(r->tags >> 32)];
+    for (dnode* n = L->head; n; n = n->next)
+        if (n->rel == r) {
+            if (L->walking) { n->pending = 1; return 1; }
+            if (n->prev) n->prev->next = n->next; else L->head = n->next;
+            if (n->next) n->next->prev = n->prev; else L->tail = n->prev;
+            n->freed = 1; n->rel = (drel*)(unsigned long long)0xfeeefeeefeeefeeeull;   // the node is freed memory now
+            L->count--;
+            return 1;
+        }
+    return 0;
+}
+static drel* t_drel[6];
+static void t_end(drel* r) {                      // +0x60
+    t_order[t_norder++] = r->id; r->ended++;
+    t_logbit_in_walk |= *(unsigned int*)(t_logs + 0x38) & 1;
+    if (r->id == 0) { t_remactive(&t_d, t_drel[1]); t_drel[1]->deleted = 1; }   // A ends B, and B is deleted
+}
+static void t_del(drel* r, int f) { (void)f; r->deleted = 1; }
+static void t_nop(drel* r) { (void)r; }
+static const void* const t_relvt[13] = { (void*)t_del, (void*)t_nop, (void*)t_nop, (void*)t_nop, (void*)t_nop, (void*)t_nop,
+                                         (void*)t_nop, (void*)t_nop, (void*)t_nop, (void*)t_nop, (void*)t_nop, (void*)t_nop, (void*)t_end };
+static void t_game_reset(ddiplo* d) {             // FUN_1404e0d90's walk: the next node is read before the calls
+    int n = (int)(d->e - d->b);
+    for (int i = 0; i < n; i++)
+        for (dnode* nd = d->b[i].head; nd; ) {
+            if (nd->freed) { t_uaf++; break; }          // the game would read freed memory here (reports 125, 132)
+            drel* r = nd->rel; dnode* next = nd->next;
+            if (r) { ((void (*)(drel*))r->vt[12])(r); ((void (*)(drel*, int))r->vt[0])(r, 1); }
+            nd = next;
+        }
+}
+static void t_build(void) {
+    memset(t_lists, 0, sizeof t_lists); t_norder = 0; t_uaf = 0; t_logbit_in_walk = 0;
+    *(unsigned int*)(t_logs + 0x38) = t_logflags;
+    t_d.b = t_lists; t_d.e = t_lists + 3; t_d.cap = t_lists + 3;
+    static const int where[6] = { 0, 0, 0, 1, 2, 2 };     // A, B, C in list 0; D in list 1; E, F in list 2
+    for (int i = 0; i < 6; i++) {
+        drel* r = (drel*)calloc(1, sizeof *r);
+        r->vt = t_relvt; r->id = i; r->tags = (unsigned long long)(unsigned short)where[i] << 32;
+        dnode* nd = (dnode*)calloc(1, sizeof *nd);
+        dlist* L = &t_lists[where[i]];
+        nd->rel = r; nd->prev = L->tail;
+        if (L->tail) L->tail->next = nd; else L->head = nd;
+        L->tail = nd; L->count++;
+        t_drel[i] = r;
+    }
+}
+static void diplo_test(HMODULE h) {
+    typedef void (*dr_t)(void*, void*, void*, void*, void*, int);
+    dr_t dr = (dr_t)GetProcAddress(h, "eb_test_diplo_reset");
+    CHECK(dr != NULL);
+    if (!dr) return;
+    // the game's own walk (the guard off): A removes B, B's node is freed and the walk reads it next
+    t_build(); dr(&t_d, (void*)t_game_reset, (void*)t_remactive, (void*)t_logset2, (void*)t_flush, 0);
+    printf("diplomacy reset, the game's walk: %d calls, %d reads of a freed node\n", t_norder, t_uaf);
+    CHECK(t_uaf == 1);
+    // the hook's walk: removals deferred, B skipped, the others ended once in the game's order, nothing read freed
+    t_build(); dr(&t_d, (void*)t_game_reset, (void*)t_remactive, (void*)t_logset2, (void*)t_flush, 1);
+    printf("diplomacy reset, the hook's walk: order");
+    for (int i = 0; i < t_norder; i++) printf(" %d", t_order[i]);
+    printf(", %d reads of a freed node, B ended %d deleted %d, flags %x, debug log on in the walk %d\n", t_uaf, t_drel[1]->ended,
+           t_drel[1]->deleted, *(unsigned int*)(t_logs + 0x38), t_logbit_in_walk);
+    CHECK(t_uaf == 0 && t_norder == 5 && t_order[0] == 0 && t_order[1] == 2 && t_order[2] == 3 && t_order[3] == 4 && t_order[4] == 5);
+    CHECK(t_drel[1]->ended == 0 && t_drel[1]->deleted == 1);
+    for (int i = 0; i < 6; i++) if (i != 1) CHECK(t_drel[i]->ended == 1 && t_drel[i]->deleted == 1);
+    for (int i = 0; i < 3; i++) { CHECK(t_lists[i].walking == 0); for (dnode* n = t_lists[i].head; n; n = n->next) CHECK(n->rel == NULL || n->pending); }
+    CHECK(*(unsigned int*)(t_logs + 0x38) == t_logflags && t_logbit_in_walk == 0);
+}
+
 static void guard_test(void) {
     tip_entry = t_tip;
     unsigned long long n;
@@ -641,7 +726,7 @@ int main(int argc, char** argv) {
     if (argc > 3 && strcmp(argv[3], "modadd") == 0) modadd_test();
 
     // 3i. crash guards (freed tooltip sources, missing relation)
-    if (argc > 3 && strcmp(argv[3], "guard") == 0) guard_test();
+    if (argc > 3 && strcmp(argv[3], "guard") == 0) { guard_test(); diplo_test(h); }
 
     // 3j. stack samples of a running thread (crash.c): it stays suspended for the walk, so 20,000 samples
     //     of a thread whose stack keeps changing walk cleanly; walking after the resume (0.4.1) is shown too
@@ -672,6 +757,29 @@ int main(int argc, char** argv) {
         double grew = private_mb() - before;
         printf("threadexit: 400 threads that allocated and ended, private memory %+.1f MB\n", grew);
         CHECK(grew < 40);
+    }
+
+    // 3l. failure paths and the random generator restore (2026-10-31): hook sets that fail at every step come
+    //     out again, a worker's recorded calls keep their order when its buffer cannot grow, the restore
+    //     equals the draws (two C references and a Python table)
+    if (argc > 3 && strcmp(argv[3], "safety") == 0) {
+        int (*tr)(void) = (int (*)(void))GetProcAddress(h, "eb_test_rng");
+        int (*th)(void) = (int (*)(void))GetProcAddress(h, "eb_test_hookset");
+        int (*tq)(void) = (int (*)(void))GetProcAddress(h, "eb_test_queue");
+        CHECK(tr != NULL); CHECK(th != NULL); CHECK(tq != NULL);
+        if (tr) CHECK(tr() == 1);
+        if (th) { int d = th(); printf("hook sets: %d wrong\n", d); CHECK(d == 0); }
+        if (tq) { int d = tq(); printf("worker queue: %d wrong\n", d); CHECK(d == 0); }
+    }
+    // 3m. [country] parallel_refresh as read from the ini: argv[4] = the value used, argv[5] = the value ignored
+    if (argc > 5 && strcmp(argv[3], "cfg") == 0) {
+        void (*tc)(int*, int*) = (void (*)(int*, int*))GetProcAddress(h, "eb_test_cfg");
+        CHECK(tc != NULL);
+        if (tc) {
+            int used = -99, ignored = -99; tc(&used, &ignored);
+            printf("parallel_refresh: used %d, ignored %d (want %s, %s)\n", used, ignored, argv[4], argv[5]);
+            CHECK(used == atoi(argv[4]) && ignored == atoi(argv[5]));
+        }
     }
 
     // 4. multi-threaded churn (also gives the profiler something to sample)

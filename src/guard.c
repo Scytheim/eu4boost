@@ -501,57 +501,152 @@ static uint64_t hk_loc_dups(void* table, void* p2) {
 }
 
 // ---- the diplomacy reset skips relations that were freed already ----
+// FUN_1404e0d90(d) (CDiplomacy, gamestate+0x1bb8; ResetGamestate on every load) walks the active relation
+// lists d+0x10..d+0x18 (a header of 0x18 bytes per country: head node, tail node, count +0x10, "being walked"
+// byte +0x14; a node of 0x20: relation, prev, next, removal pending +0x18), and for every relation calls its
+// virtual +0x60 and its deleting destructor, reading the next node first. Then it frees the lists and makes
+// them again. Reports 78, 77, 51 (0.4.1, 0.4.8): a relation already freed before the reset -> 0.4.9 checks
+// every relation before the game's walk. Reports 123 (0.4.9), 125 (x2) and 132 (0.4.10) crashed in the same
+// walk (eu4.exe+0x4e0e55 executing a heap address, +0x4e0e52 reading 0x60) with that check on: something
+// is freed *during* the walk. RemActive (FUN_1404e1570) unlinks and frees a relation's node at once unless its
+// list's +0x14 byte is set, then it only marks the node pending; the reset never sets it. So when the +0x60 or
+// destructor of one relation removes another one (RemActive, and its remover deletes it), the node the walk
+// has already read as the next one is freed memory: its first qword (mimalloc's next free block) is taken for
+// a relation, and its "vtable" for a function table.
+// Since 0.4.11 the hook does the walk itself, the way the game's other walks are safe: every list's +0x14 byte
+// set first (RemActive then only marks), a node marked pending is skipped (its remover owns the relation, as
+// when the game unlinks it), every relation is checked right before its calls; each relation's pointer is set
+// to 0 after its two calls; the game's function then does the rest (its own walk finds only zeros, frees the
+// lists including the pending nodes, makes them again). The order of the calls and the debug-log bit the game
+// turns off during its walk (bit 0 of FUN_1414d4c80() + 0x38) are as in the game.
 #define RVA_DIPLO_CLEAR 0x4e0d90u
+#define RVA_REM_ACTIVE  0x4e1570u      // CDiplomacy::RemActive(d, relation) (testing only: the removal of report 125)
+#define RVA_LOGSET      0x14d4c80u     // FUN_1414d4c80: the log settings, flags at +0x38
+#define RVA_LOGFLUSH    0x14d4180u
 static const uint8_t sig_diplo_clear[16] = { 0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x57 };
+static const uint8_t sig_rem_active[16]  = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x6c,0x24,0x10,0x48,0x89,0x74,0x24,0x20,0x44 };
+static const uint8_t sig_logset[16]      = { 0x48,0x83,0xec,0x28,0x65,0x48,0x8b,0x04,0x25,0x58,0x00,0x00,0x00,0xba,0x08,0x00 };
+static const uint8_t sig_logflush[16]    = { 0x48,0x89,0x4c,0x24,0x08,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41 };
 typedef void (*diplo_clear_t)(uint8_t* d);
+typedef char (*rem_active_t)(uint8_t* d, void* rel);
+typedef uint8_t* (*logset_t)(void);
+typedef void (*logflush_t)(uint8_t* s);
 static diplo_clear_t o_diplo_clear;
+static rem_active_t g_rem_active;
+static logset_t g_logset;
+static logflush_t g_logflush;
 static uintptr_t g_text_lo, g_text_hi;
 static volatile LONG g_freed_relations;
+static LONG64 g_dr_resets, g_dr_calls, g_dr_pending;
 static int g_diplo_tested;
 static int in_text(uintptr_t p) { return p >= g_text_lo && p < g_text_hi; }
+static uintptr_t g_fake_vt;                     // testing ([test] diplo_removed): the copy of a vtable put on relation A
 static int relation_ok(uintptr_t o) {
     if ((o & 7) || !readable(o, 0x40)) return 0;
     uintptr_t vt = *(const uintptr_t*)o;
+    if (vt && vt == g_fake_vt) return 1;
     if ((vt & 7) || vt < g_rdata_lo || vt + 13 * 8 > g_rdata_hi) return 0;
     const uintptr_t* v = (const uintptr_t*)vt;
     return in_text(v[0]) && in_text(v[9]) && in_text(v[12]);
 }
+
+// testing ([test] diplo_removed=1): what reports 123/125/132 point at. The first relation A whose next node in
+// its list holds a relation B gets a vtable copy whose +0x60 puts A's own vtable back, runs A's +0x60, then
+// removes B with RemActive and deletes it - as a relation that ends another one when it ends.
+static uintptr_t g_fvt[32];
+static uint8_t* g_t_d; static uintptr_t g_t_a, g_t_b, g_t_vt;
+static void test_a_60(void* a) {
+    *(uintptr_t*)a = g_t_vt;                    // A is itself again for the rest of the walk
+    ((void (*)(void*))((uintptr_t*)g_t_vt)[12])(a);
+    char r = g_rem_active(g_t_d, (void*)g_t_b);
+    eb_log("guard: TEST relation %p (the next in the list of %p) removed (RemActive %d) and deleted during the reset", (void*)g_t_b, a, r);
+    ((void (*)(void*, int))(*(uintptr_t**)g_t_b)[0])((void*)g_t_b, 1);
+    g_fake_vt = 0;
+}
+static void test_removal(uint8_t* d, size_t lists) {
+    uint8_t* b = *(uint8_t**)(d + 0x10);
+    for (size_t i = 0; i < lists; i++) {
+        uint8_t* nd = *(uint8_t**)(b + i * 0x18);
+        uint8_t* nx = nd ? *(uint8_t**)(nd + 0x10) : NULL;
+        if (!nd || !nx || !relation_ok(*(uintptr_t*)nd) || !relation_ok(*(uintptr_t*)nx)) continue;
+        g_t_d = d; g_t_a = *(uintptr_t*)nd; g_t_b = *(uintptr_t*)nx; g_t_vt = *(uintptr_t*)g_t_a;
+        memcpy(g_fvt, (const void*)g_t_vt, sizeof g_fvt);
+        g_fvt[12] = (uintptr_t)test_a_60;
+        g_fake_vt = (uintptr_t)g_fvt;
+        *(uintptr_t*)g_t_a = g_fake_vt;
+        eb_log("guard: TEST relation %p of list %zu will remove and delete the next one %p%s", (void*)g_t_a, i, (void*)g_t_b,
+               g_cfg.guard_diplo_reset ? "" : " (without the fix)");
+        return;
+    }
+    eb_log("guard: TEST no list with two relations - nothing removed");
+}
+
 static void hk_diplo_clear(uint8_t* d) {
     uint8_t* b = *(uint8_t**)(d + 0x10);
     uint8_t* e = *(uint8_t**)(d + 0x18);
-    size_t lists = b && e > b ? (size_t)(e - b) / 0x18 : 0, n = 0, bad = 0;
-    if (lists && lists < (1u << 20) && readable((uintptr_t)b, (size_t)(e - b))) {
-        for (size_t i = 0; i < lists; i++)
-            for (uint8_t* nd = *(uint8_t**)(b + i * 0x18); nd && n < (1u << 24); nd = *(uint8_t**)(nd + 0x10)) {
-                if (!readable((uintptr_t)nd, 0x20)) break;
-                uintptr_t o = *(uintptr_t*)nd;
-                if (!o) continue;
-                n++;
-                if (g_cfg.test_diplo_freed == 1 && !g_diplo_tested) {      // what the reports found: a freed relation
-                    void* f = mi_malloc(0x60);
-                    mi_free(f);
-                    eb_log("guard: TEST relation %p in the list of country %zu replaced by a freed block %p (first qword %p)",
-                           (void*)o, i, f, *(void**)f);
-                    *(uintptr_t*)nd = o = (uintptr_t)f; g_diplo_tested = 1;
-                }
-                if (g_cfg.guard_diplo_reset && !relation_ok(o)) {
+    size_t lists = b && e > b ? (size_t)(e - b) / 0x18 : 0, n = 0, bad = 0, pend = 0;
+    int ok_lists = lists && lists < (1u << 20) && readable((uintptr_t)b, (size_t)(e - b));
+    if (ok_lists && g_cfg.test_diplo_freed == 1 && !g_diplo_tested) {      // what reports 78/77/51 found: a freed relation
+        for (size_t i = 0; i < lists && !g_diplo_tested; i++) {
+            uint8_t* nd = *(uint8_t**)(b + i * 0x18);
+            if (!nd || !*(uintptr_t*)nd) continue;
+            void* f = mi_malloc(0x60);
+            mi_free(f);
+            eb_log("guard: TEST relation %p in the list of country %zu replaced by a freed block %p (first qword %p)",
+                   *(void**)nd, i, f, *(void**)f);
+            *(void**)nd = f; g_diplo_tested = 1;
+        }
+    }
+    if (ok_lists && g_cfg.test_diplo_removed == 1 && !g_diplo_tested && g_rem_active) { test_removal(d, lists); g_diplo_tested = 1; }
+    if (!g_cfg.guard_diplo_reset || !ok_lists || !g_logset) {
+        o_diplo_clear(d);
+        return;
+    }
+    g_dr_resets++;
+    uint8_t* ls = g_logset();                   // the game's start: the debug-log bit 0 off for the walk
+    uint32_t saved = *(uint32_t*)(ls + 0x38), off = saved & ~1u;
+    if ((*(uint32_t*)(ls + 0x38) & 2) && !(off & 2)) g_logflush(ls);
+    *(uint32_t*)(ls + 0x38) = off;
+    for (size_t i = 0; i < lists; i++) *(uint8_t*)(*(uint8_t**)(d + 0x10) + i * 0x18 + 0x14) = 1;
+    for (size_t i = 0; i < lists; i++) {
+        uint8_t* L = *(uint8_t**)(d + 0x10) + i * 0x18;      // the array as it is now (a relation added for a new tag could move it)
+        L[0x14] = 1;
+        for (uint8_t* nd = *(uint8_t**)L; nd && n < (1u << 24); ) {
+            if (!readable((uintptr_t)nd, 0x20)) break;
+            uint8_t* next = *(uint8_t**)(nd + 0x10);   // read first, as the game: nodes are not freed while +0x14 is set
+            uintptr_t o = *(uintptr_t*)nd;
+            if (o) {
+                if (nd[0x18]) { *(uintptr_t*)nd = 0; pend++; g_dr_pending++; }   // removed during this reset: its remover owns it, the game's walk must not see it
+                else if (!relation_ok(o)) {
                     uint64_t q = 0; int rd = eb_probe8((const void*)(o & ~(uintptr_t)7), &q);
                     if (InterlockedIncrement(&g_freed_relations) <= 10)
-                        eb_log("guard: diplomacy reset skipped a freed relation %p in the list of country %zu (first qword %s%p, removal pending %d)",
-                               (void*)o, i, rd ? "" : "unreadable ", (void*)(uintptr_t)q, nd[0x18]);
+                        eb_log("guard: diplomacy reset skipped a freed relation %p in the list of country %zu (first qword %s%p)",
+                               (void*)o, i, rd ? "" : "unreadable ", (void*)(uintptr_t)q);
                     *(uintptr_t*)nd = 0;
                     bad++;
+                } else {
+                    ((void (*)(void*))(*(uintptr_t**)o)[12])((void*)o);
+                    ((void (*)(void*, int))(*(uintptr_t**)o)[0])((void*)o, 1);
+                    *(uintptr_t*)nd = 0;
+                    n++; g_dr_calls++;
                 }
             }
+            nd = next;
+        }
     }
-    if (bad || g_cfg.test_diplo_freed) eb_log("guard: diplomacy reset: %zu relations in %zu lists, %zu freed ones skipped", n, lists, bad);
-    o_diplo_clear(d);
+    uint8_t* b2 = *(uint8_t**)(d + 0x10); uint8_t* e2 = *(uint8_t**)(d + 0x18);
+    for (size_t i = 0, m = b2 && e2 > b2 ? (size_t)(e2 - b2) / 0x18 : 0; i < m; i++) b2[i * 0x18 + 0x14] = 0;
+    if (!(*(uint32_t*)(ls + 0x38) & 2) || (saved & 2)) *(uint32_t*)(ls + 0x38) = saved;   // the game's end of it
+    else { g_logflush(ls); *(uint32_t*)(ls + 0x38) = saved; }
+    if (bad || pend || g_cfg.test_diplo_freed || g_cfg.test_diplo_removed)
+        eb_log("guard: diplomacy reset: %zu relations ended in %zu lists, %zu removed during the reset skipped, %zu freed ones skipped", n, lists, pend, bad);
+    o_diplo_clear(d);                           // the rest as the game: its walk finds only zeros, the lists are made again
 }
 
 int eb_guard_install(void) {
     int want_day_time = g_cfg.online_poll_ms > 0 && g_cfg.online_running_only;
     if (!g_cfg.guard_tooltip && !g_cfg.guard_relation && !g_cfg.guard_great_project && !g_cfg.guard_ironman_name && !g_cfg.test_ironman_name &&
-        !g_cfg.guard_loc_duplicates && !g_cfg.guard_diplo_reset && !g_cfg.test_diplo_freed && !g_cfg.prov_text_cache && !want_day_time) return 1;
+        !g_cfg.guard_loc_duplicates && !g_cfg.guard_diplo_reset && !g_cfg.test_diplo_freed && !g_cfg.test_diplo_removed && !g_cfg.prov_text_cache && !want_day_time) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
 #ifdef EB_TEST
@@ -590,20 +685,25 @@ int eb_guard_install(void) {
     // the daily tick hooks: the tooltip guard needs them (without them every province would be checked
     // monthly), so does the province text cache; the online throttle reads the time of the latest tick
     int want_tip = g_cfg.guard_tooltip || g_ptc_ret;
-    if ((want_tip || want_day_time) && day && midtick &&
-        hook(day, sday, sizeof sig_day, (void*)hk_day, (void**)&o_day, "daily tick") &&
-        hook(midtick, smid, sizeof sig_midtick, (void*)hk_midtick, (void**)&o_midtick, "mid-tick frame"))
-        eb_day_hooked = 1;
+    if ((want_tip || want_day_time) && day && midtick) {
+        eb_hookset hs; eb_hs_init(&hs, "guard daily tick");
+        if ((!sday || !memcmp(day, sday, sizeof sig_day)) && (!smid || !memcmp(midtick, smid, sizeof sig_midtick)) &&   // the test build has no signatures
+            eb_hs_add(&hs, day, (void*)hk_day, (void**)&o_day) && eb_hs_add(&hs, midtick, (void*)hk_midtick, (void**)&o_midtick) &&
+            eb_hs_enable(&hs))
+            eb_day_hooked = 1;
+        else eb_log("guard: daily tick / mid-tick frame signature mismatch or hook failed - off");
+    }
     if (want_tip && eb_day_hooked && g_rdata_lo && probe_init() &&
         hook(tip, stip, sizeof sig_tip, (void*)hk_tip, (void**)&o_tip, "tooltip")) {
         if (g_cfg.guard_tooltip) { ok++; eb_log("guard: modifier tooltips skip freed or invalid sources (outside the daily tick)"); }
         if (g_ptc_ret)
             eb_log("modifiers: EXPERIMENT province text cache on%s - the monthly province text of a country is built once a day",
                    g_cfg.prov_text_cache == 2 ? " with VERIFY" : g_cfg.prov_text_cache == 3 ? " as A/B (calls alternate)" : "");
-    } else g_ptc_ret = 0;
+    } else { g_ptc_ret = 0; g_cfg.guard_tooltip = 0; }
+    if (!g_ptc_ret) g_cfg.prov_text_cache = 0;
     if (g_cfg.guard_relation && hook(rel, srel, sizeof sig_rel, (void*)hk_rel, (void**)&o_rel, "relation")) {
         ok++; eb_log("guard: a missing relation on annexation is skipped instead of crashing");
-    }
+    } else g_cfg.guard_relation = 0;
 #ifndef EB_TEST
     // EU4dll's plugin64.dll loads after this DLL; without it no name has escape bytes and the hook passes all on
     if ((g_cfg.guard_ironman_name || g_cfg.test_ironman_name) &&
@@ -611,19 +711,23 @@ int eb_guard_install(void) {
         if (g_cfg.guard_ironman_name) { ok++; eb_log("guard: ironman save names in EU4dll's escapes are saved in UTF-8 like ordinary saves"); }
         if (g_cfg.test_ironman_name) eb_log("guard: TEST the ironman save of eb_auto is named \"eb_\" + Korean in EU4dll's escapes%s",
                                             g_cfg.guard_ironman_name ? "" : " (without the fix)");
-    }
+    } else g_cfg.guard_ironman_name = 0;
 #endif
 #ifndef EB_TEST
     if ((g_cfg.guard_loc_duplicates || g_cfg.test_loc_fiber) &&
         hook(b + RVA_LOC_DUPS, sig_loc_dups, sizeof sig_loc_dups, (void*)hk_loc_dups, (void**)&o_loc_dups, "duplicate localisation check")) {
         ok++; eb_log("guard: the duplicate localisation check runs on a larger stack when the main thread's would overflow%s",
                      g_cfg.test_loc_fiber == 1 ? " (TEST: always)" : "");
-    }
-    if ((g_cfg.guard_diplo_reset || g_cfg.test_diplo_freed) && g_rdata_lo && g_text_lo && probe_init() &&
+    } else g_cfg.guard_loc_duplicates = 0;
+    if ((g_cfg.guard_diplo_reset || g_cfg.test_diplo_freed || g_cfg.test_diplo_removed) && g_rdata_lo && g_text_lo && probe_init() &&
+        !memcmp(b + RVA_LOGSET, sig_logset, sizeof sig_logset) && !memcmp(b + RVA_LOGFLUSH, sig_logflush, sizeof sig_logflush) &&
+        !memcmp(b + RVA_REM_ACTIVE, sig_rem_active, sizeof sig_rem_active) &&
         hook(b + RVA_DIPLO_CLEAR, sig_diplo_clear, sizeof sig_diplo_clear, (void*)hk_diplo_clear, (void**)&o_diplo_clear, "diplomacy reset")) {
-        if (g_cfg.guard_diplo_reset) { ok++; eb_log("guard: relations freed before a game is reset are skipped instead of crashing"); }
+        g_logset = (logset_t)(b + RVA_LOGSET); g_logflush = (logflush_t)(b + RVA_LOGFLUSH); g_rem_active = (rem_active_t)(b + RVA_REM_ACTIVE);
+        if (g_cfg.guard_diplo_reset) { ok++; eb_log("guard: the diplomacy reset walks its lists with removals deferred and skips relations freed before or during it"); }
         if (g_cfg.test_diplo_freed) eb_log("guard: TEST the next diplomacy reset finds one relation freed%s", g_cfg.guard_diplo_reset ? "" : " (without the fix)");
-    }
+        if (g_cfg.test_diplo_removed) eb_log("guard: TEST in the next diplomacy reset one relation removes and deletes the next one%s", g_cfg.guard_diplo_reset ? "" : " (without the fix)");
+    } else g_cfg.guard_diplo_reset = 0;
 #endif
     if (g_cfg.guard_great_project && g_gp_mgr && g_hc_vt && probe_init()) {
         InitializeCriticalSection(&g_gp_cs);
@@ -631,14 +735,23 @@ int eb_guard_install(void) {
         if (hook(hc, shc, sizeof sig_hc_read, (void*)hk_hc_read, (void**)&o_hc_read, "has_construction read")) {
             if (hook(gpb, sgpb, sizeof sig_gp_setbuf, (void*)hk_gp_setbuf, (void**)&o_gp_setbuf, "great project array")) {
                 ok++; eb_log("guard: has_construction triggers that name a great project follow the great project array when it moves");
-            } else MH_DisableHook(hc);
-        }
-    }
+            } else { MH_DisableHook(hc); g_cfg.guard_great_project = 0; }
+        } else g_cfg.guard_great_project = 0;
+    } else g_cfg.guard_great_project = 0;
     return ok;
 }
 
 #ifdef EB_TEST
 #include <stdio.h>
+// the diplomacy reset with the harness's CDiplomacy, its RemActive, its log settings and its FUN_1404e0d90
+__declspec(dllexport) void eb_test_diplo_reset(uint8_t* d, void* orig, void* rem, void* logset, void* flush, int guard) {
+    o_diplo_clear = (diplo_clear_t)orig; g_rem_active = (rem_active_t)rem;
+    g_logset = (logset_t)logset; g_logflush = (logflush_t)flush;
+    int saved = g_cfg.guard_diplo_reset; g_cfg.guard_diplo_reset = guard;
+    if (!probe_init()) printf("diplo: no probe\n");
+    hk_diplo_clear(d);
+    g_cfg.guard_diplo_reset = saved;
+}
 // EU4dll's convertWideTextToEscapedText (escape_tool.cpp) for one UTF-16 code unit
 static size_t eu4dll_escape(wchar_t cp, uint8_t* o) {
     static const uint8_t sp[] = { 0xA4,0xA3,0xA7,0x24,0x5B,0x00,0x5C,0x20,0x0D,0x0A,0x22,0x7B,0x7D,0x40,0x80,0x7E,0x2F,0x5F,0xBD,0x3B,0x5D,
@@ -697,6 +810,9 @@ void eb_guard_report(void) {
     if (g_nhc || g_gp_moved)
         eb_log("guard: %d has_construction triggers name a great project, the array moved %d times, %d trigger addresses moved with it",
                g_nhc + g_hc_lost, g_gp_moves, g_gp_moved);
+    if (g_dr_resets)
+        eb_log("guard: diplomacy resets: %lld, relations ended %lld, removed during a reset and skipped %lld, freed ones skipped %ld",
+               (long long)g_dr_resets, (long long)g_dr_calls, (long long)g_dr_pending, (long)g_freed_relations);
     if (g_bad_containers || g_bad_sources || g_null_relations || g_freed_relations)
         eb_log("guard: %ld invalid tooltip containers, %ld invalid tooltip sources, %ld missing relations, %ld freed relations skipped",
                (long)g_bad_containers, (long)g_bad_sources, (long)g_null_relations, (long)g_freed_relations);

@@ -324,7 +324,7 @@ int eb_speed_install(void) {
             if (!game_timer) sf = NULL;
             if (sf && MH_CreateHook(sf, (void*)hk_session_frame, (void**)&o_session_frame) == MH_OK && MH_EnableHook(sf) == MH_OK)
                 eb_log("render: up to %d days per frame at speed 5 (frame budget %d ms)", g_cfg.days_per_frame, g_cfg.frame_budget_ms);
-            else eb_log("render: session update signature mismatch - one day per frame");
+            else { eb_log("render: session update signature mismatch - one day per frame"); g_cfg.days_per_frame = 1; }
         }
         return 1;
     }

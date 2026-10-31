@@ -1563,6 +1563,12 @@ static void hk_loop(uint8_t* items, void* ctx) {
     if (g_loops % 500 == 0) report_classes();
 }
 
+static int ai_all_off(void) {                    // nothing of this file is installed
+    g_stats = g_split = g_prov = g_aec = g_alm = g_army = 0;
+    g_cfg.ai_item_stats = g_cfg.ai_split = g_cfg.ai_prov_split = g_cfg.ai_ae_cache = g_cfg.ai_land_memo = g_cfg.ai_army_fast = 0;
+    return 0;
+}
+
 int eb_aiprof_install(void) {
     g_stats = g_cfg.ai_item_stats; g_split = g_cfg.ai_split == 1; g_prov = g_cfg.ai_prov_split; g_aec = g_cfg.ai_ae_cache;
     g_alm = g_aec ? g_cfg.ai_land_memo : 0;
@@ -1575,26 +1581,40 @@ int eb_aiprof_install(void) {
         (g_split && (memcmp(b + RVA_KING, sig_king, sizeof sig_king) || memcmp(b + RVA_CGET, sig_cget, sizeof sig_cget) ||
                      memcmp(b + RVA_CPUT, sig_cput, sizeof sig_cput)))) {
         eb_log("ai items: signature mismatch - not installed");
-        return 0;
+        return ai_all_off();
     }
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ms = 1000.0 / (double)f.QuadPart; g_spike = f.QuadPart / 200;
     MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("ai items: MinHook init failed"); return 0; }
+    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("ai items: MinHook init failed"); return ai_all_off(); }
     if (!g_qsem) g_qsem = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+    // the AI loop and node hooks every feature below relies on (g_ai_loop_active, the per-run state) first:
+    // without them none of the features is installed. Each feature is a set of its own: all of its hooks or none.
+    eb_hookset hs;
+    eb_hs_init(&hs, "ai loop");
+    if ((g_stats && !eb_hs_add(&hs, b + RVA_AI_ITEM, (void*)hk_item, (void**)&o_item)) ||
+        !eb_hs_add(&hs, b + RVA_AI_LOOP, (void*)hk_loop, (void**)&o_loop) ||
+        !eb_hs_add(&hs, b + RVA_AI_NODE, (void*)hk_node, (void**)&o_node) || !eb_hs_enable(&hs)) {
+        eb_log("ai items: hook failed - no AI feature installed");
+        return ai_all_off();
+    }
     if (g_prov) {
+        eb_hs_init(&hs, "ai prov");
         if (!g_qsem || memcmp(b + RVA_PLOOP, sig_ploop, sizeof sig_ploop) || memcmp(b + RVA_PEVAL, sig_peval, sizeof sig_peval) ||
             memcmp(b + RVA_PPRE, sig_ppre, sizeof sig_ppre) ||
-            MH_CreateHook(b + RVA_PEVAL, (void*)hk_peval, (void**)&o_peval) != MH_OK || MH_EnableHook(b + RVA_PEVAL) != MH_OK ||
-            MH_CreateHook(b + RVA_PPRE, (void*)hk_ppre, (void**)&o_ppre) != MH_OK || MH_EnableHook(b + RVA_PPRE) != MH_OK ||
-            MH_CreateHook(b + RVA_PLOOP, (void*)hk_ploop, (void**)&o_ploop) != MH_OK || MH_EnableHook(b + RVA_PLOOP) != MH_OK) {
+            !eb_hs_add(&hs, b + RVA_PEVAL, (void*)hk_peval, (void**)&o_peval) ||
+            !eb_hs_add(&hs, b + RVA_PPRE, (void*)hk_ppre, (void**)&o_ppre) ||
+            !eb_hs_add(&hs, b + RVA_PLOOP, (void*)hk_ploop, (void**)&o_ploop) || !eb_hs_enable(&hs)) {
+            if (!hs.failed) eb_hs_undo(&hs, "a signature differs");
             eb_log("ai prov: signature mismatch or hook failed - not installed");
             g_prov = 0;
         }
     }
     if (g_army) {
+        eb_hs_init(&hs, "ai army");
         if (memcmp(b + RVA_CANMOVE, sig_canmove, sizeof sig_canmove) || memcmp(b + RVA_HASMOD, sig_hasmod, sizeof sig_hasmod) ||
-            MH_CreateHook(b + RVA_HASMOD, (void*)hk_hasmod, (void**)&o_hasmod) != MH_OK || MH_EnableHook(b + RVA_HASMOD) != MH_OK ||
-            MH_CreateHook(b + RVA_CANMOVE, (void*)hk_canmove, (void**)&o_canmove) != MH_OK || MH_EnableHook(b + RVA_CANMOVE) != MH_OK) {
+            !eb_hs_add(&hs, b + RVA_HASMOD, (void*)hk_hasmod, (void**)&o_hasmod) ||
+            !eb_hs_add(&hs, b + RVA_CANMOVE, (void*)hk_canmove, (void**)&o_canmove) || !eb_hs_enable(&hs)) {
+            if (!hs.failed) eb_hs_undo(&hs, "a signature differs");
             eb_log("ai army: signature mismatch or hook failed - not installed");
             g_army = 0;
         } else
@@ -1602,15 +1622,17 @@ int eb_aiprof_install(void) {
                    g_army == 2 ? " with VERIFY" : g_army == 3 ? " as A/B (checks alternate between the original and flags first)" : "");
     }
     if (g_aec) {
+        eb_hs_init(&hs, "ai ae");
         if (memcmp(b + RVA_AEP, sig_aep, sizeof sig_aep) || memcmp(b + RVA_AECALC, sig_aecalc, sizeof sig_aecalc) ||
             memcmp(b + RVA_ETS_GET, sig_etsget, sizeof sig_etsget) || *(int32_t*)(b + RVA_AE_UNIT) != 100000 ||
             memcmp(b + RVA_AEALL, sig_aeall, sizeof sig_aeall) || memcmp(b + RVA_OPIN_AE, sig_opin_ae, sizeof sig_opin_ae) ||
             memcmp(b + RVA_OPIN, sig_opin, sizeof sig_opin) || memcmp(b + RVA_ALLIED, sig_allied, sizeof sig_allied) ||
             memcmp(b + RVA_STRENGTH, sig_strength, sizeof sig_strength) ||
-            MH_CreateHook(b + RVA_AEP, (void*)hk_aep, (void**)&o_aep) != MH_OK || MH_EnableHook(b + RVA_AEP) != MH_OK ||
-            MH_CreateHook(b + RVA_AEALL, (void*)hk_aeall, (void**)&o_aeall) != MH_OK || MH_EnableHook(b + RVA_AEALL) != MH_OK) {
+            !eb_hs_add(&hs, b + RVA_AEP, (void*)hk_aep, (void**)&o_aep) ||
+            !eb_hs_add(&hs, b + RVA_AEALL, (void*)hk_aeall, (void**)&o_aeall) || !eb_hs_enable(&hs)) {
+            if (!hs.failed) eb_hs_undo(&hs, "a signature differs");
             eb_log("ai ae: signature mismatch or hook failed - not installed");
-            g_aec = 0;
+            g_aec = 0; g_alm = 0;
         } else {
             g_aecalc = (aecalc_t)(b + RVA_AECALC);
             g_etsget = (etsget_t)(b + RVA_ETS_GET);
@@ -1620,13 +1642,13 @@ int eb_aiprof_install(void) {
             g_allied = (allied_t)(b + RVA_ALLIED);
             g_strength = (strength_t)(b + RVA_STRENGTH);
             // outside the AI loop: deal fills and acceptance checks on the main thread (report 29)
+            eb_hs_init(&hs, "ai deal");
             g_ui_on = !memcmp(b + RVA_OFFER_FILL, sig_offer_fill, 16) && !memcmp(b + RVA_ACCEPT, sig_accept, 16) &&
-                      MH_CreateHook(b + RVA_OFFER_FILL, (void*)hk_fill, (void**)&o_fill) == MH_OK &&
-                      MH_CreateHook(b + RVA_ACCEPT, (void*)hk_accept, (void**)&o_accept) == MH_OK &&
-                      MH_EnableHook(b + RVA_OFFER_FILL) == MH_OK && MH_EnableHook(b + RVA_ACCEPT) == MH_OK;
+                      eb_hs_add(&hs, b + RVA_OFFER_FILL, (void*)hk_fill, (void**)&o_fill) &&
+                      eb_hs_add(&hs, b + RVA_ACCEPT, (void*)hk_accept, (void**)&o_accept) && eb_hs_enable(&hs);
+            eb_hs_init(&hs, "ai land");
             if (g_ui_on && (memcmp(b + RVA_LANDPATH, sig_landpath, 16) ||
-                            MH_CreateHook(b + RVA_LANDPATH, (void*)hk_landpath, (void**)&o_landpath) != MH_OK ||
-                            MH_EnableHook(b + RVA_LANDPATH) != MH_OK)) {
+                            !eb_hs_add(&hs, b + RVA_LANDPATH, (void*)hk_landpath, (void**)&o_landpath) || !eb_hs_enable(&hs))) {
                 eb_log("ai ae: land search signature mismatch or hook failed - not kept");
                 g_alm = 0;
             }
@@ -1634,34 +1656,31 @@ int eb_aiprof_install(void) {
         }
     }
     if (g_stats) {
+        eb_hs_init(&hs, "ai fm");
         int ok = 1;
         for (int k = 0; k < NFM && ok; k++) {
             if (g_aec && (g_fmf[k].rva == RVA_AEP || g_fmf[k].rva == RVA_AEALL || (g_ui_on && g_fmf[k].rva == RVA_OFFER_FILL))) continue;   // hooked by the experiment
-            ok = !memcmp(b + g_fmf[k].rva, g_fmf[k].sig, 8) && MH_CreateHook(b + g_fmf[k].rva, g_fm_hk[k], (void**)&o_fm[k]) == MH_OK &&
-                 MH_EnableHook(b + g_fmf[k].rva) == MH_OK;
+            ok = !memcmp(b + g_fmf[k].rva, g_fmf[k].sig, 8) && eb_hs_add(&hs, b + g_fmf[k].rva, g_fm_hk[k], (void**)&o_fm[k]);
         }
-        g_fm_on = ok;
-        eb_log(ok ? "ai fm: timing the foreign minister's functions" : "ai fm: hook failed - no foreign-minister breakdown");
+        if (!ok && !hs.failed) eb_hs_undo(&hs, "a signature differs");
+        g_fm_on = ok && eb_hs_enable(&hs);
+        eb_log(g_fm_on ? "ai fm: timing the foreign minister's functions" : "ai fm: hook failed - no foreign-minister breakdown");
     }
-    if (g_stats && !g_split &&
-        (memcmp(b + RVA_KING, sig_king, sizeof sig_king) || MH_CreateHook(b + RVA_KING, (void*)hk_king, (void**)&o_king) != MH_OK ||
-         MH_EnableHook(b + RVA_KING) != MH_OK))
-        eb_log("ai items: king hook failed - no phase times");
+    if (g_stats && !g_split) {
+        eb_hs_init(&hs, "ai king");
+        if (memcmp(b + RVA_KING, sig_king, sizeof sig_king) || !eb_hs_add(&hs, b + RVA_KING, (void*)hk_king, (void**)&o_king) || !eb_hs_enable(&hs))
+            eb_log("ai items: king hook failed - no phase times");
+    }
     if (g_split) {
         for (int i = 0; i < NSTRIPE; i++) InitializeSRWLock(&g_ctx_lock[i]);
+        eb_hs_init(&hs, "ai split");
         if (!g_qsem ||
-            MH_CreateHook(b + RVA_CGET, (void*)hk_cget, (void**)&o_cget) != MH_OK || MH_EnableHook(b + RVA_CGET) != MH_OK ||
-            MH_CreateHook(b + RVA_CPUT, (void*)hk_cput, (void**)&o_cput) != MH_OK || MH_EnableHook(b + RVA_CPUT) != MH_OK ||
-            MH_CreateHook(b + RVA_KING, (void*)hk_king, (void**)&o_king) != MH_OK || MH_EnableHook(b + RVA_KING) != MH_OK) {
+            !eb_hs_add(&hs, b + RVA_CGET, (void*)hk_cget, (void**)&o_cget) ||
+            !eb_hs_add(&hs, b + RVA_CPUT, (void*)hk_cput, (void**)&o_cput) ||
+            !eb_hs_add(&hs, b + RVA_KING, (void*)hk_king, (void**)&o_king) || !eb_hs_enable(&hs)) {
             eb_log("ai split: hook failed - not installed");
             g_split = 0;
         }
-    }
-    if ((g_stats && (MH_CreateHook(b + RVA_AI_ITEM, (void*)hk_item, (void**)&o_item) != MH_OK || MH_EnableHook(b + RVA_AI_ITEM) != MH_OK)) ||
-        MH_CreateHook(b + RVA_AI_LOOP, (void*)hk_loop, (void**)&o_loop) != MH_OK || MH_EnableHook(b + RVA_AI_LOOP) != MH_OK ||
-        MH_CreateHook(b + RVA_AI_NODE, (void*)hk_node, (void**)&o_node) != MH_OK || MH_EnableHook(b + RVA_AI_NODE) != MH_OK) {
-        eb_log("ai items: hook failed");
-        return 0;
     }
     if (g_split || g_prov) { eb_par_help = ai_help; eb_par_linger = ai_linger; }
     if (g_prov)
@@ -1679,5 +1698,6 @@ int eb_aiprof_install(void) {
                g_alm == 2 ? " with VERIFY" : g_alm == 3 ? " as A/B (deals alternate between the game's searches and the memo)" : "");
     else if (g_cfg.ai_land_memo) eb_log("ai land: off - needs [parallel] ai_ae_cache and its deal hooks");
     if (g_stats) eb_log("ai items: timing every country of the AI loop and every AI task run (reports every 100 / 500 loops)");
+    g_cfg.ai_split = g_split; g_cfg.ai_prov_split = g_prov; g_cfg.ai_ae_cache = g_aec; g_cfg.ai_land_memo = g_alm; g_cfg.ai_army_fast = g_army;
     return 1;
 }

@@ -390,11 +390,14 @@ int eb_savepar_install(void) {
         { RVA_STATIC_L, (void*)hk_static_l, (void**)&o_static_l },
         { RVA_KEYOBJ,   (void*)hk_keyobj,   (void**)&o_keyobj },
     };
+    eb_hookset hs; eb_hs_init(&hs, "save countries");        // the serializer copies work only together
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
-        if (MH_CreateHook(b + t[i].rva, t[i].hook, t[i].orig) != MH_OK || MH_EnableHook(b + t[i].rva) != MH_OK) {
-            eb_log("save: hook %zu failed - parallel countries off", i);
-            return 0;
-        }
+        if (!eb_hs_add(&hs, b + t[i].rva, t[i].hook, t[i].orig)) break;
+    if (!eb_hs_enable(&hs)) {
+        eb_log("save: hooks failed - parallel countries off");
+        g_cfg.save_countries = 0;
+        return 0;
+    }
     eb_log("save: countries serialized in parallel (mode %d: %s)", g_cfg.save_countries,
            g_cfg.save_countries == 1 ? "on" : g_cfg.save_countries == 2 ? "on + verify" : "serial precompute + verify");
     return 1;

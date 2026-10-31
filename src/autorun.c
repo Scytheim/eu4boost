@@ -164,21 +164,25 @@ static HWND WINAPI hk_wfp(POINT pt) {
     return o_wfp(pt);
 }
 static BOOL WINAPI hk_tme(LPTRACKMOUSEEVENT t) { (void)t; return TRUE; }
+// all twelve or none: a pointer answered for the simulated player while the window is on the desktop, or a
+// window kept off the desktop whose cursor queries are real, would be worse than the minimized fallback
+static eb_hookset g_ohs;
 static int hook_api(const char* name, void* fn, void* orig) {
     void* t = (void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), name);
-    if (!t || MH_CreateHook(t, fn, (void**)orig) != MH_OK || MH_EnableHook(t) != MH_OK) { eb_log("autorun: %s hook failed", name); return 0; }
-    return 1;
+    if (!t) { eb_log("autorun: %s not found", name); if (!g_ohs.failed) eb_hs_undo(&g_ohs, "a user32 function is missing"); return 0; }
+    return eb_hs_add(&g_ohs, t, fn, (void**)orig);
 }
 static int offscreen_install(void) {
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return 0;
-    int ok = hook_api("CreateWindowExW", (void*)hk_cwe, &o_cwe) & hook_api("SetWindowPos", (void*)hk_swp, &o_swp) &
-             hook_api("ShowWindow", (void*)hk_sw, &o_sw) & hook_api("GetCursorPos", (void*)hk_gcp, &o_gcp) &
-             hook_api("SetCursorPos", (void*)hk_scp, &o_scp) & hook_api("ClipCursor", (void*)hk_cc, &o_cc) &
-             hook_api("GetAsyncKeyState", (void*)hk_gaks, &o_gaks) & hook_api("GetKeyState", (void*)hk_gks, &o_gks) &
-             hook_api("GetFocus", (void*)hk_gf, &o_gf) & hook_api("GetActiveWindow", (void*)hk_gaw, &o_gaw) &
-             hook_api("WindowFromPoint", (void*)hk_wfp, &o_wfp) & hook_api("TrackMouseEvent", (void*)hk_tme, &o_tme);
-    return ok;
+    eb_hs_init(&g_ohs, "autorun off-screen");
+    return hook_api("CreateWindowExW", (void*)hk_cwe, &o_cwe) && hook_api("SetWindowPos", (void*)hk_swp, &o_swp) &&
+           hook_api("ShowWindow", (void*)hk_sw, &o_sw) && hook_api("GetCursorPos", (void*)hk_gcp, &o_gcp) &&
+           hook_api("SetCursorPos", (void*)hk_scp, &o_scp) && hook_api("ClipCursor", (void*)hk_cc, &o_cc) &&
+           hook_api("GetAsyncKeyState", (void*)hk_gaks, &o_gaks) && hook_api("GetKeyState", (void*)hk_gks, &o_gks) &&
+           hook_api("GetFocus", (void*)hk_gf, &o_gf) && hook_api("GetActiveWindow", (void*)hk_gaw, &o_gaw) &&
+           hook_api("WindowFromPoint", (void*)hk_wfp, &o_wfp) && hook_api("TrackMouseEvent", (void*)hk_tme, &o_tme) &&
+           eb_hs_enable(&g_ohs);
 }
 static BOOL CALLBACK find_cb(HWND h, LPARAM l) {
     RECT r;
@@ -351,10 +355,14 @@ int eb_autorun_install(void) {
         MH_CreateHook(b + RVA_CONTINUE, (void*)hk_continue, (void**)&o_continue) != MH_OK || MH_EnableHook(b + RVA_CONTINUE) != MH_OK)
         eb_log("autorun: the continue hook failed - the save warning would wait for a click");
     if (g_cfg.autorun_offscreen) {
+        HANDLE h = NULL;
         if (!offscreen_install()) eb_log("autorun: off-screen hooks failed - minimized instead");
-        else {
+        else if (!(h = CreateThread(NULL, 0, off_thread, NULL, 0, NULL))) {
+            eb_hs_undo(&g_ohs, "the off-screen thread could not start");
+            eb_log("autorun: off-screen hooks failed - minimized instead");
+        } else {
             g_off = 1;
-            HANDLE h = CreateThread(NULL, 0, off_thread, NULL, 0, NULL); if (h) CloseHandle(h);
+            CloseHandle(h);
             if (g_cfg.autorun_input) {
                 g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(unsigned)g_cfg.autorun_input;
                 h = CreateThread(NULL, 0, player, NULL, 0, NULL); if (h) CloseHandle(h);
