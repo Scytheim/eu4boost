@@ -1219,3 +1219,12 @@ el047`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1): 모든 �
   - 배포 설정 cl3_base_ger·late·test: 초기화 1번씩(244 / 244 / 171개), 정상.
   - 모든 시험 뒤 게임 폴더·세이브·설정이 첫 시험 전과 같았다.
 - 남은 것: 실제 사용자처럼 "게임 안 다시 불러오기"(관계 수천 개)는 자동 시험에 없다. 첫 불러오기가 같은 함수로 메뉴 상태(170~244개)를 지우는 것으로 시험했다.
+- **0.4.11 배포**
+  - 커밋: 로컬 649c064, 공개 커밋 801d36a(dd4ed20 위, 트리 같음), 태그 0.4.11.
+  - GitHub 릴리스 "eu4boost 0.4.11"(설명 비움)은 `eu4boost_v0.4.11.zip` 하나다(ed448f4b…, 안의 DLL 3c81d1ec…, zip 주석 서명 확인 OK). 다시 받은 zip의 해시도 같고, releases/latest = 0.4.11.
+  - 배포 DLL 확인(이 DLL 그대로, safe_run, 모두 PASS, 화면 가림 0):
+    - rel0411_ger: 짭짭죽 1543.05.31 → 1546.01.01. 저장 11번 나라 검사 18,348번 실패 0, 누수 수정 작동, 정상 종료.
+    - rel0411_vanilla: 기본 1600 → 1603. 옛 설정 `parallel_refresh=1` 무시 로그 확인.
+    - rel0411_diplo: diplo_removed 재현 상황 → "1 removed during the reset skipped", 정상.
+    - rel0411_rng: 1874 + rng_count 446,868,485 검증 → 게임 4,456ms vs 83ms, 일치.
+  - 게임 폴더: 0.4.11 배포 DLL(3c81d1ec) + 사용자 측정 ini 1030b 그대로(ab_test=0, upload=1, auto=1, play_monitor=1). 이 ini에는 `fast_rng_replay`와 `ai_land_memo`가 없어서 둘 다 꺼진 채다. restore.sh 기본 DLL도 0411로 바꿨다.
