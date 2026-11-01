@@ -667,6 +667,9 @@ static uint8_t hk_ucb(void* o, void* w) {
 // FUN_1403ca1a0 via FUN_1403d79f0 reads the overlord's values; the first verify of the all-countries test
 // differed there in 219 of 2,812), so they run in phases (refresh_set). Nothing to share: the game's order.
 // Mode 2 = + verify: each phase is refreshed again serially on its result and compared.
+// Since 0.4.12 only mode 2 (analysis) is used; 1 is ignored (main.c): report 150, a worker in the liberty
+// desire of a participant (FUN_1402f1120 -> FUN_1403ca1a0 -> FUN_1403b22d0) read -1 from another country
+// while it changed, the same kind as report 105 of parallel_refresh.
 // Testing only: [country] test_war_all=D - every D country loops, all countries that are not dirty go
 // through the same path (a war of hundreds of countries), with mode 2 also the serial time of the set.
 static LONG64 g_war_calls, g_war_par, g_war_jobs, g_war_serial, g_war_ver, g_war_bad, g_war_tests;

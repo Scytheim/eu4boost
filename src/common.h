@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.11"
+#define EU4BOOST_VERSION "0.4.12"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -77,7 +77,8 @@ typedef struct {
     int country_parallel_refresh; // EXPERIMENT: RefreshKnowledge of dirty countries on all cores at the loop start, 2/3 = + verify, 4 = race check (1 = on is ignored since 0.4.10)
     int country_refresh_ignored;  // the ini's parallel_refresh value when it was not used (1 since 0.4.10, or out of range), logged
     int country_refresh_fixup;    // 1 = recompute the cached values of FUN_1402f1120 (+0xe1c..+0xe34) at the country's turn
-    int country_parallel_war;     // 1 = the war refresh (all participants of a war joined or declared) on all cores, 2 = + verify
+    int country_parallel_war;     // EXPERIMENT: 2 = the war refresh (all participants of a war joined or declared) on all cores + verify (1 = on is ignored since 0.4.12)
+    int country_war_ignored;      // the ini's parallel_war value when it was not used (1 since 0.4.12, or out of range), logged
     int country_parallel_annex;   // 1 = the opinions recomputed when a country disappears on all cores, 2 = + verify
     int country_test_annex;       // testing only ([country] test_annex=D): every D country loops the same for a random country
     int country_test_war_all;     // testing only: every N country loops all countries that are not dirty go through the war refresh
@@ -116,7 +117,7 @@ typedef struct {
     int test_msg_fail;            // testing only ([test] msg_fail=N): every Nth message copy of a worker fails (country.c)
     int test_rng_count;           // testing only ([test] rng_count=N): the seed sync command of a load restores N draws instead (rng.c)
     // loading (rng.c)
-    int load_fast_rng;            // 1 = a load restores the random generator with its state updates only (no draws), 2 = + verify against the game's draws
+    int load_fast_rng;            // 1 (default since 0.4.12) = a load restores the random generator with its state updates only (no draws), 2 = + verify against the game's draws
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
     int play_monitor;             // playmon.c: 1 = rows of memory, frames, days and handles while playing (diagnostics)

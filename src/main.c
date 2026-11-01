@@ -151,7 +151,14 @@ __declspec(dllexport) int eb_test_hookset(void) {
     g_cfg.test_hook_fail_at = 0; g_cfg.test_hook_fail_set[0] = 0;
     return bad;
 }
-__declspec(dllexport) void eb_test_cfg(int* refresh, int* ignored) { *refresh = g_cfg.country_parallel_refresh; *ignored = g_cfg.country_refresh_ignored; }
+// the values used and ignored of a key as read from the ini: "refresh" = [country] parallel_refresh, "war" = parallel_war,
+// "rng" = [load] fast_rng_replay (nothing ignored)
+__declspec(dllexport) int eb_test_cfg(const char* key, int* used, int* ignored) {
+    if (!strcmp(key, "refresh")) { *used = g_cfg.country_parallel_refresh; *ignored = g_cfg.country_refresh_ignored; return 1; }
+    if (!strcmp(key, "war")) { *used = g_cfg.country_parallel_war; *ignored = g_cfg.country_war_ignored; return 1; }
+    if (!strcmp(key, "rng")) { *used = g_cfg.load_fast_rng; *ignored = 0; return 1; }
+    return 0;
+}
 #endif
 
 static int ini_int(const wchar_t* ini, const wchar_t* sec, const wchar_t* key, int def) {
@@ -223,7 +230,12 @@ static void load_config(void) {
         c->country_refresh_ignored = c->country_parallel_refresh; c->country_parallel_refresh = 0;
     }
     c->country_refresh_fixup = ini_int(ini, L"country", L"refresh_fixup", 1);
-    c->country_parallel_war = ini_int(ini, L"country", L"parallel_war", 0);
+    c->country_parallel_war = ini_int(ini, L"country", L"parallel_war", 0);   // experimental, 2 = analysis mode
+    // 0 = off, 2 = the analysis mode. 1 (on) is ignored since 0.4.12: the ini of 0.4.5-0.4.11 shipped it,
+    // and a worker crashed in it (report 150: liberty desire read another country while it changed). Any other value is off too.
+    if (c->country_parallel_war != 0 && c->country_parallel_war != 2) {
+        c->country_war_ignored = c->country_parallel_war; c->country_parallel_war = 0;
+    }
     c->country_parallel_annex = ini_int(ini, L"country", L"parallel_annex", 0);
     c->country_test_annex = ini_int(ini, L"country", L"test_annex", 0);          // testing only, not in the ini files
     c->country_test_war_all = ini_int(ini, L"country", L"test_war_all", 0);       // testing only, not in the ini files
@@ -252,7 +264,7 @@ static void load_config(void) {
         c->test_msg_fail = ini_int(ini, L"test", L"msg_fail", 0);
         c->test_rng_count = ini_int(ini, L"test", L"rng_count", 0);
     }
-    c->load_fast_rng        = ini_int(ini, L"load",      L"fast_rng_replay", 0);    // experimental: 1 = on, 2 = + verify
+    c->load_fast_rng        = ini_int(ini, L"load",      L"fast_rng_replay", 1);    // 1 = on (default since 0.4.12, report 144), 2 = + verify
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
@@ -331,6 +343,10 @@ static void init(void) {
         eb_log("config: [country] parallel_refresh=1 is ignored since 0.4.10 (a worker crashed in the parallel RefreshKnowledge, report 105)");
     else if (g_cfg.country_refresh_ignored)
         eb_log("config: [country] parallel_refresh=%d is not a valid value (0 = off, 2-4 = analysis modes) - off", g_cfg.country_refresh_ignored);
+    if (g_cfg.country_war_ignored == 1)
+        eb_log("config: [country] parallel_war=1 is ignored since 0.4.12 (a worker crashed in the parallel war refresh, report 150)");
+    else if (g_cfg.country_war_ignored)
+        eb_log("config: [country] parallel_war=%d is not a valid value (0 = off, 2 = analysis mode) - off", g_cfg.country_war_ignored);
     if (g_cfg.test_hook_fail_at > 0)
         eb_log("config: TEST operation %d of the hook set \"%s\" fails", g_cfg.test_hook_fail_at, g_cfg.test_hook_fail_set);
     if (g_cfg.par_ab) {
@@ -404,7 +420,8 @@ static void init(void) {
     eb_feature("fast_variables", req.script_fast_vars, req.script_fast_vars && r_script ? req.script_fast_vars : 0, NULL);
     eb_feature("parallel_refresh", req.country_parallel_refresh ? req.country_parallel_refresh : g_cfg.country_refresh_ignored,
                g_cfg.country_parallel_refresh, g_cfg.country_refresh_ignored == 1 ? "ignored since 0.4.10" : g_cfg.country_refresh_ignored ? "not a valid value" : NULL);
-    eb_feature("parallel_war", req.country_parallel_war, g_cfg.country_parallel_war, NULL);
+    eb_feature("parallel_war", req.country_parallel_war ? req.country_parallel_war : g_cfg.country_war_ignored,
+               g_cfg.country_parallel_war, g_cfg.country_war_ignored == 1 ? "ignored since 0.4.12" : g_cfg.country_war_ignored ? "not a valid value" : NULL);
     eb_feature("parallel_annex", req.country_parallel_annex, g_cfg.country_parallel_annex, NULL);
     eb_feature("ai_prov_split", req.ai_prov_split, g_cfg.ai_prov_split, NULL);
     eb_feature("ai_ae_cache", req.ai_ae_cache, g_cfg.ai_ae_cache, NULL);

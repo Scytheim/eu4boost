@@ -57,12 +57,22 @@ grep -q '^#snap' $T/eu4boost_memsites.tsv 2>/dev/null || { echo "memsites: no sn
 run threadexit '[general]\r\nlog=1\r\n' 300 threadexit
 run safety     '[general]\r\nlog=1\r\n' 300 safety
 # [country] parallel_refresh: 0 off, 1 ignored (0.4.10), 2-4 analysis modes, anything else off
-run cfg_none   '[general]\r\nlog=1\r\n' 300 cfg 0 0
-run cfg_1      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=1\r\n' 300 cfg 0 1
-run cfg_2      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=2\r\n' 300 cfg 2 0
-run cfg_4      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=4\r\n' 300 cfg 4 0
-run cfg_5      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=5\r\n' 300 cfg 0 5
-run cfg_neg    '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=-1\r\n' 300 cfg 0 -1
-run cfg_big    '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=99999\r\n' 300 cfg 0 99999
+run cfg_none   '[general]\r\nlog=1\r\n' 300 cfg refresh 0 0
+run cfg_1      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=1\r\n' 300 cfg refresh 0 1
+run cfg_2      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=2\r\n' 300 cfg refresh 2 0
+run cfg_4      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=4\r\n' 300 cfg refresh 4 0
+run cfg_5      '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=5\r\n' 300 cfg refresh 0 5
+run cfg_neg    '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=-1\r\n' 300 cfg refresh 0 -1
+run cfg_big    '[general]\r\nlog=1\r\n[country]\r\nparallel_refresh=99999\r\n' 300 cfg refresh 0 99999
+# [country] parallel_war: 0 off, 1 ignored (0.4.12), 2 analysis mode, anything else off
+run war_none   '[general]\r\nlog=1\r\n' 300 cfg war 0 0
+run war_1      '[general]\r\nlog=1\r\n[country]\r\nparallel_war=1\r\n' 300 cfg war 0 1
+run war_2      '[general]\r\nlog=1\r\n[country]\r\nparallel_war=2\r\n' 300 cfg war 2 0
+run war_3      '[general]\r\nlog=1\r\n[country]\r\nparallel_war=3\r\n' 300 cfg war 0 3
+run war_neg    '[general]\r\nlog=1\r\n[country]\r\nparallel_war=-1\r\n' 300 cfg war 0 -1
+# [load] fast_rng_replay: on when the ini has no value (0.4.12), the ini's value otherwise
+run rng_none   '[general]\r\nlog=1\r\n' 300 cfg rng 1 0
+run rng_0      '[general]\r\nlog=1\r\n[load]\r\nfast_rng_replay=0\r\n' 300 cfg rng 0 0
+run rng_2      '[general]\r\nlog=1\r\n[load]\r\nfast_rng_replay=2\r\n' 300 cfg rng 2 0
 if [ -n "$failed" ]; then echo "FAILED:$failed"; exit 1; fi
-echo "all 25 cases passed"
+echo "all 33 cases passed"

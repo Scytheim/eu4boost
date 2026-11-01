@@ -1,4 +1,5 @@
-// The random generator restore of a load ([load] fast_rng_replay, EXPERIMENT, default 0; 2026-10-31).
+// The random generator restore of a load ([load] fast_rng_replay, 2026-10-31; default 1 since 0.4.12: report 144,
+// a 2.3 s restore 65 s after the game started).
 //
 // Loading a save runs the seed sync command FUN_140847960(cmd): DAT_1423494b0 = draws (cmd +0x54),
 // DAT_1423494b4 = seed (cmd +0x50), FUN_1414c6f50(&DAT_142325220, seed) seeds the generator's state (624
@@ -183,7 +184,7 @@ int eb_rng_install(void) {
         g_cfg.load_fast_rng = 0; return 0;
     }
     g_mode = g_cfg.load_fast_rng;
-    if (g_mode) eb_log("rng: EXPERIMENT a load restores the random generator with its state updates only%s",
+    if (g_mode) eb_log("rng: a load restores the random generator with its state updates only%s",
                        g_mode == 2 ? " (VERIFY: the game's draws run too on a copy and are compared)" : "");
     else eb_log("rng: TEST the game's restore is timed (rng_count %d)", g_cfg.test_rng_count);
     return 1;

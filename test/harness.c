@@ -771,14 +771,16 @@ int main(int argc, char** argv) {
         if (th) { int d = th(); printf("hook sets: %d wrong\n", d); CHECK(d == 0); }
         if (tq) { int d = tq(); printf("worker queue: %d wrong\n", d); CHECK(d == 0); }
     }
-    // 3m. [country] parallel_refresh as read from the ini: argv[4] = the value used, argv[5] = the value ignored
-    if (argc > 5 && strcmp(argv[3], "cfg") == 0) {
-        void (*tc)(int*, int*) = (void (*)(int*, int*))GetProcAddress(h, "eb_test_cfg");
+    // 3m. a key as read from the ini: argv[4] = refresh ([country] parallel_refresh), war (parallel_war) or
+    // rng ([load] fast_rng_replay), argv[5] = the value used, argv[6] = the value ignored
+    if (argc > 6 && strcmp(argv[3], "cfg") == 0) {
+        int (*tc)(const char*, int*, int*) = (int (*)(const char*, int*, int*))GetProcAddress(h, "eb_test_cfg");
         CHECK(tc != NULL);
         if (tc) {
-            int used = -99, ignored = -99; tc(&used, &ignored);
-            printf("parallel_refresh: used %d, ignored %d (want %s, %s)\n", used, ignored, argv[4], argv[5]);
-            CHECK(used == atoi(argv[4]) && ignored == atoi(argv[5]));
+            int used = -99, ignored = -99;
+            CHECK(tc(argv[4], &used, &ignored) == 1);
+            printf("%s: used %d, ignored %d (want %s, %s)\n", argv[4], used, ignored, argv[5], argv[6]);
+            CHECK(used == atoi(argv[5]) && ignored == atoi(argv[6]));
         }
     }
 
