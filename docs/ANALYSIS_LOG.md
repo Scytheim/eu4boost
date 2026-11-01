@@ -1318,3 +1318,9 @@ el047`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1): 모든 �
 - 네 시험 모두 crash_reports\pending이 비었다.
 - 게임 폴더는 시험 전과 같다(0.4.11 배포 DLL 3c81d1ec + ini 1031a 0aa0ab40, ab_test=0).
 - 확인 스크립트 check_0412.py는 features 줄의 `OFF(asked 1: ignored since 0.4.12)`를 공백으로 잘라 처음에 BAD라고 했다. 정규식으로 고쳤고 모두 예상대로다.
+
+### 0.4.12 배포(11-01 15:42)
+
+- 로컬 3e45203을 공개 커밋 84a9f91(부모 0a7fec0, 공개 쪽 웹 수정 없음, 트리 같음)으로 올렸다.
+- 태그는 0.4.12이고 릴리스 제목은 "eu4boost 0.4.12"다. 설명은 비우고 자산은 eu4boost_v0.4.12.zip 하나다(zip d0eb945f, DLL 6dc49f6f, 서명 확인). 내려받은 zip이 올린 것과 같고, releases/latest = 0.4.12다.
+- 사용자 게임은 15:41:33에 켜져 업데이트 확인이 "0.4.11 is the latest"였다. 게임 폴더는 아직 0.4.11 DLL + ini 1031a이고, 게임이 켜져 있어 바꾸지 않았다.
