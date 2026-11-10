@@ -720,6 +720,18 @@ int main(int argc, char** argv) {
         int (*tw)(void) = (int (*)(void))GetProcAddress(h, "eb_test_load_wait");       // uitime.c: the player's time in the lobby is no load time
         CHECK(tw != NULL);
         if (tw) { int d = tw(); CHECK(d == 0); }
+        int (*tm)(void) = (int (*)(void))GetProcAddress(h, "eb_test_warm");            // warmup.c: the file list of a made-up game folder and mod
+        CHECK(tm != NULL);
+        if (tm) { int d = tm(); CHECK(d == 0); }
+        int (*ta)(void) = (int (*)(void))GetProcAddress(h, "eb_test_alerts");          // alerts.c: when a shown alert is evaluated again
+        CHECK(ta != NULL);
+        if (ta) { int d = ta(); CHECK(d == 0); }
+        int (*tg)(void) = (int (*)(void))GetProcAddress(h, "eb_test_daygap");          // daygap.c: why no day is issued, the split of a day
+        CHECK(tg != NULL);
+        if (tg) { int d = tg(); CHECK(d == 0); }
+        int (*ts)(void) = (int (*)(void))GetProcAddress(h, "eb_test_savesum");         // savesum.c: the save checksum's sum against the game's loop
+        CHECK(ts != NULL);
+        if (ts) { int d = ts(); CHECK(d == 0); }
     }
 
     // 3h. modifier-container add (fast path vs the game's algorithm)

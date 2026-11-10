@@ -29,6 +29,25 @@
 // tokens walk through and every '{' is closed); if one fails, the whole save is written the original
 // way. A save that loads with its blocks out of step - a player's save on 2026-10-23 broke that way,
 // though before the countries - can then never come from this code.
+//
+// Provinces ([save] parallel_provinces, experiment, 2026-11-07): the province loop of the same writer
+// (0x140751657..0x14075172f, before the countries) walks gamestate+0x1ca8 (provinces inline, 0x2e10
+// bytes each, count = the pointer vector +0x1c90/+0x1c98) and, for every province whose id (+0x20) is
+// not 0, writes a key record { type 0xc, "%d" of -id } and a second record { type 1, the std::string at
+// *0x14242b888 (+0x20 when *0x142357b28 >= 1) } with FUN_141708870(writer, record), then the province
+// through its vtable +8 (FUN_140d2f410 -> FUN_1409d6e60). Profile 2026-11-07 (user's JAP campaign copy,
+// 40 MB saves): 38 ms of the ~130 ms a save keeps the main thread, the biggest serial part left.
+// A hook at the loop's first instruction (0x140751660) writes, at index 0, every province at once the
+// same way the countries are (the same per-thread writers, streams, serializer copies and checks), then
+// at every index appends that province's bytes to the real stream and jumps to the loop's increment
+// (0x14075170c), skipping the two key writes and the province's own write. Shared state on the province
+// writer's paths (532 functions: static calls, the profile's virtual calls and the Write of every persistent
+// class the province constructor FUN_1409d5a20 makes): the same as the country writer's, plus lazily created
+// objects (0x14233d8d0, already checked; 0x14242be70 FUN_140d33000; 0x14242bd98 FUN_140099b60), so a batch
+// also needs those and the lexer's token table (0x142357b30, FUN_14170d250) to exist; and FUN_140451a40, a
+// province member's Write that sets serializer A itself (see hk_static_m).
+// Modes as for the countries: 2 = the game writes and a hook at the increment compares, 3 = serial
+// precompute on the main thread + verify.
 #include "common.h"
 #include <stdio.h>
 #include <string.h>
@@ -55,6 +74,40 @@
 // lazily created objects reached from the country writer (FUN_140798dc0, FUN_1407a73c0, FUN_140b354c0,
 // FUN_140b6b4e0, FUN_1407b23e0/FUN_141711d40, FUN_140289600)
 static const uint32_t lazy_rva[] = { 0x233fe88u, 0x242bc80u, 0x2458f30u, 0x242be50u, 0x2456bc0u, 0x233d8d0u };
+// provinces (see the head comment)
+#define RVA_PLOOP    0x751657u   // the province loop: mov rbx, r13 ... jl back (0xd8 bytes)
+#define RVA_PHEAD    0x751660u   // first instruction of an iteration (mov rax, [r14+0x1ca8])
+#define RVA_PNEXT    0x75170cu   // the increment (inc edi; add rbx, 0x2e10)
+#define RVA_KEYREC   0x1708870u  // FUN_141708870(writer, record*): writes a key record
+#define RVA_SPRINTF  0x15c230u   // FUN_14015c230(buf, fmt, ...): the game's sprintf
+#define RVA_FMT_D    0x1d64d54u  // "%d"
+#define RVA_KEY2     0x242b888u  // std::string* (the second record's text)
+#define RVA_KEY2SEL  0x2357b28u  // int: >= 1 -> the string at +0x20
+#define RVA_LEXINIT  0x2357b30u  // char: the lexer's token table exists (FUN_14170d250)
+#define LAZY_PROV    0x242be70u  // FUN_140d33000
+#define LAZY_PROV2   0x242bd98u  // FUN_140099b60
+#define RVA_STATIC_M 0x451a40u   // FUN_140451a40(list, writer): a province member, writes through serializer A itself
+static const uint8_t sig_static_m[24] = { 0x4c,0x8b,0xdc,0x53,0x55,0x56,0x41,0x57,0x48,0x81,0xec,0x38,0x02,0x00,0x00,0x4c,0x8b,0x41,0x10,0x45,0x33,0xff,0x48,0x8b };
+#define OFF_M_VALUE  0x103       // FUN_140451a40+0x103: mov [rip -> 0x142458c00], rax (the value pointer of object A)
+#define GS_PARR      0x1ca8
+#define GS_PVEC      0x1c90
+#define PSTRIDE      0x2e10
+#define REC_SIZE     0x210       // type (4), text (0x200), flag at +0x204
+static const uint8_t sig_ploop[0xd8] = {
+    0x49,0x8b,0xdd,0x66,0x0f,0x1f,0x44,0x00,0x00,0x49,0x8b,0x86,0xa8,0x1c,0x00,0x00,
+    0x44,0x8b,0x44,0x03,0x20,0x45,0x85,0xc0,0x0f,0x84,0x97,0x00,0x00,0x00,0x41,0xf7,
+    0xd8,0xc7,0x45,0xe0,0x0c,0x00,0x00,0x00,0xc6,0x85,0xe4,0x01,0x00,0x00,0x00,0x48,
+    0x8d,0x15,0xc7,0x36,0x61,0x01,0x48,0x8d,0x4d,0xe4,0xe8,0x9a,0xab,0xa0,0xff,0x48,
+    0x8d,0x55,0xe0,0x48,0x8b,0xce,0xe8,0xce,0x71,0xfb,0x00,0x80,0x3d,0x87,0x64,0xc0,
+    0x01,0x00,0x75,0x05,0xe8,0xa0,0xbb,0xfb,0x00,0x48,0x8b,0x15,0xd1,0xa1,0xcd,0x01,
+    0x83,0x3d,0x6a,0x64,0xc0,0x01,0x01,0x7c,0x04,0x48,0x83,0xc2,0x20,0xc6,0x85,0xe4,
+    0x01,0x00,0x00,0x00,0xc7,0x45,0xe0,0x01,0x00,0x00,0x00,0x8b,0x42,0x10,0x48,0x83,
+    0x7a,0x18,0x10,0x72,0x03,0x48,0x8b,0x12,0xff,0xc0,0x4c,0x63,0xc0,0x48,0x8d,0x4d,
+    0xe4,0xe8,0x63,0x40,0x2e,0x01,0x48,0x8d,0x55,0xe0,0x48,0x8b,0xce,0xe8,0x77,0x71,
+    0xfb,0x00,0x49,0x8b,0x8e,0xa8,0x1c,0x00,0x00,0x48,0x03,0xcb,0x48,0x8b,0x01,0x48,
+    0x8b,0xd6,0xff,0x50,0x08,0xff,0xc7,0x48,0x81,0xc3,0x10,0x2e,0x00,0x00,0x49,0x8b,
+    0x86,0x98,0x1c,0x00,0x00,0x49,0x2b,0x86,0x90,0x1c,0x00,0x00,0x48,0xc1,0xf8,0x03,
+    0x3b,0xf8,0x0f,0x8c,0x31,0xff,0xff,0xff };
 static const uint8_t sig_keyobj[24]  = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x81,0xec,0x30,0x02,0x00,0x00,0x49,0x8b,0xf0,0x48,0x8b,0xda };
 static const uint8_t sig_static_l[24] = { 0x40,0x53,0x56,0x57,0x41,0x54,0x48,0x83,0xec,0x28,0x4c,0x8b,0x41,0x10,0x45,0x33,0xe4,0x48,0x8b,0x41,0x18,0x48,0x8b,0xfa };
 static const uint8_t sig_msctor[24]  = { 0x4c,0x8b,0xdc,0x49,0x89,0x5b,0x08,0x49,0x89,0x6b,0x10,0x49,0x89,0x73,0x18,0x49,0x89,0x7b,0x20,0x41,0x56,0x48,0x83,0xec };
@@ -73,7 +126,9 @@ typedef void* (*msctor_t)(void* s, void* data, int size, void* vec, int mode, in
 typedef void* (*new_t)(uint64_t n);
 static keyobj_t o_keyobj;
 static static_t o_static_a, o_static_b;
-static static_l_t o_static_l;
+static static_l_t o_static_l, o_static_m;
+static CRITICAL_SECTION g_alock;                  // provinces: FUN_140451a40 one thread at a time
+static volatile LONG g_alock_on;                  // ... while a province batch runs
 static token_t game_token;
 static strctor_t game_strctor;
 static strfree_t game_strfree;
@@ -116,10 +171,28 @@ static void hk_static_l(void* list, void* writer) {           // FUN_140451740 w
     }
 }
 
+// FUN_140451a40 (the Write of a member that only provinces have: a list of 12-byte entries, each written as
+// key, "=", then its date at +8 through serializer A, then a closing record) sets object A itself instead
+// of through FUN_14015bf70, so per-thread copies cannot cover it. While a province batch runs, every thread
+// (the main thread included) uses per-thread copies through the getters, and this function runs under a
+// lock: object A is then used by one thread at a time, inside this function only. Found 2026-11-07: three
+// province bytes of 30,750 differed in mode 2 (a date of this list), none in mode 3.
+static void hk_static_m(void* list, void* writer) {
+    if (!g_alock_on) { o_static_m(list, writer); return; }
+    EnterCriticalSection(&g_alock);
+    o_static_m(list, writer);
+    LeaveCriticalSection(&g_alock);
+}
+
 // ---- the batch ---------------------------------------------------------------------------------
 #define MAXW 15
-typedef struct { uint8_t* c; int thr, ok; int64_t beg, end; } sjob_t;
+typedef struct { uint8_t* c; int thr, ok; int64_t beg, end; int idx, id; } sjob_t;   // idx, id: provinces
 static sjob_t* g_jobs;
+static volatile int g_kind;                         // what the jobs are: 0 countries, 1 provinces
+typedef void (*keyrec_t)(void* writer, void* rec);
+typedef int (*gsprintf_t)(char* buf, const char* fmt, ...);
+static keyrec_t game_keyrec;
+static gsprintf_t game_sprintf;
 static int g_jobcap;
 static volatile LONG g_njobs, g_next, g_done, g_pending;
 static HANDLE g_wake[MAXW];
@@ -132,6 +205,15 @@ static LONG64 g_saves, g_batches, g_fallback, g_emitted, g_ver, g_ver_bad, g_byt
 static char g_status[160];                          // what the latest save's country loop did (savezip.c's save journal)
 static double g_pre_ms, g_pre_max, g_qpf_ms;
 static int g_logged;
+// provinces: batch state, the second record's text as the batch read it, statistics
+static int g_pact, g_pk, g_pn, g_pv_job = -1;
+static int64_t g_pv_before;
+static char g_key2[0x200]; static int g_key2_len;
+static const void* g_key2_src;
+static LONG64 g_psaves, g_pbatches, g_pfallback, g_pemitted, g_pver, g_pver_bad, g_pbytes, g_pchecked, g_pcheck_bad;
+static char g_pstatus[160];
+static double g_ppre_ms, g_ppre_max;
+static int g_plogged;
 
 static inline LONGLONG qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 static int64_t vsize(void* s) { int64_t* v = *(int64_t**)((uint8_t*)s + MS_VEC); return v ? v[1] - v[0] : 0; }
@@ -200,6 +282,23 @@ static void run_jobs(int thr) {
         LONG i = InterlockedIncrement(&g_next) - 1;
         if (i >= g_njobs) break;
         sjob_t* j = &g_jobs[i];
+        if (g_kind == 1) {                          // a province, as one iteration of the loop writes it
+            uint8_t rec[REC_SIZE] __attribute__((aligned(16)));
+            memset(rec, 0, sizeof rec);
+            j->beg = vsize(g_stream[thr]);
+            *(int*)rec = 0xc;
+            game_sprintf((char*)rec + 4, (const char*)(g_base + RVA_FMT_D), -j->id);
+            game_keyrec(w, rec);
+            rec[0x204] = 0; *(int*)rec = 1;
+            memcpy(rec + 4, g_key2, (size_t)g_key2_len + 1);
+            game_keyrec(w, rec);
+            ((void (*)(void*, void*))VT(j->c)[1])(j->c, w);
+            j->end = vsize(g_stream[thr]);
+            j->ok = balanced(vdata(g_stream[thr]) + j->beg, j->end - j->beg);
+            j->thr = thr;
+            InterlockedIncrement(&g_done);
+            continue;
+        }
         char tag[16] = { 0 };
         memcpy(tag, j->c + 0x20, 8);                // the loop copies these 8 bytes and makes a string of them
         uint8_t key[0x20] __attribute__((aligned(16)));
@@ -226,6 +325,37 @@ static DWORD WINAPI worker(LPVOID arg) {
     return 0;
 }
 
+static void ensure_workers(void) {
+    if (g_nw) return;
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    int nw = (int)si.dwNumberOfProcessors - 1;
+    if (nw > MAXW) nw = MAXW;
+    for (int i = 0; i < nw; i++) {
+        g_wake[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
+        HANDLE h = g_wake[i] ? CreateThread(NULL, 4u << 20, worker, (LPVOID)(intptr_t)(i + 1), STACK_SIZE_PARAM_IS_A_RESERVATION, NULL) : NULL;
+        if (!h) break;
+        CloseHandle(h); g_nw++;
+    }
+}
+
+// all jobs g_jobs[0..n) on `threads` threads (the main thread is one of them); returns the milliseconds
+static double run_all(int n, int threads, int kind) {
+    LONGLONG t0 = qpc();
+    while (g_pending) YieldProcessor();
+    g_next = 0; g_done = 0; g_kind = kind;
+    MemoryBarrier();
+    g_njobs = n;
+    int wake = threads - 1;
+    InterlockedExchange(&g_pending, wake);
+    for (int i = 0; i < wake; i++) SetEvent(g_wake[i]);
+    if (kind == 1) { g_alock_on = 1; t_par = 1; }   // provinces: the main thread too uses per-thread copies
+    run_jobs(0);                                     // (countries: the main thread uses the game's own statics)
+    while (g_done < n) YieldProcessor();
+    while (g_pending) YieldProcessor();
+    if (kind == 1) { t_par = 0; g_alock_on = 0; }
+    return (double)(qpc() - t0) * g_qpf_ms;
+}
+
 static const char* start_batch(uint8_t* writer, uint8_t** list, int n) {
     if (!writer[0x18]) return "text save";
     for (size_t i = 0; i < sizeof lazy_rva / sizeof lazy_rva[0]; i++)
@@ -241,17 +371,7 @@ static const char* start_batch(uint8_t* writer, uint8_t** list, int n) {
         if (!p) return "out of memory";
         g_jobs = p; g_jobcap = n;
     }
-    if (!g_nw && g_cfg.save_countries != 3) {
-        SYSTEM_INFO si; GetSystemInfo(&si);
-        int nw = (int)si.dwNumberOfProcessors - 1;
-        if (nw > MAXW) nw = MAXW;
-        for (int i = 0; i < nw; i++) {
-            g_wake[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
-            HANDLE h = g_wake[i] ? CreateThread(NULL, 4u << 20, worker, (LPVOID)(intptr_t)(i + 1), STACK_SIZE_PARAM_IS_A_RESERVATION, NULL) : NULL;
-            if (!h) break;
-            CloseHandle(h); g_nw++;
-        }
-    }
+    if (g_cfg.save_countries != 3) ensure_workers();
     o_static_a(NULL); o_static_b(NULL);              // make sure both statics are initialized, then copy them
     memcpy(g_tmpl_a, g_base + OBJ_A, sizeof g_tmpl_a);
     memcpy(g_tmpl_b, g_base + OBJ_B, sizeof g_tmpl_b);
@@ -261,18 +381,7 @@ static const char* start_batch(uint8_t* writer, uint8_t** list, int n) {
     if (threads > n) threads = n;
     for (int i = 0; i < threads; i++) if (!(g_stream[i] = new_stream())) { free_streams(); return "out of memory"; }
     for (int i = 0; i < n; i++) { g_jobs[i].c = list[i]; g_jobs[i].thr = -1; g_jobs[i].ok = 0; g_jobs[i].beg = g_jobs[i].end = 0; }
-    LONGLONG t0 = qpc();
-    while (g_pending) YieldProcessor();
-    g_next = 0; g_done = 0;
-    MemoryBarrier();
-    g_njobs = n;
-    int wake = threads - 1;
-    InterlockedExchange(&g_pending, wake);
-    for (int i = 0; i < wake; i++) SetEvent(g_wake[i]);
-    run_jobs(0);                                     // the main thread uses the game's own statics
-    while (g_done < n) YieldProcessor();
-    while (g_pending) YieldProcessor();
-    double ms = (double)(qpc() - t0) * g_qpf_ms;
+    double ms = run_all(n, threads, 0);
     g_pre_ms += ms; if (ms > g_pre_max) g_pre_max = ms;
     int64_t bytes = 0;
     for (int i = 0; i < n; i++) { if (g_jobs[i].thr < 0) { free_streams(); return "a country was not written"; } bytes += g_jobs[i].end - g_jobs[i].beg; }
@@ -294,6 +403,185 @@ static const char* start_batch(uint8_t* writer, uint8_t** list, int n) {
 }
 
 static void end_batch(void) { free_streams(); g_active = 0; }
+static void end_pbatch(void) { free_streams(); g_pact = 0; g_pv_job = -1; }
+
+// ---- provinces ----------------------------------------------------------------------------------
+// the second record's text exactly as an iteration of the loop reads it
+static const uint8_t* key2_src(int* len) {
+    uint8_t* s = *(uint8_t**)(g_base + RVA_KEY2);
+    if (!s) return NULL;
+    if (*(int*)(g_base + RVA_KEY2SEL) >= 1) s += 0x20;
+    *len = *(int*)(s + 0x10);
+    return *(uint64_t*)(s + 0x18) >= 0x10 ? *(const uint8_t**)s : s;
+}
+
+static const char* start_pbatch(uint8_t* gs, uint8_t* writer, int n) {
+    if (!writer[0x18]) return "text save";
+    for (size_t i = 0; i < sizeof lazy_rva / sizeof lazy_rva[0]; i++)
+        if (!*(void**)(g_base + lazy_rva[i])) return "a lazily created object does not exist yet";
+    if (!*(void**)(g_base + LAZY_PROV) || !*(void**)(g_base + LAZY_PROV2)) return "a lazily created object does not exist yet";
+    if (!*(volatile char*)(g_base + RVA_LEXINIT)) return "the token table is not made yet";
+    void* rs = *(void**)(writer + 0x10);
+    if (!rs) return "no stream";
+    if (!*(void**)((uint8_t*)rs + MS_VEC)) return "the stream has no vector";
+    int len = 0;
+    const uint8_t* k2 = key2_src(&len);
+    if (!k2 || len < 0 || len + 1 > (int)sizeof g_key2 || len + 1 > REC_SIZE - 4 - 8) return "unexpected second key";
+    memcpy(g_key2, k2, (size_t)len + 1); g_key2_len = len; g_key2_src = k2;
+    uint8_t* arr = *(uint8_t**)(gs + GS_PARR);
+    if (!arr) return "no provinces";
+    int m = 0;
+    for (int i = 0; i < n; i++) if (*(int*)(arr + (int64_t)i * PSTRIDE + 0x20)) m++;
+    if (!m) return "no provinces";
+    if (m > g_jobcap) {
+        sjob_t* p = (sjob_t*)realloc(g_jobs, (size_t)m * sizeof *p);
+        if (!p) return "out of memory";
+        g_jobs = p; g_jobcap = m;
+    }
+    if (g_cfg.save_provinces != 3) ensure_workers();
+    o_static_a(NULL); o_static_b(NULL);
+    memcpy(g_tmpl_a, g_base + OBJ_A, sizeof g_tmpl_a);
+    memcpy(g_tmpl_b, g_base + OBJ_B, sizeof g_tmpl_b);
+    memcpy(g_wtmpl, writer, sizeof g_wtmpl);
+    g_mode_ms = *(int*)((uint8_t*)rs + 0x10); g_mode2_ms = *(int*)((uint8_t*)rs + 0x14);
+    int threads = g_cfg.save_provinces == 3 ? 1 : 1 + g_nw;
+    if (threads > m) threads = m;
+    for (int i = 0; i < threads; i++) if (!(g_stream[i] = new_stream())) { free_streams(); return "out of memory"; }
+    for (int i = 0, k = 0; i < n; i++) {
+        uint8_t* p = arr + (int64_t)i * PSTRIDE;
+        int id = *(int*)(p + 0x20);
+        if (!id) continue;
+        sjob_t* j = &g_jobs[k++];
+        j->c = p; j->idx = i; j->id = id; j->thr = -1; j->ok = 0; j->beg = j->end = 0;
+    }
+    double ms = run_all(m, threads, 1);
+    g_ppre_ms += ms; if (ms > g_ppre_max) g_ppre_max = ms;
+    int64_t bytes = 0; int bad = 0, first = -1;
+    for (int i = 0; i < m; i++) {
+        if (g_jobs[i].thr < 0) { free_streams(); return "a province was not written"; }
+        bytes += g_jobs[i].end - g_jobs[i].beg;
+        if (!g_jobs[i].ok) { if (first < 0) first = i; bad++; }
+    }
+    g_pchecked += m;
+    if (bad) {
+        g_pcheck_bad += bad;
+        static int logged;
+        if (logged++ < 5)
+            eb_log("save: CHECK FAILED - %d of %d provinces' bytes do not close (first: id %d, %lld bytes) - provinces written the original way",
+                   bad, m, g_jobs[first].id, (long long)(g_jobs[first].end - g_jobs[first].beg));
+        free_streams();
+        return "the check of a province's bytes failed";
+    }
+    g_pbytes += bytes; g_pn = m; g_pk = 0;
+    if (g_cfg.save_stats) eb_log("save: %d provinces serialized in %.1f ms on %d threads (%.1f MB)", m, ms, threads, (double)bytes / 1048576.0);
+    return NULL;
+}
+
+static void pfallback(const char* what) {
+    end_pbatch(); g_pfallback++;
+    size_t l = strlen(g_pstatus); snprintf(g_pstatus + l, sizeof g_pstatus - l, "; original from %d on (%s)", g_pk, what);
+    if (g_plogged++ < 10) eb_log("save: province loop: %s at %d - the rest written the original way", what, g_pk);
+}
+
+// called by the stub at 0x140751660 with the loop's registers: r14 gamestate, rsi writer, edi index,
+// rbx index * 0x2e10. 1 = this province's bytes were appended: go on at the increment.
+int eb_sp_head(uint8_t* gs, uint8_t* writer, int i, int64_t off) {
+    if (GetCurrentThreadId() != g_main_tid) return 0;
+    if (g_pv_job >= 0) { pfallback("no compare after the last province"); return 0; }
+    int n = (int)((*(int64_t*)(gs + GS_PVEC + 8) - *(int64_t*)(gs + GS_PVEC)) >> 3);
+    if (i == 0) {                                    // the loop starts: a new batch
+        if (g_pact) end_pbatch();
+        if (g_active) end_batch();
+        g_psaves++;
+        const char* why = off != 0 ? "unexpected registers" : start_pbatch(gs, writer, n);
+        if (why) {
+            g_pfallback++;
+            snprintf(g_pstatus, sizeof g_pstatus, "provinces original (%s)", why);
+            if (g_plogged++ < 10) eb_log("save: provinces written the original way (%s)", why);
+            return 0;
+        }
+        g_pact = 1; g_pbatches++;
+        snprintf(g_pstatus, sizeof g_pstatus, "provinces parallel (%d, checked)", g_pn);
+    }
+    if (!g_pact) return 0;
+    uint8_t* p = *(uint8_t**)(gs + GS_PARR) + off;
+    if (!*(int*)(p + 0x20)) return 0;                // the loop skips it itself
+    sjob_t* j = g_pk < g_pn ? &g_jobs[g_pk] : NULL;
+    if (!j || j->idx != i || j->c != p || off != (int64_t)i * PSTRIDE) { pfallback("order differs"); return 0; }
+    int len2 = 0;
+    if (key2_src(&len2) != g_key2_src || len2 != g_key2_len) { pfallback("second key changed"); return 0; }
+    void* rs = *(void**)(writer + 0x10);
+    if (g_cfg.save_provinces >= 2) {                 // verify: the game writes it, eb_sp_end compares
+        g_pv_job = g_pk++; g_pv_before = *(int*)((uint8_t*)rs + 0x4c);
+        return 0;
+    }
+    ST_WRITE(rs, vdata(g_stream[j->thr]) + j->beg, j->end - j->beg);
+    g_pemitted++;
+    if (++g_pk == g_pn) end_pbatch();
+    return 1;
+}
+
+// verify modes: called by the stub at 0x14075170c (the increment) after every iteration
+void eb_sp_end(uint8_t* gs, uint8_t* writer, int i) {
+    (void)gs;
+    if (g_pv_job < 0 || GetCurrentThreadId() != g_main_tid) return;
+    sjob_t* j = &g_jobs[g_pv_job];
+    void* rs = *(void**)(writer + 0x10);
+    int64_t after = *(int*)((uint8_t*)rs + 0x4c), len = j->end - j->beg;
+    g_pver++;
+    int64_t d = after - g_pv_before == len ? scmp(rs, g_pv_before, vdata(g_stream[j->thr]) + j->beg, len) : 0;
+    if (d >= 0) {
+        g_pver_bad++;
+        if (g_pver_bad <= 20) {
+            eb_log("save: VERIFY MISMATCH province %d (index %d, id %d, thread %d): game %lld bytes, parallel %lld, first difference at %lld",
+                   g_pv_job, i, j->id, j->thr, (long long)(after - g_pv_before), (long long)len, (long long)d);
+            // the bytes around it, game then parallel (diagnostics: which token's value differs)
+            const uint8_t* pp = vdata(g_stream[j->thr]) + j->beg;
+            uint8_t* fixed = *(uint8_t**)((uint8_t*)rs + 0x40);
+            int64_t nfix = fixed ? *(int*)((uint8_t*)rs + 0x50) : 0;
+            uint8_t* v = vdata(rs); int64_t nv = vsize(rs);
+            int64_t a = d > 48 ? d - 48 : 0, e = d + 40 < len ? d + 40 : len;
+            char hg[300], hp[300]; int og = 0, op = 0;
+            for (int64_t q = a; q < e && og < 290; q++) {
+                int64_t r = g_pv_before + q;
+                uint8_t bg = r < nfix ? fixed[r] : (v && r - nfix < nv ? v[r - nfix] : 0);
+                og += snprintf(hg + og, sizeof hg - og, q == d ? "[%02x" : "%02x", bg);
+                op += snprintf(hp + op, sizeof hp - op, q == d ? "[%02x" : "%02x", pp[q]);
+            }
+            eb_log("save:   game     +%lld: %s", (long long)a, hg);
+            eb_log("save:   parallel +%lld: %s", (long long)a, hp);
+        }
+    }
+    g_pv_job = -1;
+    if (g_pk == g_pn) end_pbatch();
+}
+
+void* eb_sp_head_tramp;                     // MinHook trampoline: the moved first instruction, then 0x140751667
+void* eb_sp_end_tramp;                      // the moved increment, then 0x140751715
+void* eb_sp_skip;                           // 0x14075170c
+void eb_sp_head_stub(void);
+void eb_sp_end_stub(void);
+// rsp is 16-byte aligned at both places (the loop calls functions from the same rsp) and no volatile
+// register is live there; [rsp, rsp+0x20) is the function's own outgoing home area.
+__asm__(".text\n"
+        ".globl eb_sp_head_stub\n"
+        "eb_sp_head_stub:\n"
+        "    movq %r14, %rcx\n"
+        "    movq %rsi, %rdx\n"
+        "    movl %edi, %r8d\n"
+        "    movq %rbx, %r9\n"
+        "    callq eb_sp_head\n"
+        "    testl %eax, %eax\n"
+        "    jz 1f\n"
+        "    jmpq *eb_sp_skip(%rip)\n"
+        "1:  jmpq *eb_sp_head_tramp(%rip)\n"
+        ".globl eb_sp_end_stub\n"
+        "eb_sp_end_stub:\n"
+        "    movq %r14, %rcx\n"
+        "    movq %rsi, %rdx\n"
+        "    movl %edi, %r8d\n"
+        "    callq eb_sp_end\n"
+        "    jmpq *eb_sp_end_tramp(%rip)\n");
 
 static void hk_keyobj(void* writer, void* key, void* obj) {
     if ((uint8_t*)__builtin_return_address(0) != g_ret_country || GetCurrentThreadId() != g_main_tid) { o_keyobj(writer, key, obj); return; }
@@ -307,6 +595,7 @@ static void hk_keyobj(void* writer, void* key, void* obj) {
     }
     if (list && n > 0 && obj == list[0]) {           // the loop starts: a new batch
         if (g_active) end_batch();
+        if (g_pact) end_pbatch();                    // (the province loop always ends before)
         g_saves++;
         const char* why = start_batch((uint8_t*)writer, list, n);
         if (why) {
@@ -348,22 +637,27 @@ static void hk_keyobj(void* writer, void* key, void* obj) {
 }
 
 int eb_savepar_install(void) {
-    if (!g_cfg.save_countries) return 0;
+    if (!g_cfg.save_countries && !g_cfg.save_provinces) return 0;
 #ifdef EB_TEST
-    eb_log("save: parallel countries are not available in the test build");
+    eb_log("save: parallel countries and provinces are not available in the test build");
     return 0;
 #else
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpf_ms = 1000.0 / (double)f.QuadPart;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
-    if (nt->FileHeader.TimeDateStamp != 0x66FE6AB9u) { eb_log("save: unexpected eu4.exe - parallel countries off"); return 0; }
+    if (nt->FileHeader.TimeDateStamp != 0x66FE6AB9u) {
+        eb_log("save: unexpected eu4.exe - parallel countries and provinces off");
+        g_cfg.save_countries = g_cfg.save_provinces = 0;
+        return 0;
+    }
     uint8_t* call = b + RET_COUNTRY - 5;
     if (memcmp(b + RVA_KEYOBJ, sig_keyobj, sizeof sig_keyobj) || memcmp(b + RVA_STATIC_L, sig_static_l, sizeof sig_static_l) ||
         memcmp(b + RVA_MSCTOR, sig_msctor, sizeof sig_msctor) || memcmp(b + RVA_STRCTOR, sig_strctor, sizeof sig_strctor) ||
         memcmp(b + RVA_STRFREE, sig_strfree, sizeof sig_strfree) || memcmp(b + RVA_LOOP, sig_loop, sizeof sig_loop) ||
         call[0] != 0xe8 || call + 5 + *(int32_t*)(call + 1) != b + RVA_KEYOBJ ||
         *(void**)(b + VT_MSTREAM + 0x50) != (void*)(b + 0x171f290u)) {
-        eb_log("save: signature mismatch - parallel countries off");
+        eb_log("save: signature mismatch - parallel countries and provinces off");
+        g_cfg.save_countries = g_cfg.save_provinces = 0;
         return 0;
     }
     // the two static-object getters: the same code, distinguished by the objects they reference
@@ -373,8 +667,30 @@ int eb_savepar_install(void) {
         int found = 0;
         for (int i = 0; i < 0x80 && !found; i++)              // lea rax, [rip + obj] somewhere in the getter
             if (fn[i] == 0x48 && fn[i + 1] == 0x8d && (fn[i + 2] & 0xc7) == 0x05 && fn + i + 7 + *(int32_t*)(fn + i + 3) == b + obj) found = 1;
-        if (!found) { eb_log("save: static serializer %d not found - parallel countries off", k); return 0; }
+        if (!found) {
+            eb_log("save: static serializer %d not found - parallel countries and provinces off", k);
+            g_cfg.save_countries = g_cfg.save_provinces = 0;
+            return 0;
+        }
     }
+    if (g_cfg.save_provinces) {                                // the province loop, byte for byte, and what it calls
+        uint8_t* L = b + RVA_PLOOP;
+#define CALLTGT(va) ((va) + 5 + *(int32_t*)((va) + 1))
+#define LEATGT(va)  ((va) + 7 + *(int32_t*)((va) + 3))
+        if (memcmp(L, sig_ploop, sizeof sig_ploop) ||
+            CALLTGT(b + 0x751691u) != b + RVA_SPRINTF || CALLTGT(b + 0x75169du) != b + RVA_KEYREC ||
+            CALLTGT(b + 0x7516f4u) != b + RVA_KEYREC || LEATGT(b + 0x751686u) != b + RVA_FMT_D ||
+            memcmp(b + RVA_STATIC_M, sig_static_m, sizeof sig_static_m) ||
+            b[RVA_STATIC_M + OFF_M_VALUE] != 0x48 || b[RVA_STATIC_M + OFF_M_VALUE + 1] != 0x89 || b[RVA_STATIC_M + OFF_M_VALUE + 2] != 0x05 ||
+            b + RVA_STATIC_M + OFF_M_VALUE + 7 + *(int32_t*)(b + RVA_STATIC_M + OFF_M_VALUE + 3) != b + OBJ_A + 0x10 ||
+            memcmp(b + RVA_FMT_D, "%d", 3)) {
+            eb_log("save: province loop not as expected - parallel provinces off");
+            g_cfg.save_provinces = 0;
+        }
+#undef CALLTGT
+#undef LEATGT
+    }
+    if (!g_cfg.save_countries && !g_cfg.save_provinces) return 0;
     g_base = b;
     g_ret_country = b + RET_COUNTRY;
     game_token = (token_t)(void*)(b + RVA_TOKEN);
@@ -382,24 +698,43 @@ int eb_savepar_install(void) {
     game_strfree = (strfree_t)(void*)(b + RVA_STRFREE);
     game_msctor = (msctor_t)(void*)(b + RVA_MSCTOR);
     game_new = (new_t)(void*)(b + RVA_NEW);
+    game_keyrec = (keyrec_t)(void*)(b + RVA_KEYREC);
+    game_sprintf = (gsprintf_t)(void*)(b + RVA_SPRINTF);
     MH_STATUS s = MH_Initialize();
-    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("save: MinHook init failed"); return 0; }
+    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED) { eb_log("save: MinHook init failed"); g_cfg.save_countries = g_cfg.save_provinces = 0; return 0; }
     struct { uint32_t rva; void* hook; void** orig; } t[] = {
         { RVA_STATIC_A, (void*)hk_static_a, (void**)&o_static_a },
         { RVA_STATIC_B, (void*)hk_static_b, (void**)&o_static_b },
         { RVA_STATIC_L, (void*)hk_static_l, (void**)&o_static_l },
         { RVA_KEYOBJ,   (void*)hk_keyobj,   (void**)&o_keyobj },
     };
-    eb_hookset hs; eb_hs_init(&hs, "save countries");        // the serializer copies work only together
-    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+    // the serializer copies work only together; the country hook only when the countries are on
+    eb_hookset hs; eb_hs_init(&hs, g_cfg.save_countries ? "save countries" : "save serializer copies");
+    size_t nt_ = g_cfg.save_countries ? 4 : 3;
+    for (size_t i = 0; i < nt_; i++)
         if (!eb_hs_add(&hs, b + t[i].rva, t[i].hook, t[i].orig)) break;
     if (!eb_hs_enable(&hs)) {
-        eb_log("save: hooks failed - parallel countries off");
-        g_cfg.save_countries = 0;
+        eb_log("save: hooks failed - parallel countries and provinces off");
+        g_cfg.save_countries = g_cfg.save_provinces = 0;
         return 0;
     }
-    eb_log("save: countries serialized in parallel (mode %d: %s)", g_cfg.save_countries,
-           g_cfg.save_countries == 1 ? "on" : g_cfg.save_countries == 2 ? "on + verify" : "serial precompute + verify");
+    if (g_cfg.save_countries)
+        eb_log("save: countries serialized in parallel (mode %d: %s)", g_cfg.save_countries,
+               g_cfg.save_countries == 1 ? "on" : g_cfg.save_countries == 2 ? "on + verify" : "serial precompute + verify");
+    if (g_cfg.save_provinces) {
+        eb_sp_skip = b + RVA_PNEXT;
+        eb_hookset ps; eb_hs_init(&ps, "save provinces");
+        InitializeCriticalSection(&g_alock);
+        int ok = eb_hs_add(&ps, b + RVA_STATIC_M, (void*)hk_static_m, (void**)&o_static_m);
+        ok = ok && eb_hs_add(&ps, b + RVA_PHEAD, (void*)eb_sp_head_stub, &eb_sp_head_tramp);
+        if (ok && g_cfg.save_provinces >= 2) ok = eb_hs_add(&ps, b + RVA_PNEXT, (void*)eb_sp_end_stub, &eb_sp_end_tramp);
+        if (!ok || !eb_hs_enable(&ps)) {
+            eb_log("save: province hooks failed - parallel provinces off");
+            g_cfg.save_provinces = 0;
+        } else
+            eb_log("save: provinces serialized in parallel (EXPERIMENT, mode %d: %s)", g_cfg.save_provinces,
+                   g_cfg.save_provinces == 1 ? "on" : g_cfg.save_provinces == 2 ? "on + verify" : "serial precompute + verify");
+    }
     return 1;
 #endif
 }
@@ -429,14 +764,25 @@ __declspec(dllexport) int eb_test_balanced(void) {
 }
 #endif
 
-// savezip.c: before a save (clear) and after it (what the country loop did)
-void eb_savepar_mark(void) { g_status[0] = 0; }
-const char* eb_savepar_status(void) { return g_status[0] ? g_status : o_keyobj ? "countries not reached" : "parallel countries off"; }
+// savezip.c: before a save (clear) and after it (what the province and country loops did)
+void eb_savepar_mark(void) { g_status[0] = 0; g_pstatus[0] = 0; }
+const char* eb_savepar_status(void) {
+    static char both[340];
+    const char* c = g_status[0] ? g_status : o_keyobj ? "countries not reached" : "parallel countries off";
+    if (!g_cfg.save_provinces) return c;
+    snprintf(both, sizeof both, "%s; %s", g_pstatus[0] ? g_pstatus : "provinces not reached", c);
+    return both;
+}
 
 void eb_savepar_report(void) {
-    if (!o_keyobj) return;
-    eb_log("save: parallel countries: %lld saves, %lld batches (%.1f ms avg, %.1f max, %.1f MB avg), %lld fallbacks, %lld countries appended | checked %lld, failed %lld | verify %lld, mismatches %lld",
-           (long long)g_saves, (long long)g_batches, g_batches ? g_pre_ms / (double)g_batches : 0.0, g_pre_max,
-           g_batches ? (double)g_bytes / 1048576.0 / (double)g_batches : 0.0, (long long)g_fallback, (long long)g_emitted,
-           (long long)g_checked, (long long)g_check_bad, (long long)g_ver, (long long)g_ver_bad);
+    if (o_keyobj)
+        eb_log("save: parallel countries: %lld saves, %lld batches (%.1f ms avg, %.1f max, %.1f MB avg), %lld fallbacks, %lld countries appended | checked %lld, failed %lld | verify %lld, mismatches %lld",
+               (long long)g_saves, (long long)g_batches, g_batches ? g_pre_ms / (double)g_batches : 0.0, g_pre_max,
+               g_batches ? (double)g_bytes / 1048576.0 / (double)g_batches : 0.0, (long long)g_fallback, (long long)g_emitted,
+               (long long)g_checked, (long long)g_check_bad, (long long)g_ver, (long long)g_ver_bad);
+    if (g_cfg.save_provinces)
+        eb_log("save: parallel provinces: %lld saves, %lld batches (%.1f ms avg, %.1f max, %.1f MB avg), %lld fallbacks, %lld provinces appended | checked %lld, failed %lld | verify %lld, mismatches %lld",
+               (long long)g_psaves, (long long)g_pbatches, g_pbatches ? g_ppre_ms / (double)g_pbatches : 0.0, g_ppre_max,
+               g_pbatches ? (double)g_pbytes / 1048576.0 / (double)g_pbatches : 0.0, (long long)g_pfallback, (long long)g_pemitted,
+               (long long)g_pchecked, (long long)g_pcheck_bad, (long long)g_pver, (long long)g_pver_bad);
 }

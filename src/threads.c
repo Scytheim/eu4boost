@@ -17,10 +17,13 @@ static SetThreadAffinityMask_t o_SetThreadAffinityMask;
 
 static int popcount64(DWORD_PTR m) { int n = 0; while (m) { m &= m - 1; n++; } return n; }
 
+volatile LONG eb_app_loop;             // 1 once the game's application loop runs (it pins its thread first): the start-up loading is over
+
 static DWORD_PTR WINAPI hk_SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
     DWORD tid = GetThreadId(h);
     int self = (h == GetCurrentThread()) || tid == GetCurrentThreadId();
     int cpu = -1;
+    if (self) InterlockedExchange(&eb_app_loop, 1);
     for (int i = 0; i < 64; i++) if (mask == ((DWORD_PTR)1 << i)) { cpu = i; break; }
     if (self && g_cfg.main_affinity == 0) {
         DWORD_PTR proc = 0, sys = 0;

@@ -45,6 +45,7 @@ typedef struct {
     int prof_max_seconds;         // auto stop after this many seconds (0 = until toggled off / exit)
     int prof_autostart;           // start sampling immediately at launch
     int prof_all_threads_wall;    // 1 = sample every thread every tick (wall clock); 0 = only threads that used CPU
+    int prof_tag_days;            // diagnostics: main-thread stacks get a root frame ?:10..13 (outside / in a day / 1st / 2nd of a month)
     // threads
     int speed5_midtick_ms;        // min. time between frames rendered in the middle of a long tick at speed 5 (game: 50)
     int days_per_frame;           // speed 5: run up to this many days per frame (1 = game default)
@@ -64,6 +65,8 @@ typedef struct {
     int save_stats;               // 1 = log the time of every save and of its compression
     int save_fmt;                 // 1 = exact fast integer formatting at two sprintf call sites of the save writer
     int save_countries;           // savepar.c: 1 = serialize the countries of a save on all cores, 2/3 = + verify
+    int save_provinces;           // savepar.c: 1 = serialize the provinces of a save on all cores, 2/3 = + verify (experiment)
+    int save_fast_checksum;       // savesum.c: 1 = the checksum's sum over the save is computed the quick way (experiment), 2 = + compared with the game's
     int save_list_cache;          // savelist.c: 1 = unchanged saves are listed from cached meta without opening them, 2 = + log every item
     int script_fast_vars;         // script.c: 1 = variable reads search the scope's store without building store lists, 2 = + verify
     // modifiers (modifier.c)
@@ -116,7 +119,14 @@ typedef struct {
     int test_queue_fail;          // testing only ([test] queue_fail=N): a worker's queue cannot grow after N entries (country.c)
     int test_msg_fail;            // testing only ([test] msg_fail=N): every Nth message copy of a worker fails (country.c)
     int test_rng_count;           // testing only ([test] rng_count=N): the seed sync command of a load restores N draws instead (rng.c)
+    int test_open_log;            // testing only ([test] open_log=1): every PHYSFS_openRead of the game goes to eu4boost_opens.txt (warmup.c)
     // loading (rng.c)
+    int load_warm_files;          // warmup.c: 1 = the game's and the mods' files are opened ahead on our own threads at game start (experiment), 2 = + statistics, 3 = statistics only
+    int load_warm_threads;        // warmup.c: how many threads open them (0 = by the CPU and the kind of drive)
+    int render_alert_refresh_ms;  // alerts.c: a shown alert is evaluated again every N ms instead of every frame (0 = as the game does; experiment)
+    int render_alert_stats;       // alerts.c: 1 = the alerts update of every frame is timed (log line at exit)
+    int render_speed5_gap_pct;    // daygap.c: at speed 5 the normal frames after a daily tick get at least N % of a usual tick's time before the next day (0 = off)
+    int diag_day_gap;             // daygap.c: 1 = what keeps the game from issuing the next day is counted every frame (read-only)
     int load_fast_rng;            // 1 (default since 0.4.12) = a load restores the random generator with its state updates only (no draws), 2 = + verify against the game's draws
     // diagnostics (uitime.c)
     int ui_timing;                // 1 = log how long save lists, the save dialog, deleting and loading take
@@ -203,6 +213,8 @@ void eb_savezip_report(void);
 // savepar.c
 int  eb_savepar_install(void);
 void eb_savepar_report(void);
+int  eb_savesum_install(void);       // savesum.c: the save checksum's 32-bit sum, the same value much faster ([save] fast_checksum)
+void eb_savesum_report(void);
 void eb_savepar_mark(void);              // savezip.c, around every save: what the country loop did
 const char* eb_savepar_status(void);
 const char* eb_save_journal(void);       // savezip.c: the session's last saves (crash.c puts it in reports)
@@ -259,6 +271,16 @@ int  eb_uitime_install(void);
 int  eb_autorun_install(void);       // autorun.c: test autopilot, driven from uitime.c
 int  eb_rng_install(void);           // rng.c: the random generator restore of a load ([load] fast_rng_replay)
 void eb_rng_report(void);
+int  eb_warm_install(void);          // warmup.c: the game's and the mods' files are opened ahead at game start ([load] warm_files)
+void eb_warm_report(void);
+int  eb_alerts_install(void);        // alerts.c: shown alerts are evaluated every N ms, not every frame ([render] alert_refresh_ms)
+void eb_alerts_report(void);
+int  eb_daygap_install(void);        // daygap.c: where the time between two days goes ([diag] day_gap, read-only)
+void eb_daygap_report(void);
+extern int eb_dg_on;
+void eb_dg_day(int end);            // guard.c tells it when the daily tick starts (0) and ends (1)
+void eb_dg_frame(void);             // crash.c tells it when a frame begins
+extern volatile LONG eb_app_loop;   // threads.c: 1 once the game's application loop runs (the start-up loading is over)
 int  eb_autorun_date(const char* s);
 void eb_autorun_loaded(void);
 void eb_autorun_frame(void);

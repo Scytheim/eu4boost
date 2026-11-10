@@ -219,6 +219,23 @@ static void record(int thread, const uintptr_t* f, int n) {
     g_dropped++;
 }
 
+// [profiler] tag_days: the main thread's stacks end with one more frame, a small number outside every
+// module (written as ?:10 .. ?:13), so the analysis can split the profile by the kind of moment:
+// 0x10 outside the daily tick, 0x11 in a day, 0x12 in the day whose date is the 1st of a month, 0x13 the 2nd.
+// The date is read only inside the tick (guard.c's eb_in_day; the gamestate is valid then): the CDate at
+// gamestate+0x1dd0 counts hours, and the tick has already moved it to the day it processes.
+static uintptr_t day_tag(void) {
+    if (!eb_in_day || !g_exe) return 0x10;
+    uint8_t* gs = *(uint8_t**)((uint8_t*)g_exe + 0x233fe78u);
+    if (!gs) return 0x11;
+    int hours = *(volatile int*)(gs + 0x1dd0) - 43800000;
+    if (hours < 0) return 0x11;
+    int doy = (hours / 24) % 365, m = 0;
+    static const int ml[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    while (m < 11 && doy >= ml[m]) { doy -= ml[m]; m++; }
+    return doy == 0 ? 0x12 : doy == 1 ? 0x13 : 0x11;
+}
+
 static void sample_once(void) {
     uintptr_t frames[MAX_DEPTH];
     for (int i = 0; i < g_nthreads; i++) {
@@ -238,6 +255,7 @@ static void sample_once(void) {
         if (GetThreadContext(t->h, &ctx)) n = walk(&ctx, t->stack_lo, t->stack_hi, frames, g_cfg.prof_max_depth);
         ResumeThread(t->h);
         if (n == 0) { g_unwind_fail++; continue; }
+        if (g_cfg.prof_tag_days && t->tid == g_main_tid && n < MAX_DEPTH) frames[n++] = day_tag();
         record(i, frames, n);
         t->samples++;
         g_total_samples++;

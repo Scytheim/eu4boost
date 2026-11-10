@@ -201,6 +201,7 @@ static void load_config(void) {
     c->prof_max_seconds     = ini_int(ini, L"profiler",  L"max_seconds", 600);
     c->prof_autostart       = ini_int(ini, L"profiler",  L"autostart", 0);
     c->prof_all_threads_wall= ini_int(ini, L"profiler",  L"wall_clock_all_threads", 0);
+    c->prof_tag_days        = ini_int(ini, L"profiler",  L"tag_days", 0);         // diagnostics
     c->bg_full_speed        = ini_int(ini, L"threads",   L"background_full_speed", 0);
     c->speed5_midtick_ms    = ini_int(ini, L"render",    L"speed5_midtick_frame_ms", 50);
     c->days_per_frame       = ini_int(ini, L"render",    L"speed5_days_per_frame", 1);    // experimental
@@ -215,6 +216,8 @@ static void load_config(void) {
     c->save_stats           = ini_int(ini, L"save",      L"stats", 0);
     c->save_fmt             = ini_int(ini, L"save",      L"fast_format", 0);      // experimental
     c->save_countries       = ini_int(ini, L"save",      L"parallel_countries", 0); // experimental
+    c->save_provinces       = ini_int(ini, L"save",      L"parallel_provinces", 0); // experiment (2026-11-07)
+    c->save_fast_checksum   = ini_int(ini, L"save",      L"fast_checksum", 0);      // experiment (2026-11-10), 2 = + compare with the game's
     c->save_list_cache      = ini_int(ini, L"save",      L"list_cache", 1);
     c->script_fast_vars     = ini_int(ini, L"script",    L"fast_variables", 1);
     c->mod_fast             = ini_int(ini, L"modifiers", L"fast_add", 0);         // experimental
@@ -263,7 +266,14 @@ static void load_config(void) {
         c->test_queue_fail = ini_int(ini, L"test", L"queue_fail", 0);
         c->test_msg_fail = ini_int(ini, L"test", L"msg_fail", 0);
         c->test_rng_count = ini_int(ini, L"test", L"rng_count", 0);
+        c->test_open_log = ini_int(ini, L"test", L"open_log", 0);
     }
+    c->load_warm_files      = ini_int(ini, L"load",      L"warm_files", 0);         // experiment (2026-11-10)
+    c->load_warm_threads    = ini_int(ini, L"load",      L"warm_threads", 0);
+    c->render_alert_refresh_ms = ini_int(ini, L"render", L"alert_refresh_ms", 0);   // experiment (2026-11-10): 0 = every frame as the game does
+    c->render_alert_stats   = ini_int(ini, L"render",    L"alert_stats", 0);
+    c->render_speed5_gap_pct = ini_int(ini, L"render",   L"speed5_gap_pct", 0);     // experiment (2026-11-10): 0 = the game's own pacing
+    c->diag_day_gap         = ini_int(ini, L"diag",      L"day_gap", 0);            // read-only diagnostic (2026-11-10)
     c->load_fast_rng        = ini_int(ini, L"load",      L"fast_rng_replay", 1);    // 1 = on (default since 0.4.12, report 144), 2 = + verify
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
@@ -386,6 +396,7 @@ static void init(void) {
     eb_parallel_install();
     int r_zip = eb_savezip_install();
     eb_savepar_install();
+    eb_savesum_install();
     eb_savelist_install();       // before uitime: in its diagnostics mode it hooks the save list item
     int r_script = eb_script_install();
     int r_mod = eb_modifier_install();
@@ -396,6 +407,9 @@ static void init(void) {
     eb_aiprof_install();
     eb_uitime_install();
     eb_rng_install();
+    eb_warm_install();
+    eb_alerts_install();
+    eb_daygap_install();
     eb_autorun_install();
     int r_crash = eb_crash_install();   // last: its frame counter chains to the other POPS hooks
     eb_playmon_install();
@@ -413,6 +427,8 @@ static void init(void) {
     eb_feature("save_parallel_compress", req.save_par, req.save_par && r_zip, NULL);
     eb_feature("save_fast_format", req.save_fmt, g_cfg.save_fmt, NULL);
     eb_feature("save_parallel_countries", req.save_countries, g_cfg.save_countries, NULL);
+    eb_feature("save_parallel_provinces", req.save_provinces, g_cfg.save_provinces, NULL);
+    eb_feature("save_fast_checksum", req.save_fast_checksum, g_cfg.save_fast_checksum, NULL);
     eb_feature("save_list_cache", req.save_list_cache, g_cfg.save_list_cache, NULL);
     eb_feature("fast_add", req.mod_fast, req.mod_fast && r_mod ? req.mod_fast : 0, NULL);
     eb_feature("fast_search", req.mod_search, req.mod_search && r_mod ? req.mod_search : 0, req.mod_fast ? NULL : "needs fast_add");
@@ -439,6 +455,9 @@ static void init(void) {
     eb_feature("leak_diplo_actions", req.leak_diplo_actions, g_cfg.leak_diplo_actions, NULL);
     eb_feature("leak_message_popups", req.leak_message_popups, g_cfg.leak_message_popups, NULL);
     eb_feature("fast_rng_replay", req.load_fast_rng, g_cfg.load_fast_rng, NULL);
+    eb_feature("warm_files", req.load_warm_files, g_cfg.load_warm_files, NULL);
+    eb_feature("alert_refresh_ms", req.render_alert_refresh_ms, g_cfg.render_alert_refresh_ms, NULL);
+    eb_feature("speed5_gap_pct", req.render_speed5_gap_pct, g_cfg.render_speed5_gap_pct, NULL);
     eb_feature("report_capture", req.report_capture, req.report_capture && r_crash, NULL);
     eb_feature("update_auto", req.update_auto, g_cfg.update_auto, NULL);
     if (req.play_monitor || req.mem_sites || req.ui_timing || req.country_stats || req.par_stats || req.ai_item_stats)
@@ -462,11 +481,15 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         eb_parallel_report();
         eb_savezip_report();
         eb_savepar_report();
+        eb_savesum_report();
         eb_savelist_report();
         eb_script_report();
         eb_modifier_report();
         eb_country_report();
         eb_rng_report();
+        eb_warm_report();
+        eb_alerts_report();
+        eb_daygap_report();
         eb_guard_report();
         eb_leakfix_report();
         eb_playmon_report();

@@ -753,6 +753,7 @@ static uintptr_t hk_rcb(void* a, void* b) {
             ULONGLONG now = unbiased_ms();
             if (g_frame_ms && now - g_frame_ms > g_max_gap) g_max_gap = now - g_frame_ms;
             if (eb_pm_on && g_frame_ms) eb_pm_frame(now - g_frame_ms);
+            if (eb_dg_on) eb_dg_frame();
             g_frames++; g_frame_ms = now;
             if (g_cfg.report_test_keys && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000) &&
                 (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
