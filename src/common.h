@@ -94,10 +94,15 @@ typedef struct {
     int autorun_minimize;         // testing only: 1 = keep the game window minimized during an autorun
     int autorun_offscreen;        // testing only: 1 = keep it drawn off the desktop instead (never activated)
     int autorun_input;            // testing only: with autorun_offscreen, a simulated player with this seed (0 = none)
+    char autorun_script[2048];    // testing only: with autorun_offscreen, a scripted player (autorun.c), the game stays paused
     // console (console.c)
     int console_hotkey;           // 1 = Ctrl+Alt+C unlocks console commands in single-player ironman until the next game start
     // crash guards (guard.c)
     int guard_tooltip;            // 1 = modifier tooltips skip freed/invalid source containers
+    int ai_fast_objectives;       // experiment: 1 = mission objectives that are new skip the search of the AI strategy's list, 2 = + verify
+    int diag_ai_strategy;         // diagnostics: every AI strategy recalculation timed, its objective adds counted
+    int gui_fast_build_list;      // experiment: 1 = the building lists are filled without megabytes of reason text, 2 = + verify, 3 = timed only
+    int guard_tip_in_day;         // 1 = the same check inside the daily tick: the AI asks for breakdowns there (reports 216, 240)
     int guard_relation;           // 1 = a missing relation on annexation is skipped instead of crashing
     int guard_great_project;      // 1 = has_construction triggers that name a great project follow the array when it moves
     int guard_ironman_name;       // 1 = an ironman save name in EU4dll's escapes gets the UTF-8 file name ordinary saves get
@@ -217,6 +222,7 @@ int  eb_savesum_install(void);       // savesum.c: the save checksum's 32-bit su
 void eb_savesum_report(void);
 void eb_savepar_mark(void);              // savezip.c, around every save: what the country loop did
 const char* eb_savepar_status(void);
+const char* eb_guard_hits(void);         // guard.c: the first freed modifier sources met inside the daily tick ("" = none), for the reports
 const char* eb_save_journal(void);       // savezip.c: the session's last saves (crash.c puts it in reports)
 // savelist.c
 int  eb_savelist_install(void);
@@ -228,6 +234,14 @@ void eb_script_report(void);
 // leakfix.c
 int  eb_leakfix_install(void);
 void eb_leakfix_report(void);
+int  eb_aistrat_install(void);            // aistrat.c: [diag] ai_strategy
+void eb_aistrat_report(void);
+int  eb_buildview_install(void);          // buildview.c: [gui] fast_build_list
+void eb_buildview_report(void);
+void eb_buildview_scan(void);             // buildview.c TEST: the building windows' question for every building and province, timed
+int  eb_ai_in_loop(void);                 // aiprof.c: 1 while the parallel AI loop runs
+extern int eb_lf_zombies_on;             // leakfix.c TEST [leaks] subject_modifiers=2: the copies are kept and marked
+int  eb_lf_zombie(const void* p, ULONGLONG* age_ms);   // 0 = not a marked copy, 1 = marked, 2 = marked and past its deletion time (age_ms since then)
 void eb_leakfix_counts(LONG64* copies, LONG64* actions, LONG64* items, LONG64* entries, LONG64* popups);   // deleted so far (playmon.c)
 
 // console.c

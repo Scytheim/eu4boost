@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration of eu4boost (a copy for reference; the one in force is set in
+     SignPath). The artifact is the zip that .github/workflows/build.yml uploads: the one file
+     eu4boost.dll. It is signed only if its product name is "eu4boost" and its product version is
+     the version the workflow read from src/common.h (src/version.rc). -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="eu4boost.dll" product-name="eu4boost" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

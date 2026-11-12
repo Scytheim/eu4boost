@@ -259,6 +259,49 @@ static int hk_zip_deflate(void** zip, void* in, uint8_t* buf, uint64_t buf_size,
 static char g_jl[NJOURNAL][240];
 static int g_jn;                               // lines so far (the ring holds the last NJOURNAL)
 static char g_journal[NJOURNAL * 240 + 128];
+// The file is written by a thread of its own (0.4.14). Until 0.4.13 the main thread made, wrote and
+// closed crash_reports\saves.txt at the end of every save; on a PC whose file operations are slow
+// (report 227: an antivirus or a failing disk, the same PC waits seconds in the game's own file calls)
+// that CloseHandle alone held the game 2 to 11 seconds, 13 times in one session. The main thread now
+// only builds the text and sets an event; a write that is still running when the next save ends is
+// followed by one more with the newest text.
+static SRWLOCK g_jw_lock = SRWLOCK_INIT;       // g_journal while it is rebuilt / copied for the write
+static HANDLE g_jw_event;
+static volatile LONG g_jw_started, g_jw_writes;
+static volatile LONG64 g_jw_max_us;
+static DWORD WINAPI journal_writer(LPVOID unused) {
+    (void)unused;
+    static char copy[sizeof g_journal];
+    wchar_t p[MAX_PATH]; _snwprintf(p, MAX_PATH, L"%lssaves.txt", eb_rep_dir);
+    for (;;) {
+        WaitForSingleObject(g_jw_event, INFINITE);
+        AcquireSRWLockShared(&g_jw_lock);
+        size_t n = strlen(g_journal); memcpy(copy, g_journal, n + 1);
+        ReleaseSRWLockShared(&g_jw_lock);
+        LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+        HANDLE h = CreateFileW(p, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, copy, (DWORD)n, &w, NULL); CloseHandle(h); }
+        QueryPerformanceCounter(&t1);
+        LONG64 us = (LONG64)((double)(t1.QuadPart - t0.QuadPart) * g_qpf_ms * 1000.0);
+        if (us > g_jw_max_us) g_jw_max_us = us;
+        InterlockedIncrement(&g_jw_writes);
+    }
+    return 0;
+}
+static void journal_write_async(void) {
+    if (!g_jw_event) {                         // main thread only (the save runs there)
+        g_jw_event = CreateEventW(NULL, FALSE, FALSE, NULL);   // auto-reset: one write per signal, signals while writing collapse into one
+        if (!g_jw_event) return;
+    }
+    if (!g_jw_started) {
+        HANDLE th = CreateThread(NULL, 0, journal_writer, NULL, 0, NULL);
+        if (!th) return;                       // no thread: the journal stays in memory (reports of this session still have it)
+        SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(th);
+        g_jw_started = 1;
+    }
+    SetEvent(g_jw_event);
+}
 static void game_date(char* out, size_t n) {   // the gamestate's date (speed.c)
     uint8_t* gs = *(uint8_t* volatile*)((uint8_t*)g_exe + 0x233fe78u);
     if (!gs) { snprintf(out, n, "-"); return; }
@@ -275,14 +318,12 @@ static void journal_add(double ms) {
              eb_savepar_status(), ms);
     g_jn++;
     eb_pm_event("save: %.0f ms, %d entries %lld KB -> %lld KB, %s", ms, g_cur_n, (long long)(g_cur_in >> 10), (long long)(g_cur_out >> 10), eb_savepar_status());
+    AcquireSRWLockExclusive(&g_jw_lock);
     int k = snprintf(g_journal, sizeof g_journal, "saves of the session (newest last):\r\n");
     for (int i = g_jn > NJOURNAL ? g_jn - NJOURNAL : 0; i < g_jn && k < (int)sizeof g_journal - 1; i++)
         k += snprintf(g_journal + k, sizeof g_journal - (size_t)k, "%s", g_jl[i % NJOURNAL]);
-    if (g_cfg.report_capture && eb_rep_dir[0]) {
-        wchar_t p[MAX_PATH]; _snwprintf(p, MAX_PATH, L"%lssaves.txt", eb_rep_dir);
-        HANDLE h = CreateFileW(p, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, g_journal, (DWORD)strlen(g_journal), &w, NULL); CloseHandle(h); }
-    }
+    ReleaseSRWLockExclusive(&g_jw_lock);
+    if (g_cfg.report_capture && eb_rep_dir[0]) journal_write_async();
 }
 const char* eb_save_journal(void) { return g_journal; }    // crash.c
 
@@ -490,6 +531,9 @@ int eb_savezip_install(void) {
 }
 
 void eb_savezip_report(void) {
+    if (g_jw_writes)
+        eb_log("save: the save journal file was written %ld times on its own thread, the longest write took %.1f ms (the game did not wait)",
+               (long)g_jw_writes, (double)g_jw_max_us / 1000.0);
     if (!o_zip_deflate) return;
     if (g_entries)
         eb_log("save: %ld zip entries (%ld parallel), compression %.0f ms in total; %ld saves, %.0f ms in total",

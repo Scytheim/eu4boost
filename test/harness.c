@@ -299,6 +299,11 @@ static int tip_run(unsigned char* c, unsigned long long* visited);
 static void tip_tick_valid(void* c) { tick_total = tip_run((unsigned char*)c, &tick_visited); }
 static void tip_tick_reused(void* c) { tick_total = tip_run((unsigned char*)c, &tick_visited); }
 static void tick_then_mid(void* c) { tick_body = (tick_fn_t)(void*)tip_tick_reused; t_midtick(c, 0, NULL, 0); }
+static DWORD WINAPI tip_worker(LPVOID c) { tick_total = tip_run((unsigned char*)c, &tick_visited); return 0; }
+static void tip_tick_worker(void* c) {          // the main thread is inside the tick while a worker asks for the breakdown
+    HANDLE th = CreateThread(NULL, 0, tip_worker, c, 0, NULL);
+    WaitForSingleObject(th, INFINITE); CloseHandle(th);
+}
 static void gp_test(void);
 // ---- the diplomacy reset (guard.c hk_diplo_clear): FUN_1404e0d90 and RemActive as the game has them ----
 typedef struct dnode { struct drel* rel; struct dnode *prev, *next; unsigned char pending, freed, pad[6]; } dnode;
@@ -423,6 +428,24 @@ static void guard_test(void) {
     tick_body = (tick_fn_t)(void*)tick_then_mid; t_day(root2);   // daily tick -> mid-tick frame -> tooltip with a reused source
     printf("guard: mid-tick frame visited %llu total %d\n", tick_visited, tick_total);
     CHECK(tick_visited == 3 && tick_total == 31);
+    // 0.4.14 ([guard] modifier_in_tick, reports 216 / 240): inside the daily tick a reused source is taken out of
+    // the vector for good (its slot becomes NULL, the vector itself stays), on the main thread and on a worker
+    float* g4 = malloc(0x200); for (int i = 0; i < 0x80; i++) g4[i] = 1234.5f + (float)i;
+    void* s4[3] = { a, g4, b };
+    unsigned char* root4 = tip_new(NULL, 0, 7, 1, s4, 3);
+    void** v4 = ((void***)(root4 + 0x38))[0];
+    tick_body = (tick_fn_t)(void*)tip_tick_reused; t_day(root4);
+    printf("guard: daily tick, reused source: visited %llu total %d, slot %s\n", tick_visited, tick_total, v4[1] ? "kept" : "NULL");
+    CHECK(tick_visited == 3 && tick_total == 31 && v4[0] == a && v4[1] == NULL && v4[2] == b && ((void***)(root4 + 0x38))[1] == v4 + 3);
+    tick_body = (tick_fn_t)(void*)tip_tick_valid; t_day(g);      // the container itself is garbage: empty text and total
+    printf("guard: daily tick, invalid container: visited %llu total %d\n", tick_visited, tick_total);
+    CHECK(tick_visited == 0 && tick_total == 0);
+    float* g5 = malloc(0x200); for (int i = 0; i < 0x80; i++) g5[i] = 77.25f + (float)i;
+    void* s5[3] = { g5, a, b };
+    unsigned char* root5 = tip_new(NULL, 0, 7, 1, s5, 3);
+    tick_body = (tick_fn_t)(void*)tip_tick_worker; t_day(root5);
+    printf("guard: daily tick, worker thread: visited %llu total %d, slot %s\n", tick_visited, tick_total, ((void***)(root5 + 0x38))[0][0] ? "kept" : "NULL");
+    CHECK(tick_visited == 3 && tick_total == 31 && ((void***)(root5 + 0x38))[0][0] == NULL);
     tick_body = NULL;
     // a missing relation is skipped, a real one still runs
     unsigned char rel[0x40] = { 0 };

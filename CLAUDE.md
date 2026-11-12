@@ -67,6 +67,16 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
   - 다음: 날짜 사이에 일시정지 표시(+0x48)를 누가 켜는지, 216번 보고 확인.
 - 11-11: 0.4.13 준비(사용자 결정): 배포 ini에 중간 렌더 20ms(0.4.12까지 50), `alert_refresh_ms=100`, `parallel_provinces=1`, `fast_checksum=1`, `warm_files=1`. 코드 기본값은 0 그대로라 자동 업데이트 사용자는 ini를 바꿔야 켜짐(README에 안내). 릴리스 zip의 DLL로 safe_run 시험 4가지 PASS(새 ini 스페인·바닐라, 0.4.12 ini, 저장 비교 모드).
 - 11-11: **0.4.13 배포**(5배속 중간 렌더 20ms + 알림 줄이기 + 저장 프로빈스 병렬·빠른 합계 + 시작 때 파일 미리 열기, 공개 cb65b45, 릴리스 자산 zip 하나, 설명 비움). 게임 폴더 = 0.4.13 배포 DLL + 사용자 플레이 ini(배포 값 + 진단). 다음 후보: 날짜 사이 일시정지 표시의 원인, 216번 보고 확인, 0.4.13 보고에서 `warm:` 줄(다른 PC·HDD에서의 효과) 보기.
+- 11-11 낮(커밋 전): 보고 222~250번 검토(ANALYSIS_LOG). 플러그인 쪽 둘을 고침. (1) 227번: 저장마다 `crash_reports\saves.txt`를 메인 스레드에서 쓰던 것(한 PC에서 닫는 데 2~11초씩 13번 멈춤) → 전용 스레드가 씀. (2) 216·240번(AI 외교 장관이 하루 처리 안에서 나라 주 합계의 내역을 읽다 해제된 출처에서 튕김): 원인은 못 가렸다. `subject_modifiers` 탓이라는 가설은 10년 시험(표시만 하는 `subject_modifiers=2`: 4,620만 번 중 0번)과 구조로 맞지 않았고, AI 루프 중 컨테이너 재생성도 0번. `[guard] modifier_in_tick`(코드 기본 1)을 넣음: 하루 처리 안에서도 컨테이너와 직접 출처를 검사하고 나쁜 출처 칸을 NULL로(검사 한 번 약 45ns, 날짜 속도 약 0.5%). 걸린 사건의 첫 6건은 보고서에도 들어감. 단위 시험 33개, 게임 시험(10년 둘 포함) 모두 PASS. 다음: 사용자 플레이 확인 뒤 0.4.14 배포 여부 결정, 세이브 목록 열기 줄이기(23대 268건).
+- 11-11 오후(커밋 전): 건물 창 렉(사용자, 짭짭죽). 원인 = 건물 목록을 채우는 FUN_14124fc80이 건물마다 모든 프로빈스에 "지을 수 있나"를 물으며 이유 글을 앞 프로빈스 글 뒤에 계속 덧붙임(건물 하나에 최대 4MB, 전체 37~44MB, 실패한 프로빈스마다 전체 복사). 스페인 1704에서 채우기 한 번 0.65~1.1초, 같은 프로빈스 창을 열어 두면 채울 때마다 늘어 9.5초까지. 다른 사용자의 멈칫 eu4.exe+0x124d7e7(4대 32건)과 같음. 실험 `[gui] fast_build_list`(src/buildview.c, 코드 기본 0, 2 = 검증, 3 = 시간만): 글이 4KB를 넘으면 글 없이 묻고 이미 지을 곳을 찾은 건물은 묻지 않음 → 채우기 4~12ms, 상태·비용 같음(검증 2,829개 항목 불일치 0). 화면 밖 창을 키·클릭으로 조작하고 화면을 찍는 시험 스크립트 `[test] autorun_script`(autorun.c) 추가.
+- 11-12 새벽(커밋 전): 사용자 판에서 1871년부터 해마다 11월 11일 6초 멈춤("응답 없음"). 원인 = 플레이어 나라의 CAIStrategy::Recalculate가 미션 조건에서 나온 목표(건물 이름 × 프로빈스 약 2,200개 = 43,361개)를 전략 +0x280의 연결 목록에 넣을 때 FUN_14017f900이 매번 목록 전체를 훑음(9억 4천만 걸음, 5.6초). 실험 `[ai] fast_objectives`(src/aistrat.c, 코드 기본 0, 2 = 검증): 목록에 없는 게 확실한 목표는 훑지 않고 게임 함수로 바로 추가 → 그 다시 계산이 50ms 미만, 검증 56,660번 불일치 0. 진단 `[diag] ai_strategy=1`(다시 계산마다 시간·추가 수·이름).
+- 11-12 낮(커밋 전): 다른 사용자 제보 — Windows 11 스마트 앱 컨트롤이 서명 없는 `eu4boost.dll` 로드를 막음(0.4.12, CodeIntegrity 이벤트 3077). 통과 조건은 Authenticode 서명뿐이라(MS 검토 제도 없음, 평판은 파일마다 새로) 무료 서명(SignPath Foundation) 신청을 준비함. 아직 신청 전.
+  - DLL에 버전 정보: `src/version.rc`(제품 이름 `eu4boost`, 버전 = EU4BOOST_VERSION. 빌드 스크립트가 `build/version_gen.h`를 만들고 windres로 컴파일). SignPath가 서명 전에 이 둘을 확인한다.
+  - GitHub 자동 빌드 `.github/workflows/build.yml`: windows-2025, llvm-mingw 20261006을 해시 확인 후 사용(이 PC와 같은 버전), 캐시 없음, 액션은 커밋으로 고정. main에 올리면 빌드+테스트, 손으로 돌리며 `sign`을 켜면 SignPath에 서명 요청(조직 ID는 저장소 변수 `SIGNPATH_ORGANIZATION_ID`, 토큰은 비밀 `SIGNPATH_API_TOKEN` — 사용자가 GitHub에 직접 넣음). **GitHub에서 돌려 본 적은 아직 없다**(올린 뒤 첫 실행에서 확인).
+  - 같은 소스면 같은 DLL: mimalloc 메시지의 `__DATE__/__TIME__`을 `SOURCE_DATE_EPOCH=0`으로 고정 → 빌드끼리 링크 시각 4바이트만 다름(같은 폴더 두 번, 다른 폴더, PowerShell 빌드 모두 확인).
+  - `tools/pe_check.py` + release.sh의 `EB_SIGNED_DLL`: 서명된 DLL에 서명이 있고 Windows가 유효하다고 하는지, 버전이 맞는지, 서명·링크 시각을 빼면 로컬 빌드와 같은지 확인한 뒤에만 zip에 넣는다. 업데이트 서명(zip 주석)은 그 뒤, 서명된 DLL로 만든다.
+  - README: "Code signing policy" 절(필수 문구, 역할, 개인정보 요약 — 상태는 "신청 준비 중"으로 적음), 스마트 앱 컨트롤 안내.
+  - 걸림돌: 저장소가 3주 됐고 별 0개(릴리스 내려받기 합계 1,206번)라 "알려진 프로젝트" 심사에서 떨어질 수 있다. 신청·계정·2단계 인증은 사용자가 한다.
 - 다음 일: HANDOFF.md §9(0번: 커밋·기본값은 사용자 결정 대기).
 
 ## 사용자
@@ -78,7 +88,8 @@ EU4dll 플러그인 로더(`plugins\*.dll`)로 게임 시작 직후 로드되는
 sh build.sh                   # → build/eu4boost.dll. Windows(Git Bash): <도구 폴더>\llvm-mingw-* 자동 사용, WSL/Linux: clang + lld + mingw-w64
 sh test/run_tests.sh          # 스모크 테스트 33개 (build.sh 먼저). Windows는 바로 실행, Linux는 Wine. 끝 줄 "all 33 cases passed"
 node test/worker_test.mjs     # 크래시 보고 중간 서버(worker/crash-report.js)를 가짜 GitHub로 시험
-sh tools/release.sh           # 릴리스 파일(zip, eu4boost.dll, .sha256) → build/release/v버전/ (버전에 -dev가 없어야 함)
+sh tools/release.sh           # 릴리스 zip → build/release/eu4boost_v버전.zip (버전에 -dev가 없어야 함)
+EB_SIGNED_DLL=build/signed/eu4boost.dll sh tools/release.sh   # 코드 서명된 DLL로 릴리스(절차는 스크립트 첫머리, 검사는 tools/pe_check.py)
 powershell -File build_windows.ps1   # PowerShell 빌드 (build.sh와 같은 코드)
 python tools/re/fn.py 14093fe30                 # Ghidra 디컴파일 보기 (EU4_DECOMP)
 python tools/re/disasm.py 0x140179e90 300       # 디스어셈블 (EU4_EXE)

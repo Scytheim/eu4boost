@@ -338,6 +338,7 @@ static int help_one(void) {
 }
 
 // parallel.c: the main thread waiting for a loop's last items
+int eb_ai_in_loop(void) { return g_ai_loop_active; }       // guard.c: the parallel AI loop is running (0 when it is not hooked)
 static int ai_help(void) { return g_ai_loop_active && help_one(); }
 
 // parallel.c: a worker that found no more items; in the AI loop it stays to take army jobs until the

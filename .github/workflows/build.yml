@@ -1,0 +1,110 @@
+# Builds eu4boost.dll from this repository on a GitHub-hosted runner and runs the smoke tests.
+#
+# Release builds are code-signed through SignPath (README.md, "Code signing policy"): run this
+# workflow by hand on main with "sign" ticked; the signing request then waits for the approval of
+# the maintainer in SignPath. The signed DLL is the artifact "eu4boost-signed"; tools/release.sh
+# (EB_SIGNED_DLL) checks it against a local build of the same commit and makes the release zip.
+#
+# The build is fully described by this file and the repository: nothing is cached, the compiler is
+# one llvm-mingw release checked by its SHA-256 (the same release as on the maintainer's PC), and
+# the actions are pinned by commit.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: "Release build: submit eu4boost.dll to SignPath for code signing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  LLVM_MINGW_NAME: llvm-mingw-20261006-msvcrt-x86_64
+  LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-msvcrt-x86_64.zip
+  LLVM_MINGW_SHA256: 24847b37a951c8583c3f7ec061de2eb87f6394215c8ef3fdc4565ed0835396e1
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compiler (pinned llvm-mingw)
+        run: |
+          cd "$(cygpath -u "$RUNNER_TEMP")"
+          curl -fsSL --retry 3 -o llvm-mingw.zip "$LLVM_MINGW_URL"
+          echo "$LLVM_MINGW_SHA256 *llvm-mingw.zip" | sha256sum -c -
+          unzip -q llvm-mingw.zip
+          "$LLVM_MINGW_NAME/bin/clang" --version
+
+      - name: Version
+        id: version
+        run: |
+          v=$(sed -n 's/^#define EU4BOOST_VERSION "\(.*\)"$/\1/p' src/common.h)
+          [ -n "$v" ] || { echo "no EU4BOOST_VERSION in src/common.h"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "eu4boost $v"
+
+      - name: Build
+        run: |
+          export LLVM_MINGW="$(cygpath -u "$RUNNER_TEMP")/$LLVM_MINGW_NAME"
+          sh build.sh
+          sha256sum build/eu4boost.dll
+
+      - name: Test
+        run: |
+          export LLVM_MINGW="$(cygpath -u "$RUNNER_TEMP")/$LLVM_MINGW_NAME"
+          sh test/run_tests.sh
+
+      - name: Upload eu4boost.dll (not signed)
+        id: upload-unsigned-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eu4boost-unsigned
+          path: build/eu4boost.dll
+          if-no-files-found: error
+
+      # Signing: only a release version, only from main, only when started by hand.
+      - name: Check that this is a release build
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "signing is only for main, not $GITHUB_REF"; exit 1; }
+          case "$VERSION" in *-dev*) echo "$VERSION is a development version: not signed"; exit 1 ;; esac
+
+      - name: Submit the signing request (SignPath)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign }}
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: eu4boost
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.upload-unsigned-artifact.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+          parameters: |
+            version: "${{ steps.version.outputs.version }}"
+
+      - name: Upload eu4boost.dll (signed)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eu4boost-signed
+          path: signed/eu4boost.dll
+          if-no-files-found: error

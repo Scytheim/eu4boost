@@ -119,9 +119,70 @@ static size_t g_ndead, g_dead_head, g_dead_cap;
 static volatile LONG g_waiting;             // g_ndead - g_dead_head, read without the lock
 static volatile LONG64 g_copies_freed, g_copies_max_waiting;
 
+// TEST subject_modifiers=2 (reports 216, 240: does a modifier sum still point at a copy after mode 1
+// deleted it?): the copies are not deleted - as in the game without this fix - but put in a set with
+// the time their container was destroyed. guard.c's breakdown hook asks eb_lf_zombie for every
+// container it enters and counts the ones past the time mode 1 would have deleted them.
+int eb_lf_zombies_on;
+typedef struct { uintptr_t p; ULONGLONG t; } zomb_t;
+static zomb_t* g_z;                         // open addressing, capacity a power of two, at most half full
+static size_t g_zcap, g_zn;
+static SRWLOCK g_zlock = SRWLOCK_INIT;
+static size_t z_slot(const zomb_t* tab, size_t cap, uintptr_t p) {
+    size_t h = (size_t)(((uint64_t)(p >> 4) * 0x9E3779B97F4A7C15ull) >> 24) & (cap - 1);
+    while (tab[h].p && tab[h].p != p) h = (h + 1) & (cap - 1);
+    return h;
+}
+static void zombies_add(void** b, void** e, ULONGLONG now) {
+    AcquireSRWLockExclusive(&g_zlock);
+    size_t need = (g_zn + (size_t)(e - b)) * 2;
+    if (need > g_zcap) {
+        size_t cap = g_zcap ? g_zcap : 1 << 16;
+        while (cap < need) cap *= 2;
+        zomb_t* t = (zomb_t*)VirtualAlloc(NULL, cap * sizeof *t, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   // zeroed
+        if (t) {
+            for (size_t i = 0; i < g_zcap; i++) if (g_z[i].p) t[z_slot(t, cap, g_z[i].p)] = g_z[i];
+            if (g_z) VirtualFree(g_z, 0, MEM_RELEASE);
+            g_z = t; g_zcap = cap;
+        }
+    }
+    for (void** q = b; q < e && (g_zn + 1) * 2 <= g_zcap; q++)
+        if (*q) { size_t h = z_slot(g_z, g_zcap, (uintptr_t)*q); if (!g_z[h].p) g_zn++; g_z[h].p = (uintptr_t)*q; g_z[h].t = now; }
+    ReleaseSRWLockExclusive(&g_zlock);
+}
+int eb_lf_zombie(const void* p, ULONGLONG* age_ms) {
+    int r = 0;
+    AcquireSRWLockShared(&g_zlock);
+    if (g_zn) {
+        size_t h = z_slot(g_z, g_zcap, (uintptr_t)p);
+        if (g_z[h].p) {
+            ULONGLONG since = GetTickCount64() - g_z[h].t;
+            r = since >= DELAY_MS ? 2 : 1;
+            if (age_ms) *age_ms = since >= DELAY_MS ? since - DELAY_MS : 0;
+        }
+    }
+    ReleaseSRWLockShared(&g_zlock);
+    return r;
+}
+
+// A country's modifiers are rebuilt (this destructor, then the build) while the parallel AI loop runs? Then another
+// AI thread can be reading that country's sums at the same moment - the game checks the "calculating" state only
+// before it starts to read (FUN_14093d750). Counted for reports 216 / 240; nothing is changed.
+static volatile LONG64 g_dtor_calls, g_dtor_in_ai, g_dtor_in_ai_worker;
+
 static void hk_cont_dtor(uint8_t* c) {
     void** b = *(void***)(c + OFF_COPIES);
     void** e = *(void***)(c + OFF_COPIES + 8);
+    g_dtor_calls++;
+    if (eb_ai_in_loop()) {
+        InterlockedIncrement64(&g_dtor_in_ai);
+        if (GetCurrentThreadId() != g_main_tid) InterlockedIncrement64(&g_dtor_in_ai_worker);
+    }
+    if (eb_lf_zombies_on) {
+        if (b && e > b && e - b < 100000) zombies_add(b, e, GetTickCount64());
+        o_cont_dtor(c);
+        return;
+    }
     if (b == e && !g_waiting) { o_cont_dtor(c); return; }   // most calls: no copies made, none waiting
     ULONGLONG now = GetTickCount64();
     void* due[64];
@@ -321,7 +382,11 @@ int eb_leakfix_install(void) {
         if (memcmp(b + RVA_CONT_DTOR, sig_cont_dtor, sizeof sig_cont_dtor) || memcmp(b + RVA_COPY_NEW, sig_copy_new, sizeof sig_copy_new) ||
             memcmp(b + RVA_COPY_PUSH, sig_copy_push, sizeof sig_copy_push)) eb_log("leaks: subject_modifiers signature mismatch - off");
         else if (hook(b + RVA_CONT_DTOR, (void*)hk_cont_dtor, &o_cont_dtor, "subject_modifiers")) {
-            eb_log("leaks: the modifier copies a country keeps from related countries are deleted %d ms after its next recalculation", DELAY_MS);
+            if (g_cfg.leak_subject_modifiers == 2) {
+                eb_lf_zombies_on = 1;
+                eb_log("leaks: TEST subject_modifiers=2: the modifier copies are kept (not deleted) and marked; the breakdown counts the marked copies it enters");
+            } else
+                eb_log("leaks: the modifier copies a country keeps from related countries are deleted %d ms after its next recalculation", DELAY_MS);
             n++;
         }
         if (!o_cont_dtor) g_cfg.leak_subject_modifiers = 0;
@@ -376,6 +441,10 @@ void eb_leakfix_counts(LONG64* copies, LONG64* actions, LONG64* items, LONG64* e
 }
 
 void eb_leakfix_report(void) {
+    if (g_dtor_calls)
+        eb_log("leaks: country modifier containers were destroyed for a rebuild %lld times, %lld of them while the AI loop ran (%lld on worker threads)",
+               (long long)g_dtor_calls, (long long)g_dtor_in_ai, (long long)g_dtor_in_ai_worker);
+    if (eb_lf_zombies_on) eb_log("leaks: TEST subject_modifiers=2: %lld modifier copies kept and marked", (long long)g_zn);
     if (o_cont_dtor || eb_lf_fm_tramp || o_prov_list || o_diplo_list || o_msg_new)
         eb_log("leaks: deleted %lld modifier copies (at most %lld waiting) and %lld AI action candidates, %lld province view lines not made, "
                "%lld diplomatic action entries and %lld message popups deleted",

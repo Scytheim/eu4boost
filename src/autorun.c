@@ -13,6 +13,7 @@
 // or kept drawn off the desktop with a simulated player ([test] autorun_offscreen=1, autorun_input=seed).
 #include "common.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <intrin.h>
 #include "MinHook.h"
@@ -297,6 +298,132 @@ static DWORD WINAPI player(LPVOID p) {
     return 0;
 }
 
+// ---- a scripted player ([test] autorun_script, with autorun_offscreen) ----
+// For lag that needs a certain window open (2026-11-11: the building windows with 짭짭죽's many buildings): the game
+// stays paused after the load and a script drives it through the same posted input as the simulated player.
+// Commands, separated by ';':  wait MS | key K (A-Z, 0-9, F1-F12, SPACE, ESC, ENTER, TAB, or 0xNN) | move X Y |
+// click X Y | rclick X Y | wheel N | shot NAME [DIV [X Y W H]] (the window, or a part of it, to
+// plugins\eu4boost_shot_NAME.bmp, scaled down by DIV) | fps NAME MS (frame times over MS ms, logged) |
+// scan (buildview.c: every building x every province, timed) | fr0 (start counting long frames) | fr NAME (the longest frame and the long ones since fr0, logged) |
+// prof (Ctrl+Alt+P for the profiler thread only) | log TEXT | run (unpause at speed 5, as without a script) | end.
+// X and Y are client pixels of the game window.
+static volatile LONG g_script_run;                         // the script said "run": the usual autopilot from here
+static volatile LONG g_script_scan;                        // "scan": the main thread runs eb_buildview_scan (game functions run there)
+static volatile LONG g_fr_n, g_fr_hist[258];               // frame intervals in ms since the last reset (257 = longer)
+static volatile LONGLONG g_fr_prev;
+static double g_fr_ms;
+static volatile LONG g_fr_max_us, g_fr_over[3];            // since "fr0": the longest frame, frames over 250 ms / 1 s / 3 s
+static void fr_note(void) {                                // main thread, every frame
+    LONGLONG t = qnow();
+    if (g_fr_prev) {
+        double ms = (double)(t - g_fr_prev) * g_fr_ms;
+        int b = ms >= 257.0 ? 257 : (int)ms;
+        g_fr_hist[b]++; g_fr_n++;
+        if (ms * 1000.0 > (double)g_fr_max_us) g_fr_max_us = (LONG)(ms * 1000.0);
+        if (ms >= 250.0) g_fr_over[0]++;
+        if (ms >= 1000.0) g_fr_over[1]++;
+        if (ms >= 3000.0) g_fr_over[2]++;
+    }
+    g_fr_prev = t;
+}
+static void shot(const char* name, int div, int x, int y, int w, int h) {
+    int W = g_cw, H = g_ch;
+    if (div < 1) div = 1;
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > W || y + h > H) { x = 0; y = 0; w = W; h = H; }
+    HDC wdc = GetDC(g_win);
+    HDC mdc = CreateCompatibleDC(wdc);
+    HBITMAP bm = CreateCompatibleBitmap(wdc, W, H);
+    HGDIOBJ old = SelectObject(mdc, bm);
+    BOOL ok = PrintWindow(g_win, mdc, 1 | 2);              // PW_CLIENTONLY | PW_RENDERFULLCONTENT (the composed picture)
+    int ow = w / div, oh = h / div;
+    BITMAPINFO bi; memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = ow; bi.bmiHeader.biHeight = oh;   // bottom-up, as a .bmp is
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HDC sdc = CreateCompatibleDC(wdc);
+    HBITMAP sb = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HGDIOBJ old2 = SelectObject(sdc, sb);
+    SetStretchBltMode(sdc, HALFTONE);
+    StretchBlt(sdc, 0, 0, ow, oh, mdc, x, y, w, h, SRCCOPY);
+    GdiFlush();
+    DWORD stride = ((DWORD)ow * 3 + 3) & ~3u, size = stride * (DWORD)oh;
+    wchar_t path[MAX_PATH]; _snwprintf(path, MAX_PATH, L"%lseu4boost_shot_%hs.bmp", g_dir, name);
+    HANDLE f = bits ? CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+    if (f != INVALID_HANDLE_VALUE) {
+        BITMAPFILEHEADER fh; memset(&fh, 0, sizeof fh);
+        fh.bfType = 0x4d42; fh.bfOffBits = sizeof fh + sizeof(BITMAPINFOHEADER); fh.bfSize = fh.bfOffBits + size;
+        bi.bmiHeader.biSizeImage = size;
+        DWORD wr; WriteFile(f, &fh, sizeof fh, &wr, NULL); WriteFile(f, &bi.bmiHeader, sizeof(BITMAPINFOHEADER), &wr, NULL); WriteFile(f, bits, size, &wr, NULL);
+        CloseHandle(f);
+    }
+    eb_log("autorun: script shot %s: %dx%d of the window at %d,%d -> %dx%d (%s)", name, w, h, x, y, ow, oh, ok && f != INVALID_HANDLE_VALUE ? "written" : "FAILED");
+    SelectObject(sdc, old2); DeleteObject(sb); DeleteDC(sdc);
+    SelectObject(mdc, old); DeleteObject(bm); DeleteDC(mdc); ReleaseDC(g_win, wdc);
+}
+static int vk_of(const char* s) {
+    if (!_stricmp(s, "SPACE")) return VK_SPACE;
+    if (!_stricmp(s, "ESC")) return VK_ESCAPE;
+    if (!_stricmp(s, "ENTER")) return VK_RETURN;
+    if (!_stricmp(s, "TAB")) return VK_TAB;
+    if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '1' && s[1] <= '9') { int n = atoi(s + 1); if (n >= 1 && n <= 12) return VK_F1 + n - 1; }
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return (int)strtol(s, NULL, 16);
+    if (s[0] && !s[1]) { char c = s[0]; if (c >= 'a' && c <= 'z') c = (char)(c - 32); return (unsigned char)c; }
+    return 0;
+}
+static DWORD WINAPI scripted(LPVOID p) {
+    (void)p;
+    while (!g_closed && (!g_started || !g_win)) Sleep(200);
+    Sleep(3000);
+    eb_log("autorun: script starts: %s", g_cfg.autorun_script);
+    char buf[sizeof g_cfg.autorun_script]; strncpy(buf, g_cfg.autorun_script, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    char* save = NULL;
+    for (char* cmd = strtok_s(buf, ";", &save); cmd && !g_closed; cmd = strtok_s(NULL, ";", &save)) {
+        while (*cmd == ' ') cmd++;
+        char op[16] = { 0 }, a1[64] = { 0 }; int v[6] = { 0 };
+        int n = sscanf(cmd, "%15s %63s %d %d %d %d %d", op, a1, &v[1], &v[2], &v[3], &v[4], &v[5]);
+        if (n < 1) continue;
+        int x = atoi(a1);
+        if (!strcmp(op, "wait")) Sleep((DWORD)x);
+        else if (!strcmp(op, "key")) { int vk = vk_of(a1); if (vk) { key(vk, 1); Sleep(60); key(vk, 0); } else eb_log("autorun: script: unknown key %s", a1); }
+        else if (!strcmp(op, "move")) move_to(x, v[1], 6, 150);
+        else if (!strcmp(op, "click") || !strcmp(op, "rclick")) { move_to(x, v[1], 6, 150); Sleep(120); click(op[0] == 'r'); }
+        else if (!strcmp(op, "wheel")) wheel(x);
+        else if (!strcmp(op, "shot")) shot(a1, n >= 3 ? v[1] : 3, v[2], v[3], v[4], v[5]);
+        else if (!strcmp(op, "prof")) {                    // the profiler thread reads its hotkey through the hooked GetAsyncKeyState
+            g_keys[VK_CONTROL] = g_keys[VK_MENU] = g_keys['P'] = 1; Sleep(300); g_keys[VK_CONTROL] = g_keys[VK_MENU] = g_keys['P'] = 0;
+            eb_log("autorun: script: profiler hotkey");
+        }
+        else if (!strcmp(op, "log")) eb_log("autorun: script: %s", cmd + 4);
+        else if (!strcmp(op, "fps")) {
+            for (int i = 0; i < 258; i++) g_fr_hist[i] = 0;
+            g_fr_n = 0;
+            int ms = v[1] > 0 ? v[1] : 5000;
+            Sleep((DWORD)ms);
+            LONG total = 0, h[258]; for (int i = 0; i < 258; i++) { h[i] = g_fr_hist[i]; total += h[i]; }
+            int p50 = -1, p90 = -1, p99 = -1, mx = 0; LONG acc = 0;
+            for (int i = 0; i < 258; i++) {
+                acc += h[i];
+                if (h[i]) mx = i;
+                if (p50 < 0 && acc * 2 >= total) p50 = i;
+                if (p90 < 0 && acc * 10 >= total * 9) p90 = i;
+                if (p99 < 0 && acc * 100 >= total * 99) p99 = i;
+            }
+            eb_log("autorun: script fps %s: %ld frames in %d ms = %.1f fps (%.1f ms a frame; median %d ms, 90%% %d ms, 99%% %d ms, longest %d%s ms)",
+                   a1, (long)total, ms, total * 1000.0 / ms, total ? (double)ms / total : 0.0, p50, p90, p99, mx, mx >= 257 ? "+" : "");
+        }
+        else if (!strcmp(op, "fr0")) { g_fr_max_us = 0; g_fr_over[0] = g_fr_over[1] = g_fr_over[2] = 0; g_fr_n = 0; }
+        else if (!strcmp(op, "fr"))
+            eb_log("autorun: script frames %s: %ld frames since fr0, the longest %.0f ms; over 250 ms %ld, over 1 s %ld, over 3 s %ld",
+                   a1, (long)g_fr_n, g_fr_max_us / 1000.0, (long)g_fr_over[0], (long)g_fr_over[1], (long)g_fr_over[2]);
+        else if (!strcmp(op, "scan")) { g_script_scan = 1; while (g_script_scan && !g_closed) Sleep(50); }
+        else if (!strcmp(op, "run")) g_script_run = 1;
+        else if (!strcmp(op, "end")) { g_script_run = 2; break; }
+        else eb_log("autorun: script: unknown command %s", op);
+    }
+    if (g_script_run != 1) g_script_run = 2;               // the main thread closes the game (close_game is its job)
+    return 0;
+}
+
 static BOOL CALLBACK min_cb(HWND h, LPARAM l) {
     DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
     if (pid == GetCurrentProcessId() && IsWindowVisible(h) && !GetWindow(h, GW_OWNER) && !IsIconic(h) &&
@@ -316,6 +443,7 @@ static DWORD WINAPI min_thread(LPVOID p) {
 }
 
 void eb_autorun_frame(void) {
+    if (g_cfg.autorun_script[0]) fr_note();
     if (!g_loaded || g_closed) return;
     uint8_t* gs = *g_gs;
     if (!gs) return;
@@ -324,9 +452,15 @@ void eb_autorun_frame(void) {
     if (!g_started) {
         g_started = 1; g_start_date = g_last_date = date; g_last_change = g_t_start = now;
         char a[16]; fmt_date(date, a, sizeof a);
+        if (g_cfg.autorun_script[0] && g_off) { eb_log("autorun: game loaded at %s - left paused for the script", a); return; }
         eb_log("autorun: game loaded at %s - unpaused at speed 5", a);
         run(); g_kicks++;
         return;
+    }
+    if (g_cfg.autorun_script[0] && g_off) {
+        if (g_script_scan == 1) { eb_buildview_scan(); g_script_scan = 0; }
+        if (g_script_run == 2) { close_game("the script ended"); return; }
+        if (!g_script_run) { g_last_change = now; return; }     // paused on purpose: no "stuck", no unpausing
     }
     if (date != g_last_date) { g_last_date = date; g_last_change = g_next_kick = now; }
     if (date >= g_cfg.autorun_until) { close_game("reached the end date"); return; }
@@ -366,6 +500,11 @@ int eb_autorun_install(void) {
             if (g_cfg.autorun_input) {
                 g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(unsigned)g_cfg.autorun_input;
                 h = CreateThread(NULL, 0, player, NULL, 0, NULL); if (h) CloseHandle(h);
+            }
+            if (g_cfg.autorun_script[0]) {
+                LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_fr_ms = 1000.0 / (double)f.QuadPart;
+                g_rng = 0x9E3779B97F4A7C15ull;
+                h = CreateThread(NULL, 0, scripted, NULL, 0, NULL); if (h) CloseHandle(h);
             }
             eb_log("autorun: TEST off-screen window%s", g_cfg.autorun_input ? " with a simulated player" : "");
         }

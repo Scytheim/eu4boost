@@ -253,6 +253,9 @@ static void load_config(void) {
         c->autorun_minimize = ini_int(ini, L"test", L"autorun_minimize", 1);
         c->autorun_offscreen = ini_int(ini, L"test", L"autorun_offscreen", 0);
         c->autorun_input = ini_int(ini, L"test", L"autorun_input", 0);
+        { wchar_t ws[2048]; GetPrivateProfileStringW(L"test", L"autorun_script", L"", ws, 2048, ini);
+          WideCharToMultiByte(CP_ACP, 0, ws, -1, c->autorun_script, sizeof c->autorun_script, NULL, NULL);
+          c->autorun_script[sizeof c->autorun_script - 1] = 0; }
         c->test_warview = ini_int(ini, L"test", L"warview", 0);
         c->test_ironman_name = ini_int(ini, L"test", L"ironman_name", 0);
         c->test_loc_fiber = ini_int(ini, L"test", L"loc_fiber", 0);
@@ -274,9 +277,13 @@ static void load_config(void) {
     c->render_alert_stats   = ini_int(ini, L"render",    L"alert_stats", 0);
     c->render_speed5_gap_pct = ini_int(ini, L"render",   L"speed5_gap_pct", 0);     // experiment (2026-11-10): 0 = the game's own pacing
     c->diag_day_gap         = ini_int(ini, L"diag",      L"day_gap", 0);            // read-only diagnostic (2026-11-10)
+    c->gui_fast_build_list  = ini_int(ini, L"gui",       L"fast_build_list", 0);    // experiment (2026-11-11), 2 = + verify, 3 = timed only
+    c->diag_ai_strategy     = ini_int(ini, L"diag",      L"ai_strategy", 0);        // read-only diagnostic (2026-11-11)
+    c->ai_fast_objectives   = ini_int(ini, L"ai",        L"fast_objectives", 0);    // experiment (2026-11-12), 2 = + verify
     c->load_fast_rng        = ini_int(ini, L"load",      L"fast_rng_replay", 1);    // 1 = on (default since 0.4.12, report 144), 2 = + verify
     c->console_hotkey       = ini_int(ini, L"console",   L"ironman_hotkey", 0);
     c->guard_tooltip        = ini_int(ini, L"guard",     L"tooltip", 1);
+    c->guard_tip_in_day     = ini_int(ini, L"guard",     L"modifier_in_tick", 1);   // 0.4.14 (reports 216, 240); needs tooltip=1
     c->guard_relation       = ini_int(ini, L"guard",     L"relation", 1);
     c->guard_great_project  = ini_int(ini, L"guard",     L"great_project", 1);
     c->guard_ironman_name   = ini_int(ini, L"guard",     L"ironman_name", 1);
@@ -409,7 +416,7 @@ static void init(void) {
     eb_rng_install();
     eb_warm_install();
     eb_alerts_install();
-    eb_daygap_install();
+    eb_daygap_install(); eb_buildview_install(); eb_aistrat_install();
     eb_autorun_install();
     int r_crash = eb_crash_install();   // last: its frame counter chains to the other POPS hooks
     eb_playmon_install();
@@ -444,6 +451,7 @@ static void init(void) {
     eb_feature("ai_army_fast", req.ai_army_fast, g_cfg.ai_army_fast, NULL);
     eb_feature("ai_land_memo", req.ai_land_memo, g_cfg.ai_land_memo, req.ai_ae_cache ? NULL : "needs ai_ae_cache");
     eb_feature("guard_tooltip", req.guard_tooltip, g_cfg.guard_tooltip, NULL);
+    eb_feature("guard_modifier_in_tick", req.guard_tip_in_day, g_cfg.guard_tooltip ? g_cfg.guard_tip_in_day : 0, NULL);
     eb_feature("guard_relation", req.guard_relation, g_cfg.guard_relation, NULL);
     eb_feature("guard_great_project", req.guard_great_project, g_cfg.guard_great_project, NULL);
     eb_feature("guard_ironman_name", req.guard_ironman_name, g_cfg.guard_ironman_name, NULL);
@@ -458,6 +466,8 @@ static void init(void) {
     eb_feature("warm_files", req.load_warm_files, g_cfg.load_warm_files, NULL);
     eb_feature("alert_refresh_ms", req.render_alert_refresh_ms, g_cfg.render_alert_refresh_ms, NULL);
     eb_feature("speed5_gap_pct", req.render_speed5_gap_pct, g_cfg.render_speed5_gap_pct, NULL);
+    eb_feature("fast_build_list", req.gui_fast_build_list, g_cfg.gui_fast_build_list, NULL);
+    eb_feature("fast_objectives", req.ai_fast_objectives, g_cfg.ai_fast_objectives, NULL);
     eb_feature("report_capture", req.report_capture, req.report_capture && r_crash, NULL);
     eb_feature("update_auto", req.update_auto, g_cfg.update_auto, NULL);
     if (req.play_monitor || req.mem_sites || req.ui_timing || req.country_stats || req.par_stats || req.ai_item_stats)
@@ -489,7 +499,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         eb_rng_report();
         eb_warm_report();
         eb_alerts_report();
-        eb_daygap_report();
+        eb_daygap_report(); eb_buildview_report(); eb_aistrat_report();
         eb_guard_report();
         eb_leakfix_report();
         eb_playmon_report();

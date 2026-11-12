@@ -221,6 +221,7 @@ SSD를 쓰는 PC 한 대에서만 시험했습니다.
 - 게임이 켜지지 않거나 크래시가 나면, 먼저 `plugins\eu4boost.dll`을 다른 곳으로 옮겨 플러그인 없이 되는지 확인해 주세요.
 - 이슈를 올릴 때는 `plugins\eu4boost.log`(직전 실행은 `eu4boost_prev.log`)를 함께 첨부해 주세요.
 - 글자가 깨지거나 로딩 중 크래시가 나면 `[allocator]`의 `zero_fill=1`을 시도해 보세요(EU4dll 호환 설정).
+- **Windows 11의 스마트 앱 컨트롤이 켜진 PC에서는 아직 동작하지 않습니다.** 게임은 켜지지만 `plugins\eu4boost.log`가 갱신되지 않고, 이벤트 뷰어의 CodeIntegrity 로그에 `eu4boost.dll` 차단(이벤트 3077)이 남습니다. 악성코드로 탐지된 것이 아니라, 릴리스 파일에 Windows 코드 서명이 없어서입니다. 코드 서명을 준비하고 있습니다(아래 "Code signing policy").
 
 ## 기능 목록과 자세한 설명
 
@@ -230,8 +231,27 @@ SSD를 쓰는 PC 한 대에서만 시험했습니다.
 
 - 빌드: `sh build.sh` → `build/eu4boost.dll`. Windows는 Git Bash + llvm-mingw, Linux/WSL은 clang + lld + mingw-w64를 씁니다.
 - 테스트: `sh test/run_tests.sh`(스모크 테스트 13개).
-- 릴리스 만들기: `sh tools/release.sh` (아래 "릴리스 올리는 법").
+- 자동 빌드: `main`에 올라온 커밋은 GitHub Actions가 같은 스크립트로 빌드하고 테스트합니다([.github/workflows/build.yml](.github/workflows/build.yml)). 컴파일러는 llvm-mingw 한 버전으로 고정돼 있습니다.
+- 릴리스 만들기: `sh tools/release.sh` (절차는 스크립트 첫머리에 있습니다).
 - 개발 문서: [docs/HANDOFF.md](docs/HANDOFF.md), 분석 기록 [docs/ANALYSIS_LOG.md](docs/ANALYSIS_LOG.md).
+
+## Code signing policy (코드 서명 정책)
+
+> **상태(2026년 11월): 신청 준비 중입니다.** 0.4.13까지의 릴리스 파일에는 Windows 코드 서명이 없습니다. 승인되면 그다음 릴리스부터 아래 내용대로 서명됩니다.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **What is signed**: `eu4boost.dll` of each release, nothing else. It is built from this repository by GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)) on GitHub-hosted runners, with a pinned compiler and without caches. Every signing request is approved by hand, and the signed file is put into the release only if it is the same code as a local build of the same commit ([tools/pe_check.py](tools/pe_check.py)).
+- **Team roles**
+  - Committers and reviewers: [Scytheim](https://github.com/Scytheim)
+  - Approvers: [Scytheim](https://github.com/Scytheim)
+  - Changes from other people (pull requests) are reviewed by the maintainer before they are merged.
+- **Privacy policy**: eu4boost contacts other systems only in the two cases below. Both are described in this README and can be turned off in `plugins\eu4boost.ini`. Apart from them, this program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+  1. **Update check** (`[update] auto`, on by default; `auto=0` turns it off): when the game starts, one request to GitHub for the latest release of this repository, and the download of a newer release if there is one. GitHub sees the IP address of the PC; nothing else is sent. Details: [자동 업데이트](#자동-업데이트).
+  2. **Crash and slowdown reports** (`[report] upload`): sent only if the user answered "yes" to the question shown at the first start; `upload=0` turns it off at any time. What a report contains, where it is stored, how long it is kept and how to have it deleted: [크래시·느려짐 보고 (개인정보 처리 안내)](#크래시느려짐-보고-개인정보-처리-안내).
+- **Uninstall**: delete the files whose names start with `eu4boost` from the game's `plugins` folder ("3. 설치" above). eu4boost installs nothing outside that folder and changes no Windows settings.
+
+한국어 요약: 릴리스의 `eu4boost.dll`만 서명합니다. 서명할 파일은 이 저장소의 소스를 GitHub가 빌드한 것이고, 개발자가 요청마다 직접 승인합니다. 플러그인이 밖으로 보내는 것은 업데이트 확인과, 동의한 경우의 크래시·느려짐 보고 두 가지뿐이며 둘 다 설정 파일에서 끌 수 있습니다.
 
 ## 라이선스
 

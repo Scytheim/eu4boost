@@ -500,6 +500,7 @@ static DWORD WINAPI crash_writer(LPVOID unused) {
     s_put(&b, g_mods);
     s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
     s_put(&b, "before this session: "); s_put(&b, g_prev_saves[0] ? g_prev_saves : "no saves.txt\r\n");
+    if (eb_guard_hits()[0]) { s_put(&b, "modifier guard (reports 216, 240), first hits of this session:\r\n"); s_put(&b, eb_guard_hits()); }
     s_modules(&b);
     wchar_t stamp[20], dir[MAX_PATH]; s_stamp(stamp, 20); new_dir(dir, stamp, L"crash");
     write_file(dir, L"report.txt", g_cbuf, b.n);
@@ -549,6 +550,7 @@ static void write_hang(int seconds) {
     s_put(&b, g_mods);
     s_put(&b, "this session: "); s_put(&b, eb_save_journal()[0] ? eb_save_journal() : "no saves yet\r\n");
     s_put(&b, "before this session: "); s_put(&b, g_prev_saves[0] ? g_prev_saves : "no saves.txt\r\n");
+    if (eb_guard_hits()[0]) { s_put(&b, "modifier guard (reports 216, 240), first hits of this session:\r\n"); s_put(&b, eb_guard_hits()); }
     s_modules(&b);
     wchar_t stamp[20], dir[MAX_PATH]; s_stamp(stamp, 20); new_dir(dir, stamp, L"hang");
     write_file(dir, L"report.txt", t, b.n);

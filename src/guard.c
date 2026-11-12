@@ -92,6 +92,7 @@
 // slots 0 (deleting destructor), 9 (type) and 12 (the call before it) inside .text. One that fails is taken
 // out of its node - the original skips empty nodes - so the freed block is neither called nor freed again.
 #include "common.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mimalloc.h>
@@ -139,6 +140,7 @@ static day_t o_day;
 static midtick_t o_midtick;
 static int g_sim;                    // main thread: inside the daily tick, outside its mid-tick frames
 static uintptr_t g_rdata_lo, g_rdata_hi;
+static uintptr_t g_text_lo, g_text_hi;
 static volatile LONG g_bad_sources, g_bad_containers, g_null_relations;
 
 static unsigned g_day_n;              // daily ticks so far (main thread)
@@ -291,10 +293,150 @@ static void* ptc_text(uint8_t* c, uint64_t* out, uint8_t* desc) {
     return r;
 }
 
+// ---- inside the daily tick ([guard] modifier_in_tick, reports 216 and 240) ----
+// The AI's foreign minister asks for modifier values through the same breakdown, on the main thread and
+// on the workers of the AI loop, while the tick runs - where the checks above are skipped. Twice a
+// source was freed memory used again by something else (216: data pointer 0, count 0x7ff7; 240: data
+// pointer 0x165): a read at +0x105 / +0x120 of the recursion into it. Here every container is checked
+// when the breakdown enters it (the recursion goes through this hook), which is what both reports
+// needed, and its direct sources are checked first, because with a total asked for the game calls a
+// source's virtual +0x60 before it recurses. The source vector cannot be swapped for a filtered copy
+// here as it is outside the tick: two workers may walk the same container. A bad source's slot is set
+// to NULL instead, with one interlocked store: the breakdown skips NULL sources (FUN_1408e8ca0: "if
+// (source != 0)"), and it is the only code that follows these pointers - the adds FUN_1408ea420 /
+// FUN_1408ea730 append, FUN_1408e6190 clears, the copy constructors copy the values. The pointer was
+// dangling, so nothing is lost; the owner's next recalculation builds the vector again.
+static volatile LONG g_day_bad_c, g_day_bad_src;
+static volatile LONG64 g_day_calls, g_day_calls_main, g_day_calls_ai, g_day_srcs, g_day_qpc, g_day_timed;
+static __thread unsigned tl_day_calls, tl_day_srcs;
+
+// what the memory of a bad container holds now (14 qwords; an address inside the game is written as eu4+rva): it
+// tells what took the freed block, which is the lead to who freed it
+static void obj_words(const void* p, char* out, size_t n) {
+    int k = 0; out[0] = 0;
+    uintptr_t base = (uintptr_t)g_exe;
+    for (int i = 0; i < 14 && k < (int)n - 24; i++) {
+        uint64_t v;
+        if ((uintptr_t)p < 0x10000 || !eb_probe8((const uint8_t*)p + i * 8, &v)) { k += snprintf(out + k, n - (size_t)k, " unreadable"); break; }
+        if (v >= g_rdata_lo - 0x2000000 && v - base < 0x3000000) k += snprintf(out + k, n - (size_t)k, " eu4+%llx", (unsigned long long)(v - base));
+        else k += snprintf(out + k, n - (size_t)k, " %llx", (unsigned long long)v);
+    }
+}
+// the first hits of the session also go into the crash / slow reports (crash.c): a hit that the guard handled makes
+// no report of its own, and the log's tail in a report is usually past these lines
+#define NHITS 6
+static char g_hit_lines[NHITS][760];
+static volatile LONG g_hit_n;
+static char g_hit_text[NHITS * 760 + 8];
+const char* eb_guard_hits(void) {
+    int k = 0; g_hit_text[0] = 0;
+    LONG n = g_hit_n; if (n > NHITS) n = NHITS;
+    for (LONG i = 0; i < n; i++) {
+        const char* s = g_hit_lines[i];
+        while (*s && k < (int)sizeof g_hit_text - 4) g_hit_text[k++] = *s++;
+        g_hit_text[k++] = '\r'; g_hit_text[k++] = '\n'; g_hit_text[k] = 0;
+    }
+    return g_hit_text;
+}
+
+static void day_hit(int source, uint8_t* c, void* s, uint8_t* desc) {
+    LONG n = InterlockedIncrement(source ? &g_day_bad_src : &g_day_bad_c);
+    if (n > 20) return;
+    void* fr[24]; char where[200]; int k = 0; where[0] = 0;
+    USHORT got = RtlCaptureStackBackTrace(1, 24, fr, NULL);
+    uintptr_t base = (uintptr_t)g_exe;
+    for (USHORT i = 0; i < got && k < (int)sizeof where - 24; i++) {      // the callers outside the breakdown itself
+        uintptr_t a = (uintptr_t)fr[i];
+        if (a < g_text_lo || a >= g_text_hi) continue;
+        if (a - base >= RVA_TIP && a - base < RVA_TIP + 0x11de) continue;
+        k += snprintf(where + k, sizeof where - (size_t)k, "%s+0x%llx", k ? " < " : "", (unsigned long long)(a - base));
+        if (k > 110) break;
+    }
+    char words[14 * 20 + 16], line[760];
+    obj_words(source ? s : (void*)c, words, sizeof words);
+    const char* th = GetCurrentThreadId() == g_main_tid ? "main" : "worker";
+    if (source)
+        snprintf(line, sizeof line, "in the daily tick a freed or invalid modifier source %p of %p was taken out (%s thread, modifier %d, depth %d%s; "
+                 "called from %s) | it holds now:%s", s, (void*)c, th, *(int*)desc, *(int*)(desc + 8), eb_ai_in_loop() ? ", the AI loop running" : "",
+                 where[0] ? where : "?", words);
+    else
+        snprintf(line, sizeof line, "in the daily tick an invalid modifier container %p was skipped (%s thread, modifier %d, depth %d%s; "
+                 "called from %s) | it holds now:%s", (void*)c, th, *(int*)desc, *(int*)(desc + 8), eb_ai_in_loop() ? ", the AI loop running" : "",
+                 where[0] ? where : "?", words);
+    eb_log("guard: %s", line);
+    LONG h = InterlockedIncrement(&g_hit_n);
+    if (h <= NHITS) { strncpy(g_hit_lines[h - 1], line, sizeof g_hit_lines[0] - 1); g_hit_lines[h - 1][sizeof g_hit_lines[0] - 1] = 0; }
+}
+
+static void* tip_in_day(uint8_t* c, uint64_t* out, uint8_t* desc) {
+    LARGE_INTEGER t0; int timed = (++tl_day_calls & 255) == 0;
+    if (timed) QueryPerformanceCounter(&t0);
+    if (!container_ok(c)) { day_hit(0, c, NULL, desc); return empty_text(out, desc); }
+    void** b = *(void***)(c + M_VEC); void** e = *(void***)(c + M_VEC + 8);
+    for (void** q = b; q < e; q++) {
+        void* s = *q;
+        if (s && !container_ok((uint8_t*)s) && InterlockedCompareExchangePointer(q, NULL, s) == s) day_hit(1, c, s, desc);
+    }
+    tl_day_srcs += (unsigned)(e - b);
+    if (timed) {                                  // every 256th call is timed; the counts go to the totals then
+        LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+        InterlockedAdd64(&g_day_qpc, t1.QuadPart - t0.QuadPart); InterlockedIncrement64(&g_day_timed);
+        InterlockedAdd64(&g_day_calls, 256); InterlockedAdd64(&g_day_srcs, tl_day_srcs); tl_day_srcs = 0;
+        if (GetCurrentThreadId() == g_main_tid) InterlockedAdd64(&g_day_calls_main, 256);
+        if (eb_ai_in_loop()) InterlockedAdd64(&g_day_calls_ai, 256);
+    }
+    return o_tip(c, out, desc);
+}
+
+// TEST [leaks] subject_modifiers=2 (leakfix.c): the copies that mode 1 deletes are kept and marked. A
+// breakdown that enters one after its deletion time would have read freed memory in mode 1.
+static volatile LONG g_z_young, g_z_dead;
+static __thread int tl_z_depth;
+static __thread uint8_t* tl_z_chain[8];
+static void* hk_tip_checked(uint8_t* c, uint64_t* out, uint8_t* desc, uintptr_t ret);
+static void* tip_zombie(uint8_t* c, uint64_t* out, uint8_t* desc, uintptr_t ret) {
+    ULONGLONG age = 0;
+    int z = eb_lf_zombie(c, &age);
+    int d = tl_z_depth;
+    if (z == 1) InterlockedIncrement(&g_z_young);
+    else if (z == 2 && InterlockedIncrement(&g_z_dead) <= 30) {
+        char chain[160]; int k = 0; chain[0] = 0;
+        for (int i = d - 1; i >= 0 && i >= d - 3; i--) {
+            if (i >= 8) continue;
+            ULONGLONG a2 = 0; int z2 = eb_lf_zombie(tl_z_chain[i], &a2);
+            k += snprintf(chain + k, sizeof chain - (size_t)k, " < %p%s", (void*)tl_z_chain[i], z2 == 2 ? " (a marked copy, past its time)" : z2 == 1 ? " (a marked copy, not yet due)" : "");
+        }
+        void* fr[24]; char where[160]; int w = 0; where[0] = 0;
+        USHORT got = RtlCaptureStackBackTrace(1, 24, fr, NULL);
+        uintptr_t base = (uintptr_t)g_exe;
+        for (USHORT i = 0; i < got && w < (int)sizeof where - 24; i++) {
+            uintptr_t a = (uintptr_t)fr[i];
+            if (a < g_text_lo || a >= g_text_hi || (a - base >= RVA_TIP && a - base < RVA_TIP + 0x11de)) continue;
+            w += snprintf(where + w, sizeof where - (size_t)w, "%s+0x%llx", w ? " < " : "", (unsigned long long)(a - base));
+            if (w > 90) break;
+        }
+        eb_log("leaks: TEST the breakdown entered a copy %p %llu ms after mode 1 would have deleted it (%s thread, %s the daily tick, modifier %d, depth %d; walked from%s; called from %s)",
+               (void*)c, (unsigned long long)age, GetCurrentThreadId() == g_main_tid ? "main" : "worker", g_sim ? "in" : "outside",
+               *(int*)desc, *(int*)(desc + 8), chain[0] ? chain : " the top", where[0] ? where : "?");
+    }
+    if (d < 8) tl_z_chain[d] = c;
+    tl_z_depth = d + 1;
+    void* r = hk_tip_checked(c, out, desc, ret);
+    tl_z_depth = d;
+    return r;
+}
+
 static void* hk_tip(uint8_t* c, uint64_t* out, uint8_t* desc) {
-    if (g_ptc_ret && g_sim && (uintptr_t)__builtin_return_address(0) == g_ptc_ret && GetCurrentThreadId() == g_main_tid)
+    uintptr_t ret = (uintptr_t)__builtin_return_address(0);
+    if (eb_lf_zombies_on) return tip_zombie(c, out, desc, ret);
+    return hk_tip_checked(c, out, desc, ret);
+}
+
+static void* hk_tip_checked(uint8_t* c, uint64_t* out, uint8_t* desc, uintptr_t ret) {
+    if (g_ptc_ret && g_sim && ret == g_ptc_ret && GetCurrentThreadId() == g_main_tid)
         return ptc_text(c, out, desc);
-    if (g_sim || !g_cfg.guard_tooltip) return o_tip(c, out, desc);
+    if (!g_cfg.guard_tooltip) return o_tip(c, out, desc);
+    if (g_sim) return g_cfg.guard_tip_in_day ? tip_in_day(c, out, desc) : o_tip(c, out, desc);
     if (!container_ok(c)) {
         if (InterlockedIncrement(&g_bad_containers) <= 20) eb_log("guard: tooltip skipped an invalid modifier container %p", (void*)c);
         return empty_text(out, desc);
@@ -537,7 +679,6 @@ static diplo_clear_t o_diplo_clear;
 static rem_active_t g_rem_active;
 static logset_t g_logset;
 static logflush_t g_logflush;
-static uintptr_t g_text_lo, g_text_hi;
 static volatile LONG g_freed_relations;
 static LONG64 g_dr_resets, g_dr_calls, g_dr_pending;
 static int g_diplo_tested;
@@ -697,7 +838,11 @@ int eb_guard_install(void) {
     }
     if (want_tip && eb_day_hooked && g_rdata_lo && probe_init() &&
         hook(tip, stip, sizeof sig_tip, (void*)hk_tip, (void**)&o_tip, "tooltip")) {
-        if (g_cfg.guard_tooltip) { ok++; eb_log("guard: modifier tooltips skip freed or invalid sources (outside the daily tick)"); }
+        if (g_cfg.guard_tooltip) {
+            ok++;
+            eb_log("guard: modifier tooltips skip freed or invalid sources (outside the daily tick%s)",
+                   g_cfg.guard_tip_in_day ? "; inside it every breakdown is checked too and a freed source is taken out" : "");
+        }
         if (g_ptc_ret)
             eb_log("modifiers: EXPERIMENT province text cache on%s - the monthly province text of a country is built once a day",
                    g_cfg.prov_text_cache == 2 ? " with VERIFY" : g_cfg.prov_text_cache == 3 ? " as A/B (calls alternate)" : "");
@@ -818,4 +963,20 @@ void eb_guard_report(void) {
     if (g_bad_containers || g_bad_sources || g_null_relations || g_freed_relations)
         eb_log("guard: %ld invalid tooltip containers, %ld invalid tooltip sources, %ld missing relations, %ld freed relations skipped",
                (long)g_bad_containers, (long)g_bad_sources, (long)g_null_relations, (long)g_freed_relations);
+    if (g_cfg.guard_tip_in_day && (g_day_calls || g_day_bad_c || g_day_bad_src)) {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        double ns = g_day_timed ? (double)g_day_qpc * 1e9 / (double)f.QuadPart / (double)g_day_timed : 0.0;
+        LARGE_INTEGER q0, q1, q; QueryPerformanceCounter(&q0);          // the timer's own cost is in every timed check
+        for (int i = 0; i < 1000; i++) QueryPerformanceCounter(&q);
+        QueryPerformanceCounter(&q1);
+        double timer_ns = (double)(q1.QuadPart - q0.QuadPart) * 1e9 / (double)f.QuadPart / 1000.0;
+        ns = ns > timer_ns ? ns - timer_ns : 0.0;
+        eb_log("guard: in the daily tick about %lld modifier breakdowns were checked (%lld on the main thread, %lld while the AI loop ran, "
+               "%.1f sources each, %.0f ns a check, %.0f ms in all): %ld invalid containers skipped, %ld freed or invalid sources taken out",
+               (long long)g_day_calls, (long long)g_day_calls_main, (long long)g_day_calls_ai, g_day_calls ? (double)g_day_srcs / (double)g_day_calls : 0.0, ns,
+               ns * (double)g_day_calls / 1e6, (long)g_day_bad_c, (long)g_day_bad_src);
+    }
+    if (eb_lf_zombies_on)
+        eb_log("leaks: TEST subject_modifiers=2: the breakdown entered a marked copy %ld times before its deletion time and %ld times after it "
+               "(after = mode 1 would have read freed memory)", (long)g_z_young, (long)g_z_dead);
 }

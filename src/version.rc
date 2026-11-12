@@ -1,0 +1,34 @@
+// Version information of eu4boost.dll: what Windows shows in the file properties, and the product
+// name and version that the code signing configuration checks (README.md, "Code signing policy").
+// build/version_gen.h is written by build.sh / build_windows.ps1 from EU4BOOST_VERSION in common.h.
+#include <winver.h>
+#include "version_gen.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     EB_VER_NUM
+PRODUCTVERSION  EB_VER_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Scytheim"
+            VALUE "FileDescription",  "eu4boost - performance plugin for Europa Universalis IV"
+            VALUE "FileVersion",      EB_VER_STR
+            VALUE "InternalName",     "eu4boost"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 Scytheim. MIT License."
+            VALUE "OriginalFilename", "eu4boost.dll"
+            VALUE "ProductName",      "eu4boost"
+            VALUE "ProductVersion",   EB_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -17,14 +17,27 @@ $MI = "third_party/mimalloc"; $MH = "third_party/minhook"; $OUT = "build"
 New-Item -ItemType Directory -Force $OUT | Out-Null
 $CFLAGS = @("-O2", "-DNDEBUG", "-D__USE_MINGW_ANSI_STDIO=1", "-D_WIN32_WINNT=0x0A00", "-Wall", "-Wno-unused-function", "-fno-strict-aliasing")
 function Run([string[]]$a) { & $Clang @a; if ($LASTEXITCODE -ne 0) { throw "clang failed: $a" } }
+# version resource (src/version.rc): product name and version, from EU4BOOST_VERSION in src/common.h
+$m = Select-String -Path "src/common.h" -Pattern '^#define EU4BOOST_VERSION "(.*)"$' | Select-Object -First 1
+if (-not $m) { throw "no EU4BOOST_VERSION in src/common.h" }
+$ver = $m.Matches[0].Groups[1].Value
+$n = @(($ver -replace '[^0-9.].*$', '').Split('.')) + @('0', '0', '0')
+$num = "{0},{1},{2},0" -f [int]$n[0], [int]$n[1], [int]$n[2]
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot "$OUT/version_gen.h"), "#define EB_VER_STR `"$ver`"`n#define EB_VER_NUM $num`n")
+$Windres = "x86_64-w64-mingw32-windres"
+if (Split-Path $Clang) { $Windres = Join-Path (Split-Path $Clang) "x86_64-w64-mingw32-windres.exe" }
+& $Windres "-I" $OUT "src/version.rc" "-O" "coff" "-o" "$OUT/version.o"; if ($LASTEXITCODE -ne 0) { throw "windres failed" }
+# SOURCE_DATE_EPOCH: fixed __DATE__ and __TIME__ in mimalloc's message, as in build.sh
+$env:SOURCE_DATE_EPOCH = "0"
 Run @("-O3", "-DNDEBUG", "-DMI_STAT=0", "-DMI_SECURE=0", "-I$MI/include", "-c", "$MI/src/static.c", "-o", "$OUT/mimalloc.o")
+Remove-Item Env:SOURCE_DATE_EPOCH
 foreach ($f in "hook", "buffer", "trampoline") { Run ($CFLAGS + @("-w", "-I$MH/include", "-c", "$MH/src/$f.c", "-o", "$OUT/mh_$f.o")) }
 Run ($CFLAGS + @("-w", "-c", "$MH/src/hde/hde64.c", "-o", "$OUT/mh_hde64.o"))
 $objs = @()
-foreach ($f in "main", "alloc", "profiler", "threads", "online", "speed", "parallel", "savezip", "savepar", "modifier", "country", "console", "guard", "aiprof", "uitime", "crash", "report", "memdiag", "update", "savelist", "script", "autorun", "playmon", "leakfix", "rng", "warmup", "alerts", "daygap", "savesum") {
+foreach ($f in "main", "alloc", "profiler", "threads", "online", "speed", "parallel", "savezip", "savepar", "modifier", "country", "console", "guard", "aiprof", "uitime", "crash", "report", "memdiag", "update", "savelist", "script", "autorun", "playmon", "leakfix", "rng", "warmup", "alerts", "daygap", "savesum", "buildview", "aistrat") {
     Run ($CFLAGS + @("-I$MI/include", "-I$MH/include", "-c", "src/$f.c", "-o", "$OUT/$f.o")); $objs += "$OUT/$f.o"
 }
 # same link order as build.sh (its mh_*.o glob is alphabetical), so both scripts give the same code
-$objs += "$OUT/mimalloc.o", "$OUT/mh_buffer.o", "$OUT/mh_hde64.o", "$OUT/mh_hook.o", "$OUT/mh_trampoline.o"
-Run (@("-shared", "-static", "-fuse-ld=lld", "-s", "-o", "$OUT/eu4boost.dll") + $objs + @("-Wl,--exclude-all-symbols", "-lpsapi", "-lwinmm", "-ladvapi32", "-lwinhttp", "-lbcrypt", "-luser32", "-lkernel32"))
+$objs += "$OUT/mimalloc.o", "$OUT/mh_buffer.o", "$OUT/mh_hde64.o", "$OUT/mh_hook.o", "$OUT/mh_trampoline.o", "$OUT/version.o"
+Run (@("-shared", "-static", "-fuse-ld=lld", "-s", "-o", "$OUT/eu4boost.dll") + $objs + @("-Wl,--exclude-all-symbols", "-lpsapi", "-lwinmm", "-ladvapi32", "-lwinhttp", "-lbcrypt", "-luser32", "-lgdi32", "-lkernel32"))
 Get-Item "$OUT/eu4boost.dll" | Select-Object Name, Length, LastWriteTime
