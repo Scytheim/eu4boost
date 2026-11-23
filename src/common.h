@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EU4BOOST_VERSION "0.4.13"
+#define EU4BOOST_VERSION "0.4.14"
 #define EB_W2(x) L##x
 #define EB_W(x) EB_W2(x)        // wide string literal of a macro
 
@@ -24,13 +24,16 @@ typedef struct {
     int par_caps;                 // 1 = fewer tasks for known tiny loops (built-in table)
     int par_lpt;                  // 1 = uneven loops (built-in table) take their slowest items first
     int ai_item_stats;            // aiprof.c: 1 = time every country of the AI loop FUN_14077d8a0 (diagnostics)
+    char ai_item_focus[8];        // aiprof.c: diagnostics, a country tag whose AI update gets a stack frame of its own (profiles)
     int ai_split;                 // aiprof.c: EXPERIMENT 1 = a country's army AI runs beside its other AI tasks
+    int ai_path_ahead;            // aiprof.c: EXPERIMENT 1 = the path searches of an army list that failed lately run ahead on idle threads, 2 = + verify
     int ai_split_min;             // ... only for countries with at least this many army/fleet AI nodes
     int ai_prov_split;            // aiprof.c: EXPERIMENT 1 = province evaluation scored on all cores, 2 = + verify
     int ai_prov_min;              // ... only for countries with at least this many provinces
     int ai_ae_cache;              // aiprof.c: EXPERIMENT 1 = per-thread lock-free table for the AI loop's AE cache, 2 = + verify, 3 = A/B
     int ai_army_fast;             // aiprof.c: EXPERIMENT 1 = the army move check tests its cheap conditions first, 2 = + verify, 3 = A/B
     int ai_land_memo;             // aiprof.c: EXPERIMENT 1 = the land searches of a deal fill in the AI loop are kept for that fill (needs ai_ae_cache), 2 = + verify, 3 = A/B
+    int ai_deal_memo;             // aiprof.c: EXPERIMENT 1 = what a peace deal fill asks again and again (wish lists, reach questions) is kept for that fill (needs ai_ae_cache), 2 = + verify
     // allocator
     int alloc_enabled;
     int alloc_guard_foreign;      // also catch mimalloc pointers freed through the Windows heap API
@@ -94,6 +97,7 @@ typedef struct {
     int autorun_minimize;         // testing only: 1 = keep the game window minimized during an autorun
     int autorun_offscreen;        // testing only: 1 = keep it drawn off the desktop instead (never activated)
     int autorun_input;            // testing only: with autorun_offscreen, a simulated player with this seed (0 = none)
+    int test_path_stats;          // testing only (aiprof.c): counts the AI loop's path searches and edge checks and how many repeat
     char autorun_script[2048];    // testing only: with autorun_offscreen, a scripted player (autorun.c), the game stays paused
     // console (console.c)
     int console_hotkey;           // 1 = Ctrl+Alt+C unlocks console commands in single-player ironman until the next game start

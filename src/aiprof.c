@@ -787,6 +787,7 @@ static inline int ae_prov(atab_t* t, uint8_t* taker, int value, uint8_t* prov, u
     return direct ? ae_value(t, taker, prov, flag, obs, value) : ae_scale(value, ae_value(t, taker, prov, flag, obs, g_ae_unit));
 }
 static __thread int t_wv;                         // inside the war view test (testing only)
+static int g_wish;                                // [parallel] ai_deal_memo (the wish lists far below; rows in ae_sum)
 static volatile LONG64 g_wv_aep, g_wv_aep_cache, g_wv_aep_slot, g_wv_aep_none;
 static int* ui_aep(uint8_t* taker, int* out, int* value, uint8_t* prov, uint8_t flag, uint64_t p6, uint64_t obs, void* cache) {
     if (p6 || t_ae_orig) return o_aep(taker, out, value, prov, flag, p6, obs, cache);
@@ -895,6 +896,53 @@ static inline uint32_t ae_items(atab_t* t, uint8_t* taker, uint8_t** byidx, uint
     }
     return s;
 }
+// With [parallel] ai_deal_memo: rows. A fill sums the AE of the same candidate provinces again in every round,
+// each time one table lookup per country and deal entry (13 million lookups for the 16 war views of the SPAIN
+// test, 18% of the time once the wish lists are kept). A row is the AE of one (taker, province, flag, value)
+// for every country of the game's list, filled as the sums ask for it; rows live as long as the table's
+// generation (one top-level call outside the AI loop, one AI loop inside it). AROW_NONE = not asked yet (a
+// value that happens to be equal to it is simply computed every time).
+#define AROW_MAX  2048
+#define AROW_SLOTS 4096
+#define AROW_NONE ((int32_t)0x80000000)
+typedef struct { uint8_t* taker; uint8_t* prov; int32_t value; uint32_t id; uint16_t row; uint8_t flag; } arkey_t;
+static __thread arkey_t* t_ak;
+static __thread int32_t* t_av;
+static __thread int t_av_cap, t_av_ncl, t_av_rows, t_av_direct;
+static __thread uint32_t t_av_id, t_av_gen;
+static __thread atab_t* t_av_t;
+static volatile LONG g_av_maxrows;
+static int arow_begin(atab_t* t, int direct, int ncl) {
+    if (t_av_t == t && t_av_gen == t->gen && t_av_direct == direct && t_av_ncl == ncl) return 1;
+    if (ncl <= 0) return 0;
+    if (!t_ak && !(t_ak = (arkey_t*)calloc(AROW_SLOTS, sizeof *t_ak))) return 0;
+    if (ncl > t_av_cap) {
+        int32_t* v = (int32_t*)realloc(t_av, (size_t)AROW_MAX * (size_t)(ncl + 64) * sizeof *v);
+        if (!v) { t_av_t = NULL; return 0; }
+        t_av = v; t_av_cap = ncl + 64;
+    }
+    for (LONG m = g_av_maxrows; t_av_rows > m && InterlockedCompareExchange(&g_av_maxrows, t_av_rows, m) != m; m = g_av_maxrows) {}
+    t_av_t = t; t_av_gen = t->gen; t_av_direct = direct; t_av_ncl = ncl; t_av_rows = 0;
+    if (++t_av_id == 0) { memset(t_ak, 0, AROW_SLOTS * sizeof *t_ak); t_av_id = 1; }
+    return 1;
+}
+// the row of (taker, province, flag, value); NULL when all rows are in use
+static int32_t* arow(uint8_t* taker, uint8_t* prov, uint8_t flag, int32_t value) {
+    uint64_t h = (uintptr_t)prov * 0x9E3779B97F4A7C15ull ^ (uintptr_t)taker * 0xC2B2AE3D27D4EB4Full ^ ((uint64_t)(uint32_t)value << 8 | flag) * 0x165667B19E3779F9ull;
+    uint32_t i = ((uint32_t)(h >> 32) ^ (uint32_t)h) & (AROW_SLOTS - 1);
+    for (; t_ak[i].id == t_av_id; i = (i + 1) & (AROW_SLOTS - 1)) {
+        arkey_t* k = &t_ak[i];
+        if (k->prov == prov && k->taker == taker && k->value == value && k->flag == flag) return t_av + (size_t)k->row * (size_t)t_av_cap;
+    }
+    if (t_av_rows == AROW_MAX) return NULL;
+    int32_t* r = t_av + (size_t)t_av_rows * (size_t)t_av_cap;
+    for (int c = 0; c < t_av_ncl; c++) r[c] = AROW_NONE;
+    arkey_t* k = &t_ak[i];
+    k->taker = taker; k->prov = prov; k->value = value; k->flag = flag; k->id = t_av_id; k->row = (uint16_t)t_av_rows++;
+    return r;
+}
+typedef struct { int32_t* r; uint8_t* pv; int32_t v; uint8_t fl; } arent_t;
+#define AROW_ENT 48              // deal entries of one sum that go through rows; a sum with more does it the old way
 // FUN_14038a530 + FUN_140388b40 in C on table t (see the header); direct: no map (the real values); 0 = not applicable
 static int ae_sum(atab_t* t, int direct, uint8_t* taker, int64_t* out, int value, uint8_t* prov, void** deal) {
     uint8_t* b = (uint8_t*)g_exe;
@@ -912,6 +960,24 @@ static int ae_sum(atab_t* t, int direct, uint8_t* taker, int64_t* out, int value
     dmemo_t* dm = &t_dm;
     size_t keep = e1 - e0 >= 2 * 0x30 ? dm_begin(dm, t, taker, direct, e0, (size_t)(e1 - e0), ncl) : 0;
     uint8_t* em = e1 - keep;                          // e0..em summed here, em..e1 the kept common part
+    int32_t* rp = NULL;                               // the row of `prov`; er[0..ne): the rows of the entries e0..em
+    arent_t er[AROW_ENT];
+    int ne = -1;
+    if (g_wish && arow_begin(t, direct, ncl)) {
+        if (value > 0) rp = arow(taker, prov, 1, value);
+        ne = 0;
+        for (uint8_t* e = e0; e != em; e += 0x30) {
+            uint8_t* pv;
+            if (e[0x1f]) pv = *(uint8_t**)(byidx[(int16_t)(*(uint64_t*)(e + 0x18) >> 32)] + 0x14b0);
+            else if (!e[0x27] && *(uint8_t**)(e + 8)) pv = *(uint8_t**)(e + 8);
+            else continue;
+            int32_t v = *(int*)(e + 0x28);
+            if (v <= 0) continue;                     // such an entry adds 0
+            int32_t* r = ne < AROW_ENT ? arow(taker, pv, e[0x2c], v) : NULL;
+            if (!r) { ne = -1; break; }               // no row for it: all entries the old way
+            er[ne].r = r; er[ne].pv = pv; er[ne].v = v; er[ne].fl = e[0x2c]; ne++;
+        }
+    }
     int64_t sum = *(int64_t*)(b + RVA_AE_ZERO);
     for (int ci = 0; ci < ncl; ci++) {
         uint8_t* c = cl[ci];
@@ -931,13 +997,23 @@ static int ae_sum(atab_t* t, int direct, uint8_t* taker, int64_t* out, int value
         if (p != pe) continue;
         uint8_t half = rel[0x45] & 1;
         // FUN_140388b40(out, taker, &value, deal != 0, province, observer tag, deal, 0)
-        int ae = ae_prov(t, taker, value, prov, (uint8_t)(value > 0), otag, direct);
+        int ae;
+        if (rp) {
+            ae = rp[ci];
+            if (ae == AROW_NONE) { ae = ae_prov(t, taker, value, prov, 1, otag, direct); rp[ci] = ae; }
+        } else ae = ae_prov(t, taker, value, prov, (uint8_t)(value > 0), otag, direct);
         uint32_t part = 0;                            // the deal entries' AE for this country (32-bit adds as the game's)
         if (keep) {
             if (dm->stamp[ci] == dm->id) part = (uint32_t)dm->d[ci];
             else { part = ae_items(t, taker, byidx, em, e1, otag, direct); dm->d[ci] = (int32_t)part; dm->stamp[ci] = dm->id; }
         }
-        part += ae_items(t, taker, byidx, e0, em, otag, direct);
+        if (ne >= 0)
+            for (int k = 0; k < ne; k++) {
+                int32_t x = er[k].r[ci];
+                if (x == AROW_NONE) { x = ae_prov(t, taker, er[k].v, er[k].pv, er[k].fl, otag, direct); er[k].r[ci] = x; }
+                part += (uint32_t)x;
+            }
+        else part += ae_items(t, taker, byidx, e0, em, otag, direct);
         ae = (int)((uint32_t)ae + part);
         int64_t q = ((int64_t)(int32_t)((uint32_t)*(int*)(defs + 0x50) * 1000u) * (int64_t)ae) / 1000;
         int iq = (int)q;
@@ -1094,7 +1170,7 @@ static inline int ad_in(void) {
 static int ad_enter(uintptr_t frame) {
     if (t_ad && frame < t_ad_frame) { t_ad++; return 1; }
     t_ad = 0;
-    if (!g_alm || !g_ai_loop_active) return 0;
+    if ((!g_alm && !g_wish) || !g_ai_loop_active) return 0;
     if (++t_lpscope == 0) t_lpscope = 1;
     t_ad_side = g_alm == 3 ? (int)(++t_ad_flip & 1) : 1;
     t_ad = 1; t_ad_frame = frame;
@@ -1112,7 +1188,7 @@ static void ad_leave(LONG64 t0) {
 }
 static uint64_t hk_landpath(uint8_t* c, uint8_t* w, uint8_t* p) {
     int ui = ui_in();
-    if (!ui && !(ad_in() && t_ad_side)) return o_landpath(c, w, p);
+    if (!ui && !(g_alm && ad_in() && t_ad_side)) return o_landpath(c, w, p);
     if (ui) g_lp_calls++; else t_alp_calls++;
     if (t_lp_gen != t_lpscope) { t_lp_gen = t_lpscope; t_lp_n = 0; }
     if (!t_lp && !lp_grow()) return o_landpath(c, w, p);
@@ -1172,6 +1248,326 @@ static int hk_accept(uint8_t* c, void* reasons, uint64_t p3, uint64_t tag, void*
     return r;
 }
 
+// ---- the provinces a country wishes for in a deal (FUN_140190020) ----
+// EXPERIMENT [parallel] ai_deal_memo=1 (2 = + verify, default off; needs ai_ae_cache and its deal hooks):
+// what a deal fill asks again and again is kept for that fill. First the wish lists.
+// While a deal is filled, the value of every candidate item (FUN_140979a40 -> FUN_1409a8760 for a province)
+// asks FUN_1403b3900 what the receiving country gets for its part in the war, and for an AI receiver that
+// builds the set of provinces it wishes for: FUN_140190020(set, deal, tag, int* limit, flag) makes a NEW empty
+// offer between the deal's two sides (FUN_140975d40), values every province candidate of the deal that the
+// tag does not already get in it as if handed to the tag - FUN_1409a8760(temporary item, &value, the new
+// offer, 1, 0, &0), where the temporary item is the candidate's with the tag as receiver - and destroys the
+// offer (FUN_1409761c0). So every candidate that is valued values every candidate province again: 31% of a
+// fill of 0.7 s in the user's SPAIN campaign of 11-12 (630 provinces, at war with a country of 176).
+// The inner valuation reads the temporary item, the new offer - always the same empty one for the same two
+// sides and flag - and the game state, which does not change during one top-level fill or acceptance check
+// (see the land searches above). So within one such call
+//   1. the result of the inner valuation is kept per (the item's fields, the offer's sides and flag), for
+//      calls made from FUN_140190020's own code only;
+//   2. the new offer, which nothing but those valuations reads, is built only when one of them has to run.
+// Verify mode runs the game's valuation on every kept answer and compares.
+#define RVA_WISH     0x190020u
+#define WISH_SIZE    0x4ffu       // the function's size: calls made from its own code return into it
+#define RVA_PVALUE   0x9a8760u
+static const uint8_t sig_wish[16]   = { 0x48,0x89,0x5c,0x24,0x18,0x4c,0x89,0x4c,0x24,0x20,0x48,0x89,0x54,0x24,0x10,0x48 };
+static const uint8_t sig_pvalue[16] = { 0x4c,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10,0x55,0x53,0x56,0x57,0x41,0x54 };
+typedef int64_t* (*wish_t)(int64_t* set, uint8_t* deal, uint64_t tag, int* limit, uint64_t flag);
+typedef int* (*pvalue_t)(uint8_t* item, int* out, uint8_t* deal, uint64_t p4, uint64_t p5, int* p6);
+typedef void* (*offer_ctor_t)(void* buf, uint64_t a, uint64_t b, uint64_t flag);
+typedef void* (*offer_dtor_t)(void* buf);
+static wish_t o_wish;
+static pvalue_t o_pvalue;
+static offer_ctor_t o_offer_ctor;
+static offer_dtor_t o_offer_dtor;
+// FUN_140190020 calls that are running on this thread, innermost last
+typedef struct { uintptr_t frame; void* buf; uint64_t a, b, flag; int pending; } wctx_t;
+#define WISH_DEPTH 4
+static __thread wctx_t t_wc[WISH_DEPTH];
+static __thread int t_wn;
+typedef struct { uint64_t k[9]; int32_t v; uint32_t gen; } went_t;
+static __thread went_t* t_we;
+static __thread uint32_t t_we_mask, t_we_n, t_we_gen;
+static __thread LONG64 t_w_sets, t_w_hit, t_w_calc, t_w_lazy, t_w_built, t_w_ver, t_w_bad;
+static volatile LONG64 g_w_sets, g_w_hit, g_w_calc, g_w_lazy, g_w_built, g_w_ver, g_w_bad, g_w_badlog, g_w_full;
+static inline int wish_scope(void) { return ui_in() || (ad_in() && t_ad_side); }
+// the innermost running call, NULL if there is none (a call left by an exception is dropped)
+static inline wctx_t* wish_top(uintptr_t frame) {
+    while (t_wn && t_wc[t_wn - 1].frame <= frame) t_wn--;
+    return t_wn ? &t_wc[t_wn - 1] : NULL;
+}
+static inline int wish_from(void* ra) { return (uintptr_t)ra - ((uintptr_t)g_exe + RVA_WISH) < WISH_SIZE; }
+static void wish_flush(void) {
+    if (t_w_sets) { InterlockedAdd64(&g_w_sets, t_w_sets); t_w_sets = 0; }
+    if (t_w_hit) { InterlockedAdd64(&g_w_hit, t_w_hit); t_w_hit = 0; }
+    if (t_w_calc) { InterlockedAdd64(&g_w_calc, t_w_calc); t_w_calc = 0; }
+    if (t_w_lazy) { InterlockedAdd64(&g_w_lazy, t_w_lazy); t_w_lazy = 0; }
+    if (t_w_built) { InterlockedAdd64(&g_w_built, t_w_built); t_w_built = 0; }
+    if (t_w_ver) { InterlockedAdd64(&g_w_ver, t_w_ver); t_w_ver = 0; }
+    if (t_w_bad) { InterlockedAdd64(&g_w_bad, t_w_bad); t_w_bad = 0; }
+}
+static inline uint32_t wish_hash(const uint64_t* k) {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < 9; i++) h = (h ^ k[i]) * 0xC2B2AE3D27D4EB4Full, h ^= h >> 29;
+    return (uint32_t)(h >> 32) ^ (uint32_t)h;
+}
+static int wish_grow(void) {
+    uint32_t cap = t_we ? (t_we_mask + 1) * 2 : 1u << 11;
+    if (cap > (1u << 17)) return 0;
+    went_t* e = (went_t*)calloc(cap, sizeof *e);
+    if (!e) return 0;
+    if (t_we)
+        for (uint32_t i = 0; i <= t_we_mask; i++) {
+            went_t* o = &t_we[i];
+            if (o->gen != t_we_gen) continue;
+            uint32_t j = wish_hash(o->k) & (cap - 1);
+            while (e[j].gen == t_we_gen) j = (j + 1) & (cap - 1);
+            e[j] = *o;
+        }
+    free(t_we); t_we = e; t_we_mask = cap - 1;
+    return 1;
+}
+static inline void wish_build(wctx_t* c) {          // the new offer is needed after all
+    if (!c->pending) return;
+    c->pending = 0;
+    o_offer_ctor(c->buf, c->a, c->b, c->flag);
+    t_w_built++;
+}
+static int64_t* hk_wish(int64_t* set, uint8_t* deal, uint64_t tag, int* limit, uint64_t flag) {
+    uintptr_t f = (uintptr_t)__builtin_frame_address(0);
+    wish_top(f);
+    if (!wish_scope() || t_wn == WISH_DEPTH) return o_wish(set, deal, tag, limit, flag);
+    wctx_t* c = &t_wc[t_wn++];
+    c->frame = f; c->buf = NULL; c->pending = 0;
+    t_w_sets++;
+    int64_t* r = o_wish(set, deal, tag, limit, flag);
+    if (t_wn && t_wc[t_wn - 1].frame == f) t_wn--;
+    if (!t_wn) wish_flush();
+    return r;
+}
+static void* hk_offer_ctor(void* buf, uint64_t a, uint64_t b, uint64_t flag) {
+    wctx_t* c = t_wn ? wish_top((uintptr_t)__builtin_frame_address(0)) : NULL;
+    if (!c || c->buf || !wish_from(__builtin_return_address(0))) return o_offer_ctor(buf, a, b, flag);
+    c->buf = buf; c->a = a; c->b = b; c->flag = flag; c->pending = 1;    // FUN_140190020's own offer: not built yet
+    t_w_lazy++;
+    return buf;
+}
+static void* hk_offer_dtor(void* buf) {
+    wctx_t* c = t_wn ? wish_top((uintptr_t)__builtin_frame_address(0)) : NULL;
+    if (c && c->buf == buf) {
+        int pending = c->pending;
+        c->buf = NULL; c->pending = 0;
+        if (pending) return buf;                      // never built: nothing to destroy
+    }
+    return o_offer_dtor(buf);
+}
+static int* hk_pvalue(uint8_t* item, int* out, uint8_t* deal, uint64_t p4, uint64_t p5, int* p6) {
+    wctx_t* c = t_wn ? wish_top((uintptr_t)__builtin_frame_address(0)) : NULL;
+    if (!c || !c->buf || c->buf != (void*)deal) return o_pvalue(item, out, deal, p4, p5, p6);
+    if (!wish_from(__builtin_return_address(0)) || (uint8_t)p4 != 1 || p5 || !p6 || *p6) {
+        wish_build(c);                                // another use of the offer: it has to exist
+        return o_pvalue(item, out, deal, p4, p5, p6);
+    }
+    uint64_t k[9];
+    k[0] = *(uint64_t*)item;
+    k[1] = (uint64_t)*(uint32_t*)(item + 8) | (uint64_t)item[0x20] << 32 | (uint64_t)item[0x40] << 40 | (uint64_t)(uint8_t)c->flag << 48;
+    k[2] = *(uint64_t*)(item + 0x10); k[3] = *(uint64_t*)(item + 0x18);
+    memcpy(&k[4], item + 0x22, 8);
+    k[5] = *(uint64_t*)(item + 0x30); k[6] = *(uint64_t*)(item + 0x38);
+    k[7] = c->a; k[8] = c->b;
+    if (t_we_gen != t_lpscope) { t_we_gen = t_lpscope; t_we_n = 0; }
+    if (!t_we && !wish_grow()) { wish_build(c); return o_pvalue(item, out, deal, p4, p5, p6); }
+    uint32_t i = wish_hash(k) & t_we_mask;
+    for (; t_we[i].gen == t_we_gen; i = (i + 1) & t_we_mask) {
+        went_t* e = &t_we[i];
+        if (memcmp(e->k, k, sizeof k)) continue;
+        t_w_hit++;
+        if (g_wish == 2) {
+            int g = 0x7fffffff;
+            wish_build(c);
+            o_pvalue(item, &g, deal, p4, p5, p6);
+            t_w_ver++;
+            if (g != e->v) {
+                t_w_bad++;
+                if (InterlockedIncrement64(&g_w_badlog) <= 20)
+                    eb_log("ai deal memo: VERIFY MISMATCH province %d for %.3s: kept %d, the game says %d",
+                           k[6] ? (int)*(uint32_t*)((uint8_t*)(uintptr_t)k[6] + 0x20) : -1, (char*)&k[5], e->v, g);
+            }
+        }
+        *out = e->v;
+        return out;
+    }
+    wish_build(c);
+    int* r = o_pvalue(item, out, deal, p4, p5, p6);
+    t_w_calc++;
+    // the valuation may have used the table itself (a nested call): find the free slot again
+    if (t_we_gen != t_lpscope) return r;              // a new top-level call began inside: not kept
+    if ((t_we_n + 1) * 2 > t_we_mask + 1 && !wish_grow()) { InterlockedIncrement64(&g_w_full); return r; }
+    for (i = wish_hash(k) & t_we_mask; t_we[i].gen == t_we_gen; i = (i + 1) & t_we_mask)
+        if (!memcmp(t_we[i].k, k, sizeof k)) return r;                 // put there by a nested call
+    memcpy(t_we[i].k, k, sizeof k); t_we[i].v = *out; t_we[i].gen = t_we_gen; t_we_n++;
+    return r;
+}
+
+// The same option keeps two yes/no questions about a province and a country that a fill asks again and again:
+// FUN_140a0f9f0(province, tag), which the value of every province item starts with, and
+// FUN_140a0f140(province, tag), the same question for the province's neighbours, asked by FUN_14098b440 for
+// every province candidate each time a candidate is valued (together 19% of a fill once the wish lists are
+// kept). Both read the province, its neighbours and the countries' relations only.
+#define RVA_PREACH 0xa0f9f0u
+#define RVA_PNEAR  0xa0f140u
+static const uint8_t sig_preach[16] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x6c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48 };
+static const uint8_t sig_pnear[16]  = { 0x40,0x53,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x83,0xec };
+typedef uint64_t (*preach_t)(uint8_t* prov, uint64_t tag);
+static preach_t o_preach, o_pnear;
+typedef struct { uint8_t* p; uint64_t tag; uint32_t gen; uint8_t kind, r; } pent_t;
+static __thread pent_t* t_pe;
+static __thread uint32_t t_pe_mask, t_pe_n, t_pe_gen;
+static __thread LONG64 t_p_hit, t_p_calc, t_p_ver, t_p_bad;
+static volatile LONG64 g_p_hit, g_p_calc, g_p_ver, g_p_bad;
+static void reach_flush(void) {
+    if (t_p_hit) { InterlockedAdd64(&g_p_hit, t_p_hit); t_p_hit = 0; }
+    if (t_p_calc) { InterlockedAdd64(&g_p_calc, t_p_calc); t_p_calc = 0; }
+    if (t_p_ver) { InterlockedAdd64(&g_p_ver, t_p_ver); t_p_ver = 0; }
+    if (t_p_bad) { InterlockedAdd64(&g_p_bad, t_p_bad); t_p_bad = 0; }
+}
+static inline uint32_t reach_hash(uint8_t* p, uint64_t tag) {
+    uint64_t h = (uintptr_t)p * 0x9E3779B97F4A7C15ull ^ tag * 0xC2B2AE3D27D4EB4Full;
+    return (uint32_t)(h >> 32) ^ (uint32_t)h;
+}
+static int reach_grow(void) {
+    uint32_t cap = t_pe ? (t_pe_mask + 1) * 2 : 1u << 12;
+    if (cap > (1u << 20)) return 0;
+    pent_t* e = (pent_t*)calloc(cap, sizeof *e);
+    if (!e) return 0;
+    if (t_pe)
+        for (uint32_t i = 0; i <= t_pe_mask; i++) {
+            pent_t* o = &t_pe[i];
+            if (o->gen != t_pe_gen) continue;
+            uint32_t j = (reach_hash(o->p, o->tag) + o->kind) & (cap - 1);
+            while (e[j].gen == t_pe_gen) j = (j + 1) & (cap - 1);
+            e[j] = *o;
+        }
+    free(t_pe); t_pe = e; t_pe_mask = cap - 1;
+    return 1;
+}
+// kind: 0 = FUN_140a0f9f0, 1 = FUN_140a0f140
+static uint64_t reach(int kind, preach_t orig, uint8_t* prov, uint64_t tag) {
+    if (!wish_scope()) return orig(prov, tag);
+    if (t_pe_gen != t_lpscope) { reach_flush(); t_pe_gen = t_lpscope; t_pe_n = 0; }
+    if (!t_pe && !reach_grow()) return orig(prov, tag);
+    uint32_t i = (reach_hash(prov, tag) + (uint32_t)kind) & t_pe_mask;
+    for (; t_pe[i].gen == t_pe_gen; i = (i + 1) & t_pe_mask) {
+        pent_t* e = &t_pe[i];
+        if (e->p != prov || e->tag != tag || e->kind != kind) continue;
+        t_p_hit++;
+        if (g_wish == 2) {
+            uint8_t g = (uint8_t)orig(prov, tag);
+            t_p_ver++;
+            if (g != e->r) {
+                t_p_bad++;
+                if (InterlockedIncrement64(&g_w_badlog) <= 20)
+                    eb_log("ai deal memo: VERIFY MISMATCH %s province %d for %.3s: kept %d, the game says %d",
+                           kind ? "neighbours of" : "reach of", (int)*(uint32_t*)(prov + 0x20), (char*)&tag, e->r, g);
+            }
+        }
+        return e->r;
+    }
+    uint8_t r = (uint8_t)orig(prov, tag);
+    t_p_calc++;
+    if (t_pe_gen != t_lpscope) return r;              // a new top-level call began inside: not kept
+    if ((t_pe_n + 1) * 2 > t_pe_mask + 1 && !reach_grow()) return r;
+    for (i = (reach_hash(prov, tag) + (uint32_t)kind) & t_pe_mask; t_pe[i].gen == t_pe_gen; i = (i + 1) & t_pe_mask)
+        if (t_pe[i].p == prov && t_pe[i].tag == tag && t_pe[i].kind == kind) return r;   // put there by a nested call
+    t_pe[i].p = prov; t_pe[i].tag = tag; t_pe[i].gen = t_pe_gen; t_pe[i].kind = (uint8_t)kind; t_pe[i].r = r; t_pe_n++;
+    return r;
+}
+static uint64_t hk_preach(uint8_t* prov, uint64_t tag) { return reach(0, o_preach, prov, tag); }
+static uint64_t hk_pnear(uint8_t* prov, uint64_t tag) { return reach(1, o_pnear, prov, tag); }
+
+// The third thing kept: FUN_140992b40(deal, tag a, tag b, std::vector<province*>* out). The value of a province
+// item calls it for every item already in the deal: it walks a's long province list (country +0x1378) and adds
+// to `out` the provinces of b (or of b's subjects) that b or one of the deal's countries (deal +0x70) holds - 11%
+// of a fill, all of it the walk. The answer depends on a, b, the deal's country list and the game state, so
+// within one top-level call the provinces it added are kept per (a, b, the tags of that list - compared tag by
+// tag, since a deal on the stack and its list can sit where another's sat) and added again in the same order
+// (through the game's own vector growth, FUN_1400cc220, so that `out` grows exactly as before).
+#define RVA_PLIST 0x992b40u
+#define RVA_VPUSH 0xcc220u       // std::vector<void*>::_Emplace_reallocate(vec, where, &value)
+static const uint8_t sig_plist[16] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x6c,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x57 };
+static const uint8_t sig_vpush[16] = { 0x40,0x53,0x55,0x41,0x55,0x41,0x57,0x48,0x83,0xec,0x28,0x48,0x8b,0x41,0x08,0x4c };
+typedef void (*plist_t)(uint8_t* deal, uint64_t a, uint64_t b, uint8_t*** vec);
+typedef void* (*vpush_t)(void* vec, void* where, void* value);
+static plist_t o_plist;
+static vpush_t g_vpush;
+typedef struct { uint64_t a, b; uint32_t gen, n, ln; size_t off, loff; } vent_t;   // ln tags of the deal's list at loff, n provinces at off
+#define PLIST_CAP 1024           // entries per top-level call; more distinct questions are asked as before
+static __thread vent_t* t_ve;
+static __thread uint8_t** t_va;                   // the kept lists and provinces of all entries, one after the other
+static __thread size_t t_va_n, t_va_cap;
+static __thread uint32_t t_ve_n, t_ve_gen;
+static __thread LONG64 t_v_hit, t_v_calc, t_v_ver, t_v_bad;
+static volatile LONG64 g_v_hit, g_v_calc, g_v_ver, g_v_bad;
+static void plist_flush(void) {
+    if (t_v_hit) { InterlockedAdd64(&g_v_hit, t_v_hit); t_v_hit = 0; }
+    if (t_v_calc) { InterlockedAdd64(&g_v_calc, t_v_calc); t_v_calc = 0; }
+    if (t_v_ver) { InterlockedAdd64(&g_v_ver, t_v_ver); t_v_ver = 0; }
+    if (t_v_bad) { InterlockedAdd64(&g_v_bad, t_v_bad); t_v_bad = 0; }
+}
+static void hk_plist(uint8_t* deal, uint64_t a, uint64_t b, uint8_t*** vec) {
+    if (!wish_scope() || !vec) { o_plist(deal, a, b, vec); return; }
+    if (t_ve_gen != t_lpscope) { plist_flush(); t_ve_gen = t_lpscope; t_ve_n = 0; t_va_n = 0; }
+    if (!t_ve && !(t_ve = (vent_t*)calloc(PLIST_CAP, sizeof *t_ve))) { o_plist(deal, a, b, vec); return; }
+    uint8_t* l0 = *(uint8_t**)(deal + 0x70); uint8_t* l1 = *(uint8_t**)(deal + 0x78);
+    size_t lb = (size_t)(l1 - l0);
+    if (lb > 256 * 8 || (lb & 7)) { o_plist(deal, a, b, vec); return; }
+    uint32_t ln = (uint32_t)(lb >> 3);
+    uint64_t h = a * 0xC2B2AE3D27D4EB4Full ^ b * 0x165667B19E3779F9ull ^ ln;
+    for (uint32_t k = 0; k < ln; k++) h = (h ^ ((uint64_t*)l0)[k]) * 0x9E3779B97F4A7C15ull, h ^= h >> 31;
+    uint32_t i = ((uint32_t)(h >> 32) ^ (uint32_t)h) & (PLIST_CAP - 1);
+    for (; t_ve[i].gen == t_ve_gen; i = (i + 1) & (PLIST_CAP - 1)) {
+        vent_t* e = &t_ve[i];
+        if (e->a != a || e->b != b || e->ln != ln || memcmp(t_va + e->loff, l0, lb)) continue;
+        t_v_hit++;
+        if (g_wish == 2) {                            // the game's walk, compared with the kept provinces
+            size_t n0 = (size_t)(vec[1] - vec[0]);
+            o_plist(deal, a, b, vec);
+            size_t n1 = (size_t)(vec[1] - vec[0]);
+            t_v_ver++;
+            if (n1 - n0 != e->n || memcmp(vec[0] + n0, t_va + e->off, (size_t)e->n * sizeof(void*))) {
+                t_v_bad++;
+                if (InterlockedIncrement64(&g_w_badlog) <= 20)
+                    eb_log("ai deal memo: VERIFY MISMATCH province list of %.3s for %.3s: kept %u provinces, the game gives %zu",
+                           (char*)&a, (char*)&b, e->n, n1 - n0);
+            }
+            return;
+        }
+        for (uint32_t k = 0; k < e->n; k++) {
+            uint8_t* v = t_va[e->off + k];
+            if (vec[1] == vec[2]) g_vpush(vec, vec[1], &v);
+            else *vec[1]++ = v;
+        }
+        return;
+    }
+    size_t n0 = (size_t)(vec[1] - vec[0]);
+    o_plist(deal, a, b, vec);
+    t_v_calc++;
+    size_t n = (size_t)(vec[1] - vec[0]) - n0;
+    if (t_ve_gen != t_lpscope || t_ve_n >= PLIST_CAP / 2 || n > 0xffffff) return;
+    if (*(uint8_t**)(deal + 0x70) != l0 || *(uint8_t**)(deal + 0x78) != l1) return;       // the list itself changed: not kept
+    if (t_va_n + ln + n > t_va_cap) {
+        size_t cap = (t_va_n + ln + n) * 2 + 1024;
+        uint8_t** q = (uint8_t**)realloc(t_va, cap * sizeof *q);
+        if (!q) return;
+        t_va = q; t_va_cap = cap;
+    }
+    for (i = ((uint32_t)(h >> 32) ^ (uint32_t)h) & (PLIST_CAP - 1); t_ve[i].gen == t_ve_gen; i = (i + 1) & (PLIST_CAP - 1)) {}
+    vent_t* e = &t_ve[i];
+    e->a = a; e->b = b; e->gen = t_ve_gen; e->ln = ln; e->loff = t_va_n; e->n = (uint32_t)n; e->off = t_va_n + ln;
+    memcpy(t_va + e->loff, l0, lb);
+    memcpy(t_va + e->off, vec[0] + n0, n * sizeof(void*));
+    t_va_n += ln + n; t_ve_n++;
+}
+
 // testing only ([test] warview=N): every N country loops the war view's calls for both leaders of every
 // active war (gamestate+0x1e28: data +8, count +0x14), with the war view's budget (1 - acceptance) and
 // with the largest (100), each once with the game's code (t_ui_block) and once through t_ut, in
@@ -1207,7 +1603,8 @@ void eb_warview_test(uint8_t* gs) {
     int every = g_cfg.test_warview < 0 ? -g_cfg.test_warview : g_cfg.test_warview;   // < 0: only through t_ut (profiling)
     if (!every || ++loops % every || !g_ui_on) return;
     uint8_t* b = (uint8_t*)g_exe;
-    if (memcmp(b + RVA_OFFER_NEW, sig_offer_new, 16) || memcmp(b + RVA_OFFER_FREE, sig_offer_free, 16)) return;
+    // (with the wish memo these two are hooked: their first bytes were checked when it was installed)
+    if (!g_wish && (memcmp(b + RVA_OFFER_NEW, sig_offer_new, 16) || memcmp(b + RVA_OFFER_FREE, sig_offer_free, 16))) return;
     uint8_t** wars = *(uint8_t***)(gs + 0x1e30);
     int nw = *(int*)(gs + 0x1e3c), nv = 0;
     uint8_t** byidx = *(uint8_t***)(*(uint8_t**)(b + RVA_COUNTRIES) + 0x118);
@@ -1249,6 +1646,14 @@ void eb_warview_test(uint8_t* gs) {
                (long long)g_dm_new, (long long)g_dm_reuse, (long long)g_ui_sums, (long long)(g_ui_hit + g_ui_calc + g_ui_neg), (long long)g_ui_hit,
                (long long)g_ui_calc, (long long)g_ui_neg, (long long)g_lp_calls, (long long)g_lp_hit, (long long)g_ae_sum_ver, (long long)g_ae_sum_bad,
                (long long)g_ui_ver, (long long)g_ui_bad, (long long)g_lp_ver, (long long)g_lp_bad);
+    if (nv && g_wish) {
+        wish_flush(); reach_flush(); plist_flush();
+        eb_log("ai deal memo: %lld wish lists: %lld province valuations answered from the kept ones, %lld computed (%lld not kept, table full); "
+               "the list's own offer built %lld of %lld times; reach questions %lld, %lld of them kept; province lists %lld, %lld of them kept; most AE rows %ld | verify %lld, mismatches %lld",
+               (long long)g_w_sets, (long long)g_w_hit, (long long)g_w_calc, (long long)g_w_full, (long long)g_w_built, (long long)g_w_lazy,
+               (long long)(g_p_hit + g_p_calc), (long long)g_p_hit, (long long)(g_v_hit + g_v_calc), (long long)g_v_hit, (long)(t_av_rows > g_av_maxrows ? t_av_rows : g_av_maxrows),
+                   (long long)(g_w_ver + g_p_ver + g_v_ver), (long long)(g_w_bad + g_p_bad + g_v_bad));
+    }
 }
 
 // ---- army move check experiment ----
@@ -1379,11 +1784,379 @@ static void report_classes(void) {
                top[j]->self * g_ms / g_loops, (long long)top[j]->runs, top[j]->max * g_ms, (long)top[j]->spikes, class_name(top[j]->vt), top[j]->vt);
 }
 
+// ---- TEST [test] ai_path_stats=1: how often the map path search and its edge check repeat ----
+// FUN_14096c520(functor, unit, province from, province to, path out, options, p7, p8) is the map's path search
+// (45 callers; 48% of the AI update of a big country at war, 11-12). For every step it asks the functor
+// whether the unit can cross from one province to the next, which ends in
+// FUN_14096f860(functor, unit, p3, from, to, adjacency entry, options) (21%). This counts the calls and how many
+// ask something already asked - by the same search, the same AI task run, the same AI loop on the thread - for
+// all countries and for the focus country ([parallel] ai_item_focus) alone. Nothing is changed.
+#define RVA_PATH 0x96c520u
+#define RVA_EDGE 0x96f860u
+static const uint8_t sig_path[16] = { 0x4c,0x89,0x4c,0x24,0x20,0x48,0x89,0x54,0x24,0x10,0x48,0x89,0x4c,0x24,0x08,0x55 };
+static const uint8_t sig_edge[16] = { 0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x6c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57 };
+typedef uint64_t (*path_t)(uint8_t* functor, uint8_t* unit, uint8_t* from, uint8_t* to, void* out, uint8_t* opts, uint64_t p7, uint64_t p8);
+typedef uint64_t (*edge_t)(uint8_t* functor, uint8_t* unit, uint64_t p3, uint8_t* from, uint8_t* to, uint8_t* adj, uint8_t* opts);
+static path_t o_path;
+static edge_t o_edge;
+static __thread int t_focus;                      // inside the focus country's AI update
+// ---- EXPERIMENT [parallel] ai_path_ahead=1 (2 = + verify, default off): an army list's path searches on idle threads ----
+// FUN_140106320(ctx, target province, unit, ...) adds up the strength that can come to a province: for every
+// army of the country (list at country +0xd18) and of its allies that is near enough but in another area it
+// runs the map's path search FUN_14096c520(functor {vt 0x141c3af98}, army, the army's province, target,
+// path out, options) and counts the army only if there is a path. A search that finds no path walks the whole
+// reachable map: in the user's SPAIN campaign (11-12) Germany's five 48-regiment armies in Italy each asked
+// for the same Spanish province every day, 9,018 edge checks and 2-4 ms each, one after the other on
+// Germany's thread - 11 ms of its 15-19 ms a day, while the AI loop's other threads had long finished
+// (89% of all path search time of the AI loop went to searches without a path).
+// The searches of one such call do not depend on each other, and a search reads only its arguments and the
+// game state (plus the country's access cache, see the split experiment's locks). So:
+//   - a failed search is remembered per AI country (the unit and the AI loop);
+//   - when a call of FUN_140106320 makes its first search, the units that failed in this or the previous AI
+//     loop and are still in their country's unit list are searched ahead as jobs for idle threads: the same
+//     functor bytes, options and target as that first search, from the unit's province now;
+//   - a later search of the call whose every input equals a job's (unit, from, to, the functor's class - it has
+//     no fields -, options bytes, an empty path list) takes the job's result - the returned value, the options as the search left
+//     them and the path list - waiting for it if a thread is still on it, or runs the search itself if no
+//     thread has started it;
+//   - before FUN_140106320 returns, jobs nobody started are dropped and running ones are waited for (the game
+//     state must not change under a search), and paths nobody took are freed.
+// A wrong guess only costs idle time: nothing is used unless every input is the same. While jobs are out the
+// country's access cache is used under the split experiment's lock (hk_cget / hk_cput).
+// Verify mode runs the search again in place of every taken result and compares the returned value, the
+// options and the path.
+#define RVA_SUPPORT  0x106320u
+#define SUPPORT_SIZE 4459u        // the function's size: its three calls of the path search return into it
+#define RVA_GFREE    0x17394f0u   // operator delete(p, size)
+#define VT_PATH_SUPPORT 0x1c3af98u
+static const uint8_t sig_support[16] = { 0x48,0x8b,0xc4,0x4c,0x89,0x40,0x18,0x48,0x89,0x50,0x10,0x48,0x89,0x48,0x08,0x55 };
+static const uint8_t sig_gfree[5] = { 0xe9,0x2b,0x45,0x02,0x00 };
+typedef uint64_t (*support_t)(uint8_t* ctx, uint8_t* target, uint8_t* unit, void* p4, void* p5, uint64_t p6, uint64_t p7);
+typedef void (*gfree_t)(void* p, size_t n);
+static support_t o_support;
+static gfree_t g_gfree;
+static int g_ahead;                               // [parallel] ai_path_ahead
+#define PF_MAX 12                 // jobs of one call
+#define PF_OPTS 0x48
+typedef struct {
+    uint8_t* unit; uint8_t* from; uint8_t* to;
+    uint64_t functor[2];          // a functor of the caller's class: nothing but its vtable (its destructor frees 8 bytes)
+    uint8_t opts0[PF_OPTS];       // the options as the search got them
+    uint8_t opts[PF_OPTS];        // ... and as it left them
+    uint64_t out[3];              // the path list {head, tail, int count, char}: nodes of 0x20 bytes, next at +0x10
+    uint64_t result;
+    LONG64 ticks;
+    int taken;
+} pfdata_t;
+typedef struct { uintptr_t frame; int active, posted, n, cidx, q, fails; void* map; uint8_t* target; uint8_t* unit; job_t* jobs[PF_MAX]; } pfscope_t;
+static __thread pfscope_t t_pf;                   // the FUN_140106320 call running on this thread
+#define PH_N 24
+typedef struct { uint8_t* unit[PH_N]; LONG loop[PH_N]; int16_t owner[PH_N]; } phist_t;
+static phist_t* g_ph[NTAG];                       // failed searches by AI country; only that country's thread uses its entry
+static volatile LONG64 g_pf_scopes, g_pf_posted, g_pf_used[2], g_pf_own, g_pf_waited, g_pf_unused, g_pf_dropped,
+                       g_pf_saved, g_pf_end_wait, g_pf_ver, g_pf_bad, g_pf_badlog, g_pf_hist_q[6], g_pf_hist_f[6], g_pf_samples;
+// A/B (ai_path_ahead=3): odd AI loops send searches ahead, even ones do not; per side the time inside FUN_140106320 and the AI loop's wall time
+static volatile LONG64 g_pf_ab_t[2], g_pf_ab_n[2], g_pf_ab_wall[2], g_pf_ab_loops[2], g_pf_ab_max[2];
+static volatile LONG g_pf_loop_fails;             // searches without a path inside the reach sums of the running AI loop
+static volatile LONG64 g_pf_ab_wall3[2], g_pf_ab_loops3[2], g_pf_ab_t3[2];      // the same for the loops with 3 or more of them
+static LONG64 g_pf_loop_t;                        // time inside the reach sums of the running AI loop
+
+static void pf_run(job_t* j) {
+    pfdata_t* d = (pfdata_t*)j->arg;
+    t_node_run++;                                 // answers the army experiment keeps per AI task run do not carry over
+    LONG64 t0 = qpc();
+    d->result = o_path((uint8_t*)d->functor, d->unit, d->from, d->to, d->out, d->opts, 0, 0);
+    d->ticks = qpc() - t0;
+}
+static void pf_free_path(pfdata_t* d) {
+    for (uint8_t* nd = (uint8_t*)(uintptr_t)d->out[0]; nd;) {
+        uint8_t* nx = *(uint8_t**)(nd + 0x10);
+        g_gfree(nd, 0x20);
+        nd = nx;
+    }
+    d->out[0] = d->out[1] = d->out[2] = 0;
+}
+static void pf_wait(job_t* j) {
+    AcquireSRWLockExclusive(&g_done_lock);
+    while (j->state != 2) SleepConditionVariableSRW(&g_done_cv, &g_done_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&g_done_lock);
+}
+// the end of a FUN_140106320 call: no job of it may be left running
+static void pf_finish(pfscope_t* s) {
+    for (int i = 0; i < s->n; i++) {
+        job_t* j = s->jobs[i];
+        pfdata_t* d = (pfdata_t*)j->arg;
+        if (InterlockedCompareExchange(&j->state, 3, 0) == 0) InterlockedIncrement64(&g_pf_dropped);   // never started
+        else if (j->state != 3) {
+            if (j->state != 2) { InterlockedIncrement64(&g_pf_end_wait); pf_wait(j); }
+            if (!d->taken) InterlockedIncrement64(&g_pf_unused);
+            pf_free_path(d);
+        }
+        job_release(j);
+    }
+    if (s->map) InterlockedDecrement(&g_ctx_active[stripe(s->map)]);
+    s->n = 0; s->map = NULL; s->active = 0;
+}
+static void pf_note_fail(int cidx, uint8_t* unit) {
+    phist_t* h = g_ph[cidx];
+    if (!h) { h = (phist_t*)calloc(1, sizeof *h); if (!h) return; g_ph[cidx] = h; }
+    LONG now = g_ai_loop_n;
+    int at = -1;
+    for (int k = 0; k < PH_N && at < 0; k++) if (h->unit[k] == unit) at = k;
+    for (int k = 0; k < PH_N && at < 0; k++) if (!h->unit[k]) at = k;
+    if (at < 0) { at = 0; for (int k = 1; k < PH_N; k++) if (now - h->loop[k] > now - h->loop[at]) at = k; }   // the oldest
+    h->unit[at] = unit; h->loop[at] = now; h->owner[at] = (int16_t)(*(uint64_t*)(unit + 0xd0) >> 32);
+}
+static int pf_alive(uint8_t* unit, int owner) {     // still a unit of that country
+    if (owner < 0 || owner >= NTAG) return 0;
+    uint8_t* c = (*(uint8_t***)(*(uint8_t**)((uint8_t*)g_exe + RVA_COUNTRIES) + 0x118))[owner];
+    if (!c) return 0;
+    for (uint8_t** n = *(uint8_t***)(c + 0xd18); n; n = (uint8_t**)n[2])
+        if (n[0] == unit) return (int16_t)(*(uint64_t*)(unit + 0xd0) >> 32) == owner;
+    return 0;
+}
+// the first search of the call: the units that failed lately are searched ahead with its functor, options and target
+static void pf_post(pfscope_t* s, uint8_t* functor, uint8_t* unit, uint8_t* to, uint8_t* opts) {
+    s->posted = 1;
+    phist_t* h = g_ph[s->cidx];
+    if (!h || !g_qsem) return;
+    LONG now = g_ai_loop_n;
+    void* map = *(void**)(opts + 0x38);           // the country's access cache the edge checks use
+    for (int k = 0; k < PH_N && s->n < PF_MAX; k++) {
+        uint8_t* u = h->unit[k];
+        if (!u || u == unit || (uint32_t)(now - h->loop[k]) > 1u || !pf_alive(u, h->owner[k])) continue;
+        uint8_t* from = *(uint8_t**)(u + 0xe8);
+        if (!from || from == to) continue;
+        job_t* j = (job_t*)calloc(1, sizeof(job_t) + sizeof(pfdata_t));
+        if (!j) return;
+        pfdata_t* d = (pfdata_t*)(j + 1);
+        j->run = pf_run; j->arg = d; j->ctx = NULL; j->state = 0; j->refs = 2; j->n = 0;
+        d->unit = u; d->from = from; d->to = to;
+        d->functor[0] = *(uint64_t*)functor;
+        memcpy(d->opts0, opts, PF_OPTS); memcpy(d->opts, opts, PF_OPTS);
+        if (!s->n && map) { s->map = map; InterlockedIncrement(&g_ctx_active[stripe(map)]); }
+        AcquireSRWLockExclusive(&g_qlock);
+        int queued = g_qn < QCAP;
+        if (queued) g_q[g_qn++] = j;
+        ReleaseSRWLockExclusive(&g_qlock);
+        if (!queued) { free(j); return; }
+        ReleaseSemaphore(g_qsem, 1, NULL);
+        s->jobs[s->n++] = j;
+        InterlockedIncrement64(&g_pf_posted);
+    }
+}
+static int pf_same_path(uint64_t* a, uint64_t* b) {
+    if (*(int*)(a + 2) != *(int*)(b + 2)) return 0;
+    uint8_t* x = (uint8_t*)(uintptr_t)a[0]; uint8_t* y = (uint8_t*)(uintptr_t)b[0];
+    for (; x && y; x = *(uint8_t**)(x + 0x10), y = *(uint8_t**)(y + 0x10))
+        if (*(int*)x != *(int*)y) return 0;
+    return !x && !y;
+}
+// the path search as asked by the game (ra: where the call returns)
+static uint64_t path_do(void* ra, uint8_t* functor, uint8_t* unit, uint8_t* from, uint8_t* to, uint64_t* out, uint8_t* opts, uint64_t p7, uint64_t p8) {
+    pfscope_t* s = &t_pf;
+    if (!s->active || p8 || !out || !opts || !unit || !from || !to ||
+        (uintptr_t)ra - ((uintptr_t)g_exe + RVA_SUPPORT) >= SUPPORT_SIZE ||
+        (uintptr_t)__builtin_frame_address(0) >= s->frame ||
+        *(uintptr_t*)functor != (uintptr_t)g_exe + VT_PATH_SUPPORT ||
+        out[0] || out[1] || *(int*)(out + 2) || *((uint8_t*)out + 0x14))
+        return o_path(functor, unit, from, to, out, opts, p7, p8);
+    for (int i = 0; i < s->n; i++) {
+        job_t* j = s->jobs[i];
+        pfdata_t* d = (pfdata_t*)j->arg;
+        if (d->taken || d->unit != unit || d->from != from || d->to != to || memcmp(d->opts0, opts, PF_OPTS)) continue;
+        d->taken = 1;
+        if (InterlockedCompareExchange(&j->state, 3, 0) == 0) {       // no thread took it: here, as usual
+            InterlockedIncrement64(&g_pf_own);
+            break;
+        }
+        if (j->state != 2) { InterlockedIncrement64(&g_pf_waited); pf_wait(j); }
+        int found = (uint8_t)d->result != 0;
+        InterlockedIncrement64(&g_pf_used[found]);
+        InterlockedAdd64(&g_pf_saved, d->ticks);
+        if (!found) { pf_note_fail(s->cidx, unit); InterlockedIncrement(&g_pf_loop_fails); }
+        if (g_ahead == 2) {
+            uint64_t r = o_path(functor, unit, from, to, out, opts, p7, p8);
+            InterlockedIncrement64(&g_pf_ver);
+            if ((uint8_t)r != (uint8_t)d->result || memcmp(opts, d->opts, PF_OPTS) || !pf_same_path(out, d->out)) {
+                InterlockedIncrement64(&g_pf_bad);
+                if (InterlockedIncrement64(&g_pf_badlog) <= 20)
+                    eb_log("ai path ahead: VERIFY MISMATCH unit %p from %d to %d: ahead %d (%d steps), now %d (%d steps)%s", (void*)unit,
+                           *(int*)(from + 0x20), *(int*)(to + 0x20), (int)(uint8_t)d->result, *(int*)(d->out + 2), (int)(uint8_t)r, *(int*)(out + 2),
+                           memcmp(opts, d->opts, PF_OPTS) ? ", options differ" : "");
+            }
+            return r;
+        }
+        memcpy(opts, d->opts, PF_OPTS);
+        memcpy(out, d->out, 0x15);
+        d->out[0] = d->out[1] = d->out[2] = 0;        // the path is the caller's now
+        return d->result;
+    }
+    if (!s->posted) pf_post(s, functor, unit, to, opts);
+    uint64_t r = o_path(functor, unit, from, to, out, opts, p7, p8);
+    s->q++;
+    if (!(uint8_t)r) { pf_note_fail(s->cidx, unit); s->fails++; InterlockedIncrement(&g_pf_loop_fails); }
+    return r;
+}
+static uint64_t hk_support(uint8_t* ctx, uint8_t* target, uint8_t* unit, void* p4, void* p5, uint64_t p6, uint64_t p7) {
+    pfscope_t* s = &t_pf;
+    uintptr_t f = (uintptr_t)__builtin_frame_address(0);
+    if (s->active && s->frame <= f) pf_finish(s);     // a call left by an exception
+    if (s->active || !g_ai_loop_active || *(volatile uint8_t*)((uint8_t*)g_exe + RVA_FIXED_SEED_FLAG))
+        return o_support(ctx, target, unit, p4, p5, p6, p7);
+    int cidx = (int16_t)(*(uint64_t*)(ctx + 0x28) >> 32);
+    if (cidx < 0 || cidx >= NTAG) return o_support(ctx, target, unit, p4, p5, p6, p7);
+    int side = g_ahead != 3 || (g_ai_loop_n & 1);
+    s->active = 1; s->frame = f; s->posted = !side; s->n = 0; s->cidx = cidx; s->map = NULL; s->q = s->fails = 0; s->target = target; s->unit = unit;
+    LONG64 t0 = g_ahead == 3 ? qpc() : 0;
+    uint64_t r = o_support(ctx, target, unit, p4, p5, p6, p7);
+    if (g_ahead == 3) { LONG64 d = qpc() - t0; InterlockedAdd64(&g_pf_ab_t[side], d); InterlockedIncrement64(&g_pf_ab_n[side]); InterlockedAdd64(&g_pf_loop_t, d); }
+    InterlockedIncrement64(&g_pf_hist_q[s->q < 5 ? s->q : 5]); InterlockedIncrement64(&g_pf_hist_f[s->fails < 5 ? s->fails : 5]);
+    if (t_focus && s->fails && InterlockedIncrement64(&g_pf_samples) <= 60)
+        eb_log("ai path ahead: TEST sample loop %ld run %u: reach sum for unit %p (in %d) to province %d: %d searches run here, %d without a path, %d jobs",
+               (long)g_ai_loop_n, t_node_run, (void*)unit, unit && *(uint8_t**)(unit + 0xe8) ? *(int*)(*(uint8_t**)(unit + 0xe8) + 0x20) : -1,
+               target ? *(int*)(target + 0x20) : -1, s->q, s->fails, s->n);
+    pf_finish(s);
+    InterlockedIncrement64(&g_pf_scopes);
+    return r;
+}
+static void pf_report(void) {
+    eb_log("ai path ahead: %lld loops: %lld calls of the reach sum; %lld searches sent ahead: %lld taken without a path and %lld with one "
+           "(%.1f ms of searching a loop not done on the country's thread; waited for %lld), %lld run by the asking thread itself, "
+           "%lld never asked for, %lld never started; waited at the end of a call %lld times | verify %lld, mismatches %lld",
+           (long long)g_loops, (long long)g_pf_scopes, (long long)g_pf_posted, (long long)g_pf_used[0], (long long)g_pf_used[1],
+           g_pf_saved * g_ms / (g_loops ? g_loops : 1), (long long)g_pf_waited, (long long)g_pf_own, (long long)g_pf_unused,
+           (long long)g_pf_dropped, (long long)g_pf_end_wait, (long long)g_pf_ver, (long long)g_pf_bad);
+    if (g_ahead == 3)
+        for (int k = 0; k < 2; k++)
+            eb_log("ai path ahead A/B %s: %lld AI loops, wall %.2f ms each (longest %.1f ms); %lld calls of the reach sum, %.2f ms a loop inside them | "
+                   "loops with 3+ searches without a path: %lld, wall %.2f ms each, %.2f ms inside the reach sums",
+                   k ? "B (searches ahead)" : "A (the game)      ", (long long)g_pf_ab_loops[k], g_pf_ab_loops[k] ? g_pf_ab_wall[k] * g_ms / g_pf_ab_loops[k] : 0.0,
+                   g_pf_ab_max[k] * g_ms, (long long)g_pf_ab_n[k], g_pf_ab_loops[k] ? g_pf_ab_t[k] * g_ms / g_pf_ab_loops[k] : 0.0,
+                   (long long)g_pf_ab_loops3[k], g_pf_ab_loops3[k] ? g_pf_ab_wall3[k] * g_ms / g_pf_ab_loops3[k] : 0.0,
+                   g_pf_ab_loops3[k] ? g_pf_ab_t3[k] * g_ms / g_pf_ab_loops3[k] : 0.0);
+    eb_log("ai path ahead:   calls by searches run on the thread (0/1/2/3/4/5+): %lld/%lld/%lld/%lld/%lld/%lld; by searches without a path: %lld/%lld/%lld/%lld/%lld/%lld",
+           (long long)g_pf_hist_q[0], (long long)g_pf_hist_q[1], (long long)g_pf_hist_q[2], (long long)g_pf_hist_q[3], (long long)g_pf_hist_q[4], (long long)g_pf_hist_q[5],
+           (long long)g_pf_hist_f[0], (long long)g_pf_hist_f[1], (long long)g_pf_hist_f[2], (long long)g_pf_hist_f[3], (long long)g_pf_hist_f[4], (long long)g_pf_hist_f[5]);
+}
+
+#define PS_SLOTS 65536
+typedef struct { uint64_t* k; uint32_t* g; uint32_t gen; } pset_t;             // a set of 64-bit keys per generation
+static __thread pset_t t_ps[7];                   // 0 path/run, 1 path/loop, 2 edge/search, 3 edge/run, 4 edge/loop, 5 start/run, 6 start/loop
+static __thread uint32_t t_ps_search;
+static __thread LONG64 t_ps_edges;                // edge checks of the running search
+static volatile LONG g_ps_samples;
+static volatile LONG64 g_ps_path[2][3], g_ps_edge[2][4], g_ps_path_t[2], g_ps_found[2];   // [all, focus][calls, repeats...]
+static volatile LONG64 g_ps_start[2][2], g_ps_fail_t[2], g_ps_fail_start[2][2];           // same unit, start and options searched before: run, loop
+static int ps_seen(int s, uint32_t gen, uint64_t key) {          // 1 = already in set s of this generation
+    pset_t* p = &t_ps[s];
+    if (!p->k) { p->k = (uint64_t*)calloc(PS_SLOTS, sizeof *p->k); p->g = (uint32_t*)calloc(PS_SLOTS, sizeof *p->g); if (!p->k || !p->g) return 0; }
+    uint32_t i = (uint32_t)(key >> 20) & (PS_SLOTS - 1);
+    for (int n = 0; n < 64; n++, i = (i + 1) & (PS_SLOTS - 1)) {
+        if (p->g[i] != gen) { p->g[i] = gen; p->k[i] = key; return 0; }
+        if (p->k[i] == key) return 1;
+    }
+    return 0;                                         // crowded: counted as new
+}
+static inline uint64_t ps_mix(uint64_t h, uint64_t v) { h = (h ^ v) * 0x9E3779B97F4A7C15ull; return h ^ h >> 29; }
+static uint64_t hk_path(uint8_t* functor, uint8_t* unit, uint8_t* from, uint8_t* to, void* out, uint8_t* opts, uint64_t p7, uint64_t p8) {
+    void* ra = __builtin_return_address(0);
+    if (!g_cfg.test_path_stats || !g_ai_loop_active) return path_do(ra, functor, unit, from, to, (uint64_t*)out, opts, p7, p8);
+    uint64_t key = ps_mix(ps_mix(ps_mix(ps_mix(1, *(uint64_t*)functor), (uintptr_t)unit), (uintptr_t)from), (uintptr_t)to);
+    if (opts) for (int i = 0; i < 0x48; i += 8) key = ps_mix(key, *(uint64_t*)(opts + i));
+    uint32_t run = (uint32_t)t_node_run * 2654435761u ^ (uint32_t)g_ai_loop_n;
+    int r_run = ps_seen(0, run | 1, key), r_loop = ps_seen(1, (uint32_t)g_ai_loop_n | 1, key);
+    uint64_t ks = ps_mix(ps_mix(ps_mix(3, *(uint64_t*)functor), (uintptr_t)unit), (uintptr_t)from);    // the search without its target
+    if (opts) for (int i = 0; i < 0x48; i += 8) ks = ps_mix(ks, *(uint64_t*)(opts + i));
+    int s_run = ps_seen(5, run | 1, ks), s_loop = ps_seen(6, (uint32_t)g_ai_loop_n | 1, ks);
+    uint32_t saved = t_ps_search;
+    t_ps_search = (t_ps_search * 7 + 3 + (uint32_t)(uintptr_t)&key) | 1;        // a generation of its own for this search's edges
+    LONG64 e0 = t_ps_edges; t_ps_edges = 0;
+    LONG64 t0 = qpc();
+    uint64_t r = path_do(ra, functor, unit, from, to, (uint64_t*)out, opts, p7, p8);
+    LONG64 d = qpc() - t0;
+    LONG64 edges = t_ps_edges; t_ps_edges = e0 + edges;
+    t_ps_search = saved;
+    if (t_focus && d * g_ms > 0.3 && InterlockedIncrement(&g_ps_samples) <= 120) {
+        uint8_t* b = (uint8_t*)g_exe;
+        uint8_t* fl = from ? *(uint8_t**)(from + 0x28) : NULL; uint8_t* tl = to ? *(uint8_t**)(to + 0x28) : NULL;
+        eb_log("ai path: TEST sample loop %ld run %u: %s in %.2f ms, %lld edge checks | caller eu4.exe+0x%llx functor vt +0x%llx | unit %p (%d regiments, vt +0x%llx) "
+               "from %d (flags %02x %02x, owner %.3s) to %d (flags %02x %02x, owner %.3s) | opts %016llx %016llx %016llx %016llx %016llx | p7 %llx p8 %llx | out count %d",
+               (long)g_ai_loop_n, t_node_run, (uint8_t)r ? "FOUND" : "no path", d * g_ms, (long long)edges,
+               (unsigned long long)((uint8_t*)ra - b), (unsigned long long)(*(uint8_t**)functor - b),
+               (void*)unit, (int)((*(uint8_t**)(unit + 0x38) - *(uint8_t**)(unit + 0x30)) >> 3), (unsigned long long)(*(uint8_t**)unit - b),
+               from ? *(int*)(from + 0x20) : -1, fl ? fl[0x228] : 0, fl ? fl[0x229] : 0, from ? (char*)(from + 0x468) : "?",
+               to ? *(int*)(to + 0x20) : -1, tl ? tl[0x228] : 0, tl ? tl[0x229] : 0, to ? (char*)(to + 0x468) : "?",
+               opts ? *(unsigned long long*)opts : 0ull, opts ? *(unsigned long long*)(opts + 8) : 0ull, opts ? *(unsigned long long*)(opts + 0x10) : 0ull,
+               opts ? *(unsigned long long*)(opts + 0x18) : 0ull, opts ? *(unsigned long long*)(opts + 0x20) : 0ull,
+               (unsigned long long)p7, (unsigned long long)p8, out ? *(int*)((uint8_t*)out + 0x10) : -1);
+    }
+    for (int f = 0; f <= t_focus; f++) {
+        InterlockedIncrement64(&g_ps_path[f][0]);
+        if (r_run) InterlockedIncrement64(&g_ps_path[f][1]);
+        if (r_loop) InterlockedIncrement64(&g_ps_path[f][2]);
+        InterlockedAdd64(&g_ps_path_t[f], d);
+        if ((uint8_t)r) InterlockedIncrement64(&g_ps_found[f]);
+        else { InterlockedAdd64(&g_ps_fail_t[f], d); if (s_run) InterlockedIncrement64(&g_ps_fail_start[f][0]); if (s_loop) InterlockedIncrement64(&g_ps_fail_start[f][1]); }
+        if (s_run) InterlockedIncrement64(&g_ps_start[f][0]);
+        if (s_loop) InterlockedIncrement64(&g_ps_start[f][1]);
+    }
+    return r;
+}
+static uint64_t hk_edge(uint8_t* functor, uint8_t* unit, uint64_t p3, uint8_t* from, uint8_t* to, uint8_t* adj, uint8_t* opts) {
+    if (g_ai_loop_active) {
+        t_ps_edges++;
+        uint64_t key = ps_mix(ps_mix(ps_mix(ps_mix(ps_mix(2, (uintptr_t)unit), p3), (uintptr_t)from), (uintptr_t)to), (uintptr_t)adj);
+        if (opts) key = ps_mix(ps_mix(key, *(uint64_t*)opts), *(uint64_t*)(opts + 8));
+        uint32_t run = (uint32_t)t_node_run * 2654435761u ^ (uint32_t)g_ai_loop_n;
+        int r_s = ps_seen(2, t_ps_search | 1, key), r_run = ps_seen(3, run | 1, key), r_loop = ps_seen(4, (uint32_t)g_ai_loop_n | 1, key);
+        for (int f = 0; f <= t_focus; f++) {
+            InterlockedIncrement64(&g_ps_edge[f][0]);
+            if (r_s) InterlockedIncrement64(&g_ps_edge[f][1]);
+            if (r_run) InterlockedIncrement64(&g_ps_edge[f][2]);
+            if (r_loop) InterlockedIncrement64(&g_ps_edge[f][3]);
+        }
+    }
+    return o_edge(functor, unit, p3, from, to, adj, opts);
+}
+static void ps_report(void) {
+    for (int f = 0; f < 2; f++) {
+        if (!g_ps_path[f][0] && !g_ps_edge[f][0]) continue;
+        eb_log("ai path: TEST %s: %lld path searches (%.1f ms a loop, %.0f us each, %lld found), asked before in the same AI task run %lld (%.1f%%), "
+               "in the same AI loop on the thread %lld (%.1f%%) | %lld edge checks (%.0f a search): asked before in the same search %lld (%.1f%%), "
+               "the same run %lld (%.1f%%), the same loop %lld (%.1f%%)", f ? g_cfg.ai_item_focus : "all countries",
+               (long long)g_ps_path[f][0], g_ps_path_t[f] * g_ms / (g_loops ? g_loops : 1), g_ps_path[f][0] ? g_ps_path_t[f] * g_ms * 1000.0 / g_ps_path[f][0] : 0.0,
+               (long long)g_ps_found[f], (long long)g_ps_path[f][1], g_ps_path[f][0] ? 100.0 * g_ps_path[f][1] / g_ps_path[f][0] : 0.0,
+               (long long)g_ps_path[f][2], g_ps_path[f][0] ? 100.0 * g_ps_path[f][2] / g_ps_path[f][0] : 0.0,
+               (long long)g_ps_edge[f][0], g_ps_path[f][0] ? (double)g_ps_edge[f][0] / g_ps_path[f][0] : 0.0,
+               (long long)g_ps_edge[f][1], g_ps_edge[f][0] ? 100.0 * g_ps_edge[f][1] / g_ps_edge[f][0] : 0.0,
+               (long long)g_ps_edge[f][2], g_ps_edge[f][0] ? 100.0 * g_ps_edge[f][2] / g_ps_edge[f][0] : 0.0,
+               (long long)g_ps_edge[f][3], g_ps_edge[f][0] ? 100.0 * g_ps_edge[f][3] / g_ps_edge[f][0] : 0.0);
+        LONG64 nf = g_ps_path[f][0] - g_ps_found[f];
+        eb_log("ai path: TEST %s: searches without a path %lld, %.1f ms a loop (%.0f us each; the found ones %.0f us each) | the same unit, start and options "
+               "searched before (any target): in the same run %lld, in the same loop %lld; of the searches without a path %lld and %lld", f ? g_cfg.ai_item_focus : "all countries",
+               (long long)nf, g_ps_fail_t[f] * g_ms / (g_loops ? g_loops : 1), nf ? g_ps_fail_t[f] * g_ms * 1000.0 / nf : 0.0,
+               g_ps_found[f] ? (g_ps_path_t[f] - g_ps_fail_t[f]) * g_ms * 1000.0 / g_ps_found[f] : 0.0,
+               (long long)g_ps_start[f][0], (long long)g_ps_start[f][1], (long long)g_ps_fail_start[f][0], (long long)g_ps_fail_start[f][1]);
+    }
+}
+
+// diagnostics [parallel] ai_item_focus=TAG (with ai_item_stats): that country's AI update runs through item_focus,
+// a frame of its own on the stack, so that a profile of all threads can be cut down to that one country (the
+// log has the frame's address; bench tool prof_focus.py).
+static volatile LONG64 g_focus_runs;
+static __attribute__((noinline)) void item_focus(uint8_t* ai) {
+    t_focus = 1;
+    o_item(ai);
+    t_focus = 0;
+    InterlockedIncrement64(&g_focus_runs);            // (also keeps the call above from becoming a jump)
+}
 static void hk_item(uint8_t* ai) {
     t_nested = 0;
     t_ph[0] = t_ph[1] = t_ph[2] = 0;
     LONG64 t0 = qpc();
-    o_item(ai);
+    if (g_cfg.ai_item_focus[0] && !memcmp(ai + 0x20, g_cfg.ai_item_focus, 3)) item_focus(ai);
+    else o_item(ai);
     LONG64 d = qpc() - t0;
     int idx = *(int16_t*)(ai + 0x24);
     if (idx < 0 || idx >= NTAG) return;
@@ -1485,12 +2258,18 @@ static void hk_loop(uint8_t* items, void* ctx) {
     o_loop(items, ctx);
     InterlockedExchange(&g_ai_loop_active, 0);
     InterlockedExchangePointer(&g_ae_cache, NULL);
-    if ((g_split || g_prov) && g_qn) {           // jobs left behind (done by their owners): drop
+    if ((g_split || g_prov || g_ahead) && g_qn) { // jobs left behind (done by their owners): drop
         AcquireSRWLockExclusive(&g_qlock);
         while (g_qn) job_discard(g_q[--g_qn]);
         ReleaseSRWLockExclusive(&g_qlock);
     }
     LONG64 w = qpc() - t0;
+    if (g_ahead == 3) {
+        int k = g_ai_loop_n & 1;
+        g_pf_ab_wall[k] += w; g_pf_ab_loops[k]++; if (w > g_pf_ab_max[k]) g_pf_ab_max[k] = w;
+        if (g_pf_loop_fails >= 3) { g_pf_ab_wall3[k] += w; g_pf_ab_loops3[k]++; g_pf_ab_t3[k] += g_pf_loop_t; }
+        InterlockedExchange(&g_pf_loop_fails, 0); InterlockedExchange64(&g_pf_loop_t, 0);
+    }
     g_wall += w;
     g_slow += g_loop_max;
     g_walls[g_loops % NWALL] = (float)(w * g_ms);
@@ -1552,12 +2331,22 @@ static void hk_loop(uint8_t* items, void* ctx) {
                     eb_log("ai land A/B %s: %lld top-level calls, avg %.3f ms, total %.1f ms, longest %.1f ms", s ? "B (memo)    " : "A (the game)",
                            (long long)g_ad_n[s], g_ad_n[s] ? g_ad_t[s] * g_ms / g_ad_n[s] : 0.0, g_ad_t[s] * g_ms, g_ad_max[s] * g_ms);
         }
+        if (g_wish) {
+            wish_flush(); reach_flush(); plist_flush();
+            eb_log("ai deal memo: %lld wish lists: %lld province valuations answered from the kept ones, %lld computed (%lld not kept, table full); "
+                   "the list's own offer built %lld of %lld times; reach questions %lld, %lld of them kept; province lists %lld, %lld of them kept; most AE rows %ld | verify %lld, mismatches %lld",
+                   (long long)g_w_sets, (long long)g_w_hit, (long long)g_w_calc, (long long)g_w_full, (long long)g_w_built, (long long)g_w_lazy,
+                   (long long)(g_p_hit + g_p_calc), (long long)g_p_hit, (long long)(g_v_hit + g_v_calc), (long long)g_v_hit, (long)(t_av_rows > g_av_maxrows ? t_av_rows : g_av_maxrows),
+                   (long long)(g_w_ver + g_p_ver + g_v_ver), (long long)(g_w_bad + g_p_bad + g_v_bad));
+        }
         if (g_aec == 3)
             for (int s = 0; s < 2; s++)
                 eb_log("ai ae A/B %s: %lld AE sums, avg %.2f us, total %.1f ms, max %.3f ms",
                        s ? "B (ae_sum, tables)    " : "A (game's code and map)", (long long)g_ae_ab_n[s], g_ae_ab_n[s] ? g_ae_ab_t[s] * g_ms * 1000.0 / g_ae_ab_n[s] : 0.0,
                        g_ae_ab_t[s] * g_ms, g_ae_ab_max[s] * g_ms);
     }
+    if (g_cfg.test_path_stats && g_loops % 100 == 0) ps_report();
+    if (g_ahead && g_loops % (g_ahead == 1 ? 500 : 100) == 0) pf_report();
     if (!g_stats) return;
     if (g_loops == 50) dump_trees(items);
     if (g_loops % 100 == 0) report();
@@ -1565,16 +2354,17 @@ static void hk_loop(uint8_t* items, void* ctx) {
 }
 
 static int ai_all_off(void) {                    // nothing of this file is installed
-    g_stats = g_split = g_prov = g_aec = g_alm = g_army = 0;
-    g_cfg.ai_item_stats = g_cfg.ai_split = g_cfg.ai_prov_split = g_cfg.ai_ae_cache = g_cfg.ai_land_memo = g_cfg.ai_army_fast = 0;
+    g_stats = g_split = g_prov = g_aec = g_alm = g_army = g_wish = g_ahead = 0;
+    g_cfg.ai_item_stats = g_cfg.ai_split = g_cfg.ai_prov_split = g_cfg.ai_ae_cache = g_cfg.ai_land_memo = g_cfg.ai_army_fast = g_cfg.ai_deal_memo = g_cfg.ai_path_ahead = 0;
     return 0;
 }
 
 int eb_aiprof_install(void) {
     g_stats = g_cfg.ai_item_stats; g_split = g_cfg.ai_split == 1; g_prov = g_cfg.ai_prov_split; g_aec = g_cfg.ai_ae_cache;
     g_alm = g_aec ? g_cfg.ai_land_memo : 0;
+    g_wish = g_aec ? g_cfg.ai_deal_memo : 0;
     g_army = g_cfg.ai_army_fast;
-    if (!g_stats && !g_split && !g_prov && !g_aec && !g_army) return 1;
+    if (!g_stats && !g_split && !g_prov && !g_aec && !g_army && !g_cfg.test_path_stats && !g_cfg.ai_path_ahead) return 1;
     uint8_t* b = (uint8_t*)g_exe;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + ((IMAGE_DOS_HEADER*)g_exe)->e_lfanew);
     if (nt->FileHeader.TimeDateStamp != 0x66FE6AB9u || memcmp(b + RVA_AI_ITEM, sig_item, sizeof sig_item) ||
@@ -1633,7 +2423,7 @@ int eb_aiprof_install(void) {
             !eb_hs_add(&hs, b + RVA_AEALL, (void*)hk_aeall, (void**)&o_aeall) || !eb_hs_enable(&hs)) {
             if (!hs.failed) eb_hs_undo(&hs, "a signature differs");
             eb_log("ai ae: signature mismatch or hook failed - not installed");
-            g_aec = 0; g_alm = 0;
+            g_aec = 0; g_alm = 0; g_wish = 0;
         } else {
             g_aecalc = (aecalc_t)(b + RVA_AECALC);
             g_etsget = (etsget_t)(b + RVA_ETS_GET);
@@ -1654,6 +2444,22 @@ int eb_aiprof_install(void) {
                 g_alm = 0;
             }
             if (!g_ui_on) { eb_log("ai ae: deal fill / acceptance signature mismatch or hook failed - only the AI loop uses the tables"); g_alm = 0; }
+            eb_hs_init(&hs, "ai wish");
+            if (g_wish && (!g_ui_on || memcmp(b + RVA_WISH, sig_wish, 16) || memcmp(b + RVA_PVALUE, sig_pvalue, 16) ||
+                           memcmp(b + RVA_OFFER_NEW, sig_offer_new, 16) || memcmp(b + RVA_OFFER_FREE, sig_offer_free, 16) ||
+                           !eb_hs_add(&hs, b + RVA_WISH, (void*)hk_wish, (void**)&o_wish) ||
+                           !eb_hs_add(&hs, b + RVA_PVALUE, (void*)hk_pvalue, (void**)&o_pvalue) ||
+                           !eb_hs_add(&hs, b + RVA_OFFER_NEW, (void*)hk_offer_ctor, (void**)&o_offer_ctor) ||
+                           !eb_hs_add(&hs, b + RVA_OFFER_FREE, (void*)hk_offer_dtor, (void**)&o_offer_dtor) ||
+                           memcmp(b + RVA_PREACH, sig_preach, 16) || memcmp(b + RVA_PNEAR, sig_pnear, 16) ||
+                           !eb_hs_add(&hs, b + RVA_PREACH, (void*)hk_preach, (void**)&o_preach) ||
+                           !eb_hs_add(&hs, b + RVA_PNEAR, (void*)hk_pnear, (void**)&o_pnear) ||
+                           memcmp(b + RVA_PLIST, sig_plist, 16) || memcmp(b + RVA_VPUSH, sig_vpush, 16) ||
+                           !eb_hs_add(&hs, b + RVA_PLIST, (void*)hk_plist, (void**)&o_plist) || !eb_hs_enable(&hs))) {
+                if (!hs.failed) eb_hs_undo(&hs, "a signature differs");
+                eb_log("ai deal memo: signature mismatch or hook failed - not installed");
+                g_wish = 0;
+            } else g_vpush = (vpush_t)(b + RVA_VPUSH);
         }
     }
     if (g_stats) {
@@ -1661,6 +2467,7 @@ int eb_aiprof_install(void) {
         int ok = 1;
         for (int k = 0; k < NFM && ok; k++) {
             if (g_aec && (g_fmf[k].rva == RVA_AEP || g_fmf[k].rva == RVA_AEALL || (g_ui_on && g_fmf[k].rva == RVA_OFFER_FILL))) continue;   // hooked by the experiment
+            if (g_wish && g_fmf[k].rva == RVA_OFFER_NEW) continue;
             ok = !memcmp(b + g_fmf[k].rva, g_fmf[k].sig, 8) && eb_hs_add(&hs, b + g_fmf[k].rva, g_fm_hk[k], (void**)&o_fm[k]);
         }
         if (!ok && !hs.failed) eb_hs_undo(&hs, "a signature differs");
@@ -1699,6 +2506,43 @@ int eb_aiprof_install(void) {
                g_alm == 2 ? " with VERIFY" : g_alm == 3 ? " as A/B (deals alternate between the game's searches and the memo)" : "");
     else if (g_cfg.ai_land_memo) eb_log("ai land: off - needs [parallel] ai_ae_cache and its deal hooks");
     if (g_stats) eb_log("ai items: timing every country of the AI loop and every AI task run (reports every 100 / 500 loops)");
+    g_ahead = g_cfg.ai_path_ahead;
+    if (g_cfg.test_path_stats || g_ahead) {
+        eb_hs_init(&hs, "ai path");
+        int ok = !memcmp(b + RVA_PATH, sig_path, 16) && eb_hs_add(&hs, b + RVA_PATH, (void*)hk_path, (void**)&o_path);
+        if (ok && g_cfg.test_path_stats) ok = !memcmp(b + RVA_EDGE, sig_edge, 16) && eb_hs_add(&hs, b + RVA_EDGE, (void*)hk_edge, (void**)&o_edge);
+        if (ok && g_ahead)
+            ok = g_qsem && !memcmp(b + RVA_SUPPORT, sig_support, 16) && !memcmp(b + RVA_GFREE, sig_gfree, 5) &&
+                 eb_hs_add(&hs, b + RVA_SUPPORT, (void*)hk_support, (void**)&o_support) &&
+                 (g_split || (!memcmp(b + RVA_CGET, sig_cget, sizeof sig_cget) && !memcmp(b + RVA_CPUT, sig_cput, sizeof sig_cput) &&
+                              eb_hs_add(&hs, b + RVA_CGET, (void*)hk_cget, (void**)&o_cget) &&
+                              eb_hs_add(&hs, b + RVA_CPUT, (void*)hk_cput, (void**)&o_cput)));
+        if (!ok || !eb_hs_enable(&hs)) {
+            if (!hs.failed) eb_hs_undo(&hs, "a signature differs");
+            eb_log("ai path: signature mismatch or hook failed - not installed");
+            g_ahead = 0; g_cfg.test_path_stats = 0;
+        } else {
+            g_gfree = (gfree_t)(b + RVA_GFREE);
+            if (g_cfg.test_path_stats) eb_log("ai path: TEST counting the path searches and edge checks of the AI loop");
+            if (g_ahead) {
+                eb_par_help = ai_help; eb_par_linger = ai_linger;
+                eb_log("ai path ahead: EXPERIMENT on%s - the path searches of an army list that found no path lately are run ahead on idle threads",
+                       g_ahead == 2 ? " with VERIFY" : g_ahead == 3 ? " as A/B (odd AI loops ahead, even ones the game's way)" : "");
+            }
+        }
+    }
+    g_cfg.ai_path_ahead = g_ahead;
+    if (g_stats && g_cfg.ai_item_focus[0]) {
+        HMODULE me = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(void*)item_focus, &me);
+        eb_log("ai items: focus on %.3s - its AI update runs through eu4boost.dll+0x%llx", g_cfg.ai_item_focus,
+               (unsigned long long)((uintptr_t)(void*)item_focus - (uintptr_t)me));
+    }
+    if (g_wish)
+        eb_log("ai deal memo: EXPERIMENT on%s - within one peace deal fill the provinces a country wishes for are valued once, and the reach questions and province lists are asked once",
+               g_wish == 2 ? " with VERIFY" : "");
+    else if (g_cfg.ai_deal_memo) eb_log("ai deal memo: off - needs [parallel] ai_ae_cache and its deal hooks");
     g_cfg.ai_split = g_split; g_cfg.ai_prov_split = g_prov; g_cfg.ai_ae_cache = g_aec; g_cfg.ai_land_memo = g_alm; g_cfg.ai_army_fast = g_army;
+    g_cfg.ai_deal_memo = g_wish;
     return 1;
 }

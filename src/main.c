@@ -182,13 +182,17 @@ static void load_config(void) {
     c->par_caps             = ini_int(ini, L"parallel",  L"small_loop_caps", 1);   // on since 0.3.0 (validated)
     c->par_lpt              = ini_int(ini, L"parallel",  L"longest_first", 0);     // experimental
     c->ai_item_stats        = ini_int(ini, L"parallel",  L"ai_item_stats", 0);     // diagnostics
+    { wchar_t ws[8]; GetPrivateProfileStringW(L"parallel", L"ai_item_focus", L"", ws, 8, ini);           // diagnostics
+      for (int i = 0; i < 3; i++) c->ai_item_focus[i] = (char)ws[i] && ws[1] && ws[2] ? (char)ws[i] : 0; }
     c->ai_split             = ini_int(ini, L"parallel",  L"ai_split", 0);          // experimental
+    c->ai_path_ahead        = ini_int(ini, L"parallel",  L"ai_path_ahead", 0);     // experimental
     c->ai_split_min         = ini_int(ini, L"parallel",  L"ai_split_min", 8);
     c->ai_prov_split        = ini_int(ini, L"parallel",  L"ai_prov_split", 0);     // experimental
     c->ai_prov_min          = ini_int(ini, L"parallel",  L"ai_prov_min", 50);
     c->ai_ae_cache          = ini_int(ini, L"parallel",  L"ai_ae_cache", 0);       // experimental
     c->ai_army_fast         = ini_int(ini, L"parallel",  L"ai_army_fast", 0);      // experimental
     c->ai_land_memo         = ini_int(ini, L"parallel",  L"ai_land_memo", 0);      // experimental
+    c->ai_deal_memo         = ini_int(ini, L"parallel",  L"ai_deal_memo", 0);      // experimental
     c->alloc_enabled        = ini_int(ini, L"allocator", L"enabled", 1);
     c->alloc_guard_foreign  = ini_int(ini, L"allocator", L"guard_foreign", 1);
     c->alloc_large_pages    = ini_int(ini, L"allocator", L"large_pages", 0);
@@ -257,6 +261,7 @@ static void load_config(void) {
           WideCharToMultiByte(CP_ACP, 0, ws, -1, c->autorun_script, sizeof c->autorun_script, NULL, NULL);
           c->autorun_script[sizeof c->autorun_script - 1] = 0; }
         c->test_warview = ini_int(ini, L"test", L"warview", 0);
+        c->test_path_stats = ini_int(ini, L"test", L"ai_path_stats", 0);
         c->test_ironman_name = ini_int(ini, L"test", L"ironman_name", 0);
         c->test_loc_fiber = ini_int(ini, L"test", L"loc_fiber", 0);
         c->test_diplo_freed = ini_int(ini, L"test", L"diplo_freed", 0);
@@ -450,6 +455,8 @@ static void init(void) {
     eb_feature("ai_ae_cache", req.ai_ae_cache, g_cfg.ai_ae_cache, NULL);
     eb_feature("ai_army_fast", req.ai_army_fast, g_cfg.ai_army_fast, NULL);
     eb_feature("ai_land_memo", req.ai_land_memo, g_cfg.ai_land_memo, req.ai_ae_cache ? NULL : "needs ai_ae_cache");
+    eb_feature("ai_deal_memo", req.ai_deal_memo, g_cfg.ai_deal_memo, req.ai_ae_cache ? NULL : "needs ai_ae_cache");
+    eb_feature("ai_path_ahead", req.ai_path_ahead, g_cfg.ai_path_ahead, NULL);
     eb_feature("guard_tooltip", req.guard_tooltip, g_cfg.guard_tooltip, NULL);
     eb_feature("guard_modifier_in_tick", req.guard_tip_in_day, g_cfg.guard_tooltip ? g_cfg.guard_tip_in_day : 0, NULL);
     eb_feature("guard_relation", req.guard_relation, g_cfg.guard_relation, NULL);

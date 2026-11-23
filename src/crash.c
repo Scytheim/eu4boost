@@ -577,24 +577,79 @@ static void append_file(const wchar_t* dir, const wchar_t* name, const char* s, 
     if (h == INVALID_HANDLE_VALUE) return;
     DWORD w; WriteFile(h, s, (DWORD)n, &w, NULL); CloseHandle(h);
 }
+// The files of the slow report are written by a thread of their own (0.4.14). eb_slow_event runs on the main
+// thread for slow save lists and loads (uitime.c), and until 0.4.13 it created the folder, appended events.txt
+// and rewrote top.txt right there: on a PC whose file operations are slow its own CloseHandle made a stall of
+// its own (report 253: 2.8 s right after a slow load screen list; report 227 was the same with saves.txt).
+// Now the event goes into memory under g_slow_cs and the writer does the file work, outside that lock (the
+// main thread also takes it for the load samples). eb_crash_exit writes what is still pending before the
+// session's report is put together; events still pending at a crash are lost.
+#define SLOW_MAX 30
+static char g_slow_q[SLOW_MAX * 12 * 1024 + 1024];       // event text not written yet
+static int g_slow_qn, g_slow_mkdir, g_slow_top_dirty;
+static char g_slow_top[200];
+static CRITICAL_SECTION g_slow_io;                       // one writer of the files at a time
+static HANDLE g_slow_ev;
+static volatile LONG g_slow_writer;                       // 0 not started, 1 running, -1 no thread: written in place
+static volatile LONG g_slow_writes; static volatile LONG64 g_slow_wmax;
+static void slow_write_pending(int at_exit) {             // holds g_slow_io
+    static char q[sizeof g_slow_q]; char top[sizeof g_slow_top];
+    if (!at_exit) EnterCriticalSection(&g_slow_cs);
+    else if (!TryEnterCriticalSection(&g_slow_cs)) return;   // taken by a thread the process exit ended
+    int n = g_slow_qn, mk = g_slow_mkdir, td = g_slow_top_dirty;
+    memcpy(q, g_slow_q, (size_t)n); memcpy(top, g_slow_top, sizeof top);
+    g_slow_qn = 0; g_slow_mkdir = 0; g_slow_top_dirty = 0;
+    LeaveCriticalSection(&g_slow_cs);
+    if (!n && !mk && !td) return;
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    if (mk) { CreateDirectoryW(g_slow_dir, NULL); write_file(g_slow_dir, L"unconfirmed", "", 0); }
+    if (n) append_file(g_slow_dir, L"events.txt", q, n);
+    if (td) write_file(g_slow_dir, L"top.txt", top, (int)strlen(top));
+    QueryPerformanceCounter(&t1);
+    LONG64 us = (LONG64)((t1.QuadPart - t0.QuadPart) * g_ms * 1000.0);
+    if (us > g_slow_wmax) g_slow_wmax = us;
+    InterlockedIncrement(&g_slow_writes);
+}
+static DWORD WINAPI slow_writer(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(g_slow_ev, INFINITE);
+        EnterCriticalSection(&g_slow_io); slow_write_pending(0); LeaveCriticalSection(&g_slow_io);
+    }
+    return 0;
+}
 void eb_slow_event(const char* what, double ms, double limit, const char* detail) {
     if (!g_session[0] || !g_cfg.report_slow || g_crashed) return;
+    if (!g_slow_writer && InterlockedCompareExchange(&g_slow_writer, 2, 0) == 0) {   // the first event starts the writer
+        InitializeCriticalSection(&g_slow_io);
+        g_slow_ev = CreateEventW(NULL, FALSE, FALSE, NULL);  // auto-reset: events while it writes are written next round
+        HANDLE th = g_slow_ev ? CreateThread(NULL, 64 * 1024, slow_writer, NULL, 0, NULL) : NULL;
+        if (th) { SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(th); }
+        InterlockedExchange(&g_slow_writer, th ? 1 : -1);
+    }
+    while (g_slow_writer == 2) Sleep(0);                  // another thread is starting it
+    int queued = 0;
     EnterCriticalSection(&g_slow_cs);
-    if (g_slow_n < 30) {
-        static char t[12 * 1024];
-        if (!g_slow_dir[0]) { new_dir(g_slow_dir, g_start, L"slow"); write_file(g_slow_dir, L"unconfirmed", "", 0); }
+    if (g_slow_n < SLOW_MAX) {
+        if (!g_slow_dir[0]) { _snwprintf(g_slow_dir, MAX_PATH, L"%lspending\\%ls_slow\\", eb_rep_dir, g_start); g_slow_mkdir = 1; }
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         SYSTEMTIME st; GetLocalTime(&st);
-        int k = snprintf(t, sizeof t, "event: %s - %.0f ms (limit %.0f ms) at %02d:%02d:%02d, %.0f s after launch\r\n%s\r\n\r\n",
-                         what, ms, limit, st.wHour, st.wMinute, st.wSecond, (q.QuadPart - g_t0) * g_ms / 1000.0, detail);
-        if (k > (int)sizeof t - 1) k = (int)sizeof t - 1;
-        append_file(g_slow_dir, L"events.txt", t, k);
+        int room = (int)sizeof g_slow_q - g_slow_qn;
+        if (room > 12 * 1024) room = 12 * 1024;
+        int k = room > 1 ? snprintf(g_slow_q + g_slow_qn, (size_t)room, "event: %s - %.0f ms (limit %.0f ms) at %02d:%02d:%02d, %.0f s after launch\r\n%s\r\n\r\n",
+                                    what, ms, limit, st.wHour, st.wMinute, st.wSecond, (q.QuadPart - g_t0) * g_ms / 1000.0, detail) : 0;
+        if (k > room - 1) k = room - 1;
+        if (k > 0) g_slow_qn += k;
         g_slow_n++;
-        if (ms / limit > g_slow_ratio) { g_slow_ratio = ms / limit; write_file(g_slow_dir, L"top.txt", what, (int)strlen(what)); }
+        if (ms / limit > g_slow_ratio) { g_slow_ratio = ms / limit; snprintf(g_slow_top, sizeof g_slow_top, "%s", what); g_slow_top_dirty = 1; }
+        queued = 1;
         eb_log("report: slow %s: %.0f ms (limit %.0f) - kept for the slow report", what, ms, limit);
         eb_pm_event("slow report: %s - %.0f ms", what, ms);
     }
     LeaveCriticalSection(&g_slow_cs);
+    if (!queued) return;
+    if (g_slow_writer == 1) SetEvent(g_slow_ev);
+    else if (g_slow_writer == -1) { EnterCriticalSection(&g_slow_io); slow_write_pending(0); LeaveCriticalSection(&g_slow_io); }
 }
 // the session is over: events.txt (and the session's mods) becomes report.txt, which report.c sends
 static void finalize_slow(const wchar_t* dir, const wchar_t* log, const char* mods) {
@@ -1135,6 +1190,14 @@ void eb_crash_exit(void) {                                    // DLL_PROCESS_DET
     if (g_samples) eb_log("report: %lld main thread stack samples, suspended %.1f us on average, %.1f us at most; fault guard %ld",
                           (long long)g_samples, g_sample_t * g_ms * 1000.0 / g_samples, g_sample_max * g_ms * 1000.0, g_guard_faults);
     drop_unconfirmed(g_start);
+    if (g_slow_writer == 1 || g_slow_writer == -1) {
+        // the writer thread is gone (the process is ending): what it had not written yet, unless it ended in the
+        // middle of a write (its lock then stays taken and those events are lost)
+        if (TryEnterCriticalSection(&g_slow_io)) { slow_write_pending(1); LeaveCriticalSection(&g_slow_io); }
+        if (g_slow_writes)
+            eb_log("report: the slow report's files were written %ld times on their own thread, the longest write %.1f ms",
+                   (long)g_slow_writes, g_slow_wmax / 1000.0);
+    }
     if (g_slow_dir[0]) finalize_slow(g_slow_dir, L"eu4boost.log", g_mods);
     // a new session may have started already (the game restarting itself): its record stays
     char t[256], mine[64]; sb_t b = { mine, 0, sizeof mine };
