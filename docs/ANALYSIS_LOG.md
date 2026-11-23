@@ -914,7 +914,7 @@
 ## 2026-10-25 0.4.6 배포
 
 - **배포**: 로컬 6cd476e, 공개 커밋 8bf8305(de768bf 위, 트리 같음), 태그 0.4.6, GitHub 릴리스 0.4.6(설명 비움) = eu4boost_v0.4.6.zip 하나(86e6e565…, 안의 DLL 8d31a5c9…, zip 주석 서명 확인 OK). 릴리스에서 다시 받은 zip 해시 같음.
-- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `benchuto
+- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `bench\auto
 uns
 el046`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1 + test.warview=60): 모든 기능 설치(AE 실험의 전쟁 창 경로 포함), 저장 10번 나라 검사 16,680번 실패 0, 전쟁 화면 196번 게임 8,174ms → 3,582ms 차이 0, 정상 종료(state=exit), 보낼 보고 없음, 사용자 세이브 그대로.
 - 시험 뒤: 게임 폴더에 0.4.6 배포 DLL(8d31a5c9)·플레이 ini(0.4.6 배포 ini + report.upload=1, ab_test=0, auto=1).
@@ -938,7 +938,7 @@ el046`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1 + test.warv
 ## 2026-10-25 0.4.7 배포
 
 - **배포**: 로컬 5afb3a2, 공개 커밋 af12c3c(478a76d 위, 트리 같음), 태그 0.4.7, GitHub 릴리스 0.4.7(설명 비움) = eu4boost_v0.4.7.zip 하나(affa3cf6…, 안의 DLL 33e3fa0e…, zip 주석 서명 확인 OK). 릴리스에서 다시 받은 zip 해시 같음.
-- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `benchuto
+- **배포 DLL 최종 확인**(이 DLL 그대로, 자동 시험 `bench\auto
 uns
 el047`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1): 모든 기능 설치(ironman_name 포함), 저장 10번 나라 검사 16,680번 실패 0, 정상 종료(state=exit), 보낼 보고 없음, 사용자 세이브 그대로.
 - 시험 뒤: 게임 폴더에 0.4.7 배포 DLL(33e3fa0e)·플레이 ini(0.4.7 배포 ini + report.upload=1, ab_test=0, auto=1).
@@ -2121,4 +2121,4 @@ el047`, eb_LATE 1874.07.01 → 1877.01.01, zip의 ini + save.stats=1): 모든 �
   - `rel0414_old0413`(0.4.13 배포 ini = 자동 업데이트 사용자): PASS, 새 기능 꺼짐·`modifier_in_tick` 켜짐.
   - `rel0414_vanilla`(test 세이브 1600 → 1601): PASS.
   - `rel0414_verify`(`fast_objectives=2`, 저장 두 기능 비교 모드): 목표 5만 6,797번 게임 찾기와 비교 차이 0, 프로빈스 20,500·체크섬 7번 차이 0. 결과 표시 FAIL은 검증 모드가 11월 11일에 게임 찾기를 함께 돌려 4.9초 멈춤 보고가 써졌기 때문(예상한 것).
-- 남은 것: 커밋, 공개 커밋·푸시, GitHub 릴리스(사용자 확인 뒤).
+- **배포**(사용자 "네, 배포", 11-23 23:5x): 로컬 커밋 46db649 = 공개 2555b74(트리 같음, commit-tree, noreply 작성자). GitHub 릴리스 `0.4.14`(제목 "eu4boost 0.4.14", 설명 비움, 자산 `eu4boost_v0.4.14.zip` 하나, 최신 릴리스). 내려받아 다시 확인: 741,459바이트, sha256 59c157bf…, DLL 8ba12ba2, ini 6413d1db, README_KO 024bd173, 업데이트 서명 주석 158바이트. 자동 업데이트 사용자는 DLL만 바뀌므로 새 두 기능을 쓰려면 ini에 `[gui] fast_build_list=1`과 `[ai] fast_objectives=1`을 넣어야 한다(README_KO 0.4.14 절에 안내).
